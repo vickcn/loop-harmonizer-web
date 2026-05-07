@@ -36,6 +36,21 @@ npm run dev
 http://localhost:3000
 ```
 
+## Claude 雲端作業設定
+
+如果 Claude 的 setup script 不是在 repo 根目錄執行，會出現 `ENOENT: /home/user/package.json`。  
+請把 setup script 設成：
+
+```bash
+set -e
+setup_script="$(find /home/user -maxdepth 4 -type f -path "*/scripts/claude-cloud-setup.sh" | head -n 1)"
+[ -n "$setup_script" ] || { echo "setup script not found"; exit 254; }
+bash "$setup_script"
+```
+
+這個專案的腳本會自動尋找 `package.json`、執行 `npm ci`，並預設執行 `npm run build`。  
+若要加快初始化，可加環境變數：`SKIP_BUILD=1`。
+
 ## 部署到 Vercel
 
 ```bash

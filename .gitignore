@@ -175,6 +175,7 @@ models
 *.jpg
 *.svg
 *.sh
+!scripts/claude-cloud-setup.sh
 *.bat
 *.zsh
 *.iss
