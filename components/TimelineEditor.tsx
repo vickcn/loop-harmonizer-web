@@ -1,6 +1,6 @@
 "use client";
 
-import { PointerEvent, useMemo, useRef, useState } from "react";
+import { PointerEvent, WheelEvent, useMemo, useRef, useState } from "react";
 import { SongTimeline, TempoAnchor } from "@/lib/types";
 import { getSectionAtBar, getTimelineBpmAtBar, makeTempoSegmentsFromAnchors } from "@/lib/timeline";
 
@@ -13,18 +13,28 @@ type Props = {
 const WIDTH = 980;
 const SECTION_H = 74;
 const TEMPO_H = 230;
-const BPM_MIN = 80;
-const BPM_MAX = 180;
+const Y_SPAN_OPTIONS = [4, 8, 12, 16, 24];
 
 export function TimelineEditor({ timeline, currentBar, onTimelineChange }: Props) {
   const [dragId, setDragId] = useState<string | null>(null);
+  const [ySpan, setYSpan] = useState(4);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const sectionTypeMap = useMemo(() => new Map(timeline.sectionTypes.map((t) => [t.id, t])), [timeline.sectionTypes]);
+  const centerBpm = timeline.originalBpm;
+  const axisMin = centerBpm - ySpan;
+  const axisMax = centerBpm + ySpan;
 
   const barToX = (bar: number) => ((bar - 1) / (timeline.totalBars - 1)) * WIDTH;
   const xToBar = (x: number) => Math.round((x / WIDTH) * (timeline.totalBars - 1) + 1);
-  const bpmToY = (bpm: number) => TEMPO_H - ((bpm - BPM_MIN) / (BPM_MAX - BPM_MIN)) * TEMPO_H;
-  const yToBpm = (y: number) => Math.round(BPM_MIN + ((TEMPO_H - y) / TEMPO_H) * (BPM_MAX - BPM_MIN));
+  const bpmToY = (bpm: number) => {
+    const clamped = Math.max(axisMin, Math.min(axisMax, bpm));
+    return TEMPO_H - ((clamped - axisMin) / (axisMax - axisMin)) * TEMPO_H;
+  };
+  const yToBpm = (y: number) => Math.round(axisMin + ((TEMPO_H - y) / TEMPO_H) * (axisMax - axisMin));
+  const yTicks = useMemo(() => {
+    const step = ySpan <= 8 ? 2 : ySpan <= 16 ? 4 : 8;
+    return Array.from({ length: Math.floor((axisMax - axisMin) / step) + 1 }, (_, index) => axisMin + index * step);
+  }, [axisMax, axisMin, ySpan]);
 
   const pointerToLocal = (event: PointerEvent) => {
     const rect = svgRef.current!.getBoundingClientRect();
@@ -63,6 +73,20 @@ export function TimelineEditor({ timeline, currentBar, onTimelineChange }: Props
     updateAnchor(dragId, { bar: xToBar(x), bpm: yToBpm(y) });
   };
 
+  const onWheelZoomY = (event: WheelEvent<SVGSVGElement>) => {
+    const rect = svgRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    if (event.clientY - rect.top < SECTION_H) return;
+    event.preventDefault();
+    const currentIndex = Y_SPAN_OPTIONS.indexOf(ySpan);
+    if (currentIndex < 0) return;
+    if (event.deltaY < 0 && currentIndex > 0) {
+      setYSpan(Y_SPAN_OPTIONS[currentIndex - 1]);
+    } else if (event.deltaY > 0 && currentIndex < Y_SPAN_OPTIONS.length - 1) {
+      setYSpan(Y_SPAN_OPTIONS[currentIndex + 1]);
+    }
+  };
+
   const currentSection = getSectionAtBar(timeline, currentBar);
   const currentBpm = getTimelineBpmAtBar(timeline, currentBar);
   const sortedAnchors = [...timeline.tempoAnchors].sort((a, b) => a.bar - b.bar);
@@ -73,9 +97,19 @@ export function TimelineEditor({ timeline, currentBar, onTimelineChange }: Props
       <div className="row" style={{ justifyContent: "space-between" }}>
         <div>
           <h2 style={{ margin: 0 }}>Timeline Editor</h2>
-          <p className="small">點擊 Tempo 區可新增錨點；拖曳錨點可改 bar / BPM。段落名稱可重複，內部使用 section id。</p>
+          <p className="small">點擊 Tempo 區可新增錨點；拖曳錨點可改 bar / BPM。雙擊錨點可刪除。Y 軸預設顯示中心 ±4 BPM，可手動拉伸。</p>
         </div>
-        <div className="small">目前：{currentSection?.label ?? "--"}｜Bar {currentBar.toFixed(2)}｜{currentBpm.toFixed(1)} BPM</div>
+        <div className="row">
+          <label className="row">
+            <span className="label">Y 軸範圍</span>
+            <select className="input" value={ySpan} onChange={(event) => setYSpan(Number(event.target.value))}>
+              {Y_SPAN_OPTIONS.map((span) => (
+                <option key={span} value={span}>±{span} BPM</option>
+              ))}
+            </select>
+          </label>
+          <div className="small">目前：{currentSection?.label ?? "--"}｜Bar {currentBar.toFixed(2)}｜{currentBpm.toFixed(1)} BPM</div>
+        </div>
       </div>
 
       <div style={{ overflowX: "auto" }}>
@@ -85,6 +119,7 @@ export function TimelineEditor({ timeline, currentBar, onTimelineChange }: Props
           width={WIDTH}
           height={SECTION_H + TEMPO_H + 34}
           onDoubleClick={addAnchor}
+          onWheel={onWheelZoomY}
           onPointerMove={onPointerMove}
           onPointerUp={() => setDragId(null)}
           onPointerCancel={() => setDragId(null)}
@@ -113,7 +148,7 @@ export function TimelineEditor({ timeline, currentBar, onTimelineChange }: Props
             );
           })}
 
-          {[80, 100, 120, 140, 160, 180].map((bpm) => {
+          {yTicks.map((bpm) => {
             const y = SECTION_H + bpmToY(bpm);
             return (
               <g key={bpm}>
