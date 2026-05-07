@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-WORK_ROOT="${WORK_ROOT:-/home/user}"
+WORK_ROOT="${WORK_ROOT:-${HOME:-/home/user}}"
 PROJECT_NAME="${PROJECT_NAME:-loop-harmonizer-web}"
 PROJECT_DIR=""
 FALLBACK_DIR=""
