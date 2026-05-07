@@ -1,0 +1,35 @@
+:root {
+  --bg: #0f1117;
+  --panel: #171a23;
+  --panel-2: #202433;
+  --text: #f4f4f5;
+  --muted: #a1a1aa;
+  --line: #343849;
+  --accent: #8ab4f8;
+  --accent-2: #f8c471;
+  --danger: #fb7185;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--text); font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+button, input, select { font: inherit; }
+button { cursor: pointer; }
+.container { max-width: 1180px; margin: 0 auto; padding: 24px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 18px; padding: 16px; box-shadow: 0 20px 60px rgba(0,0,0,.24); }
+.row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.grid { display: grid; gap: 16px; }
+.btn { border: 1px solid var(--line); background: var(--panel-2); color: var(--text); padding: 10px 14px; border-radius: 12px; }
+.btn.primary { background: var(--accent); color: #101010; border-color: transparent; font-weight: 700; }
+.btn.danger { background: transparent; color: var(--danger); border-color: var(--danger); }
+.input { background: #10131b; border: 1px solid var(--line); color: var(--text); padding: 10px 12px; border-radius: 12px; min-width: 90px; }
+.label { color: var(--muted); font-size: 13px; }
+.small { font-size: 13px; color: var(--muted); }
+.title { font-size: 28px; margin: 0 0 6px; }
+.subtitle { margin: 0; color: var(--muted); }
+.timeline { user-select: none; touch-action: none; }
+.section-block { position: absolute; top: 10px; height: 46px; border-radius: 12px; border: 1px solid rgba(255,255,255,.18); display: flex; align-items: center; justify-content: center; font-weight: 700; overflow: hidden; white-space: nowrap; }
+.anchor { position: absolute; width: 18px; height: 18px; border-radius: 999px; background: var(--accent-2); border: 2px solid #fff; transform: translate(-50%, -50%); box-shadow: 0 4px 20px rgba(0,0,0,.5); }
+.cursor { position: absolute; top: 0; bottom: 0; width: 2px; background: #fff; opacity: .92; pointer-events: none; }
+.tap-pad { min-height: 140px; display:flex; align-items:center; justify-content:center; text-align:center; border: 2px dashed var(--line); border-radius: 20px; background: #10131b; }
+.tap-pad:active { border-color: var(--accent); background: #151b29; }
+hr { border: none; border-top: 1px solid var(--line); margin: 16px 0; }
