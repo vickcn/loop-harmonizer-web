@@ -6,7 +6,7 @@ import { LiveBeatPanel } from "@/components/LiveBeatPanel";
 import { TapTempoPad } from "@/components/TapTempoPad";
 import { TimelineEditor } from "@/components/TimelineEditor";
 import { TransportBar } from "@/components/TransportBar";
-import { BrowserLoopEngine, EngineStatus } from "@/lib/audioEngine";
+import { BrowserLoopEngine, EngineStatus, PlaybackMode } from "@/lib/audioEngine";
 import { defaultTimeline } from "@/lib/timeline";
 import { SongTimeline } from "@/lib/types";
 
@@ -22,7 +22,9 @@ export default function Page() {
     currentBpm: timeline.originalBpm,
     timelineBpm: timeline.originalBpm,
     actualBpm: timeline.originalBpm,
-    tempoRatio: 1
+    tempoRatio: 1,
+    playbackMode: "quick",
+    pitchPreserveReady: false
   });
 
   const engineRef = useRef<BrowserLoopEngine | null>(null);
@@ -59,8 +61,8 @@ export default function Page() {
   return (
     <main className="container grid">
       <header>
-        <h1 className="title">Loop Harmonizer M0 Web</h1>
-        <p className="subtitle">流程播放、段落時間軸、Tempo 錨點、即時切 beat 線性緩衝、Tap Tempo + Vercel API。</p>
+        <h1 className="title">Loop Harmonizer M1 Web</h1>
+        <p className="subtitle">流程播放、段落時間軸、Tempo 錨點、即時切 beat 線性緩衝、Tap Tempo + Vercel API，並加入變速不變調模式。</p>
       </header>
 
       <TransportBar
@@ -70,6 +72,9 @@ export default function Page() {
         currentBpm={status.currentBpm}
         timelineBpm={status.timelineBpm}
         tempoRatio={status.tempoRatio}
+        playbackMode={status.playbackMode}
+        pitchPreserveReady={status.pitchPreserveReady}
+        onPlaybackModeChange={(mode: PlaybackMode) => void engine.setPlaybackMode(mode)}
         onPlay={() => void engine.play()}
         onPause={() => engine.pause()}
         onStop={() => engine.stop()}
@@ -96,9 +101,9 @@ export default function Page() {
       </div>
 
       <section className="card">
-        <h2 style={{ marginTop: 0 }}>M0 限制</h2>
+        <h2 style={{ marginTop: 0 }}>M1 說明</h2>
         <p className="small">
-          目前使用 Web Audio playbackRate 驗證控制流程，所以變速時音高會跟著改變。下一版要做「變速不變調」時，建議改成 AudioWorklet + SoundTouchJS / RubberBand WASM。
+          「快速變速」仍使用 playbackRate，適合低延遲驗證控制流程；「M1 變速不變調」使用 AudioWorklet 粒狀 overlap-add time-stretch 原型，會盡量維持音高。這版不依賴外部 WASM 套件，方便直接部署到 Vercel；音質可在下一版再替換為 SoundTouchJS / RubberBand WASM。
         </p>
       </section>
     </main>
