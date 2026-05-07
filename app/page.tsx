@@ -6,7 +6,7 @@ import { LiveBeatPanel } from "@/components/LiveBeatPanel";
 import { TapTempoPad } from "@/components/TapTempoPad";
 import { TimelineEditor } from "@/components/TimelineEditor";
 import { TransportBar } from "@/components/TransportBar";
-import { BrowserLoopEngine, EngineStatus, PlaybackMode } from "@/lib/audioEngine";
+import { BrowserLoopEngine, DriverMode, EngineStatus, PlaybackMode } from "@/lib/audioEngine";
 import { defaultTimeline } from "@/lib/timeline";
 import { SongTimeline } from "@/lib/types";
 
@@ -19,19 +19,21 @@ export default function Page() {
   const [status, setStatus] = useState<EngineStatus>({
     isPlaying: false,
     currentBar: 1,
-    currentBpm: timeline.originalBpm,
-    timelineBpm: timeline.originalBpm,
-    actualBpm: timeline.originalBpm,
+    currentBpm: defaultTimeline.originalBpm,
+    timelineBpm: defaultTimeline.originalBpm,
+    actualBpm: defaultTimeline.originalBpm,
     tempoRatio: 1,
     playbackMode: "quick",
-    pitchPreserveReady: false
+    pitchPreserveReady: false,
+    driverMode: "loop",
+    loopBpm: defaultTimeline.originalBpm,
   });
 
   const engineRef = useRef<BrowserLoopEngine | null>(null);
 
   const engine = useMemo(() => {
     if (!engineRef.current) {
-      engineRef.current = new BrowserLoopEngine(timeline);
+      engineRef.current = new BrowserLoopEngine(defaultTimeline);
       engineRef.current.setStatusCallback(setStatus);
     }
     return engineRef.current;
@@ -52,11 +54,19 @@ export default function Page() {
     setFileName(file.name);
   };
 
+  const playAs = (mode: DriverMode) => {
+    engine.setDriverMode(mode);
+    void engine.play();
+  };
+
   const triggerLiveBeat = (bpm = targetBpm, beats = transitionBeats) => {
     setTargetBpm(bpm);
     setTransitionBeats(beats);
     engine.triggerLiveBeatChange(bpm, beats);
   };
+
+  const loopIsPlaying = status.isPlaying && status.driverMode === "loop";
+  const timelineIsPlaying = status.isPlaying && status.driverMode === "timeline";
 
   return (
     <main className="container grid">
@@ -65,25 +75,23 @@ export default function Page() {
         <p className="subtitle">流程播放、段落時間軸、Tempo 錨點、即時切 beat 線性緩衝、Tap Tempo + Vercel API，並加入變速不變調模式。</p>
       </header>
 
+      {/* ── Loop 播放 ── */}
       <TransportBar
+        title="Loop 播放"
         loaded={loaded}
-        isPlaying={status.isPlaying}
+        isPlaying={loopIsPlaying}
         currentBar={status.currentBar}
         currentBpm={status.currentBpm}
-        timelineBpm={status.timelineBpm}
+        timelineBpm={status.loopBpm}
         tempoRatio={status.tempoRatio}
         playbackMode={status.playbackMode}
         pitchPreserveReady={status.pitchPreserveReady}
+        showModeSelector={true}
         onPlaybackModeChange={(mode: PlaybackMode) => void engine.setPlaybackMode(mode)}
-        onPlay={() => void engine.play()}
+        onPlay={() => playAs("loop")}
         onPause={() => engine.pause()}
         onStop={() => engine.stop()}
       />
-
-      <FileLoader originalBpm={timeline.originalBpm} onOriginalBpmChange={setOriginalBpm} onFile={loadFile} />
-      {fileName && <div className="small">已載入：{fileName}</div>}
-
-      <TimelineEditor timeline={timeline} currentBar={status.currentBar} onTimelineChange={updateTimeline} />
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 16 }}>
         <LiveBeatPanel
@@ -95,10 +103,34 @@ export default function Page() {
         />
         <TapTempoPad
           songId={timeline.id}
-          currentTimelineBpm={status.timelineBpm}
+          currentTimelineBpm={status.loopBpm}
           onSuggestedBpm={(bpm, beats) => triggerLiveBeat(bpm, beats)}
         />
       </div>
+
+      {/* ── 載入音檔 ── */}
+      <FileLoader originalBpm={timeline.originalBpm} onOriginalBpmChange={setOriginalBpm} onFile={loadFile} />
+      {fileName && <div className="small">已載入：{fileName}</div>}
+
+      {/* ── Timeline 播放 ── */}
+      <TransportBar
+        title="Timeline 播放"
+        loaded={loaded}
+        isPlaying={timelineIsPlaying}
+        currentBar={status.currentBar}
+        currentBpm={status.currentBpm}
+        timelineBpm={status.timelineBpm}
+        tempoRatio={status.tempoRatio}
+        playbackMode={status.playbackMode}
+        pitchPreserveReady={status.pitchPreserveReady}
+        showModeSelector={false}
+        onPlaybackModeChange={(mode: PlaybackMode) => void engine.setPlaybackMode(mode)}
+        onPlay={() => playAs("timeline")}
+        onPause={() => engine.pause()}
+        onStop={() => engine.stop()}
+      />
+
+      <TimelineEditor timeline={timeline} currentBar={status.currentBar} onTimelineChange={updateTimeline} />
 
       <section className="card">
         <h2 style={{ marginTop: 0 }}>M1 說明</h2>

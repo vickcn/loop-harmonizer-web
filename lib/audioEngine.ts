@@ -2,6 +2,7 @@ import { SongTimeline } from "./types";
 import { getTimelineBpmAtBar } from "./timeline";
 
 export type PlaybackMode = "quick" | "pitch-preserve";
+export type DriverMode = "loop" | "timeline";
 
 type LiveTransition = {
   fromBpm: number;
@@ -19,6 +20,8 @@ export type EngineStatus = {
   tempoRatio: number;
   playbackMode: PlaybackMode;
   pitchPreserveReady: boolean;
+  driverMode: DriverMode;
+  loopBpm: number;
 };
 
 export class BrowserLoopEngine {
@@ -37,13 +40,23 @@ export class BrowserLoopEngine {
   private playbackMode: PlaybackMode = "quick";
   private pitchPreserveReady = false;
   private workletLoading: Promise<void> | null = null;
+  private driverMode: DriverMode = "loop";
+  private loopBpm: number;
 
   constructor(timeline: SongTimeline) {
     this.timeline = timeline;
+    this.loopBpm = timeline.originalBpm;
   }
 
   setTimeline(timeline: SongTimeline) {
+    if (timeline.originalBpm !== this.timeline.originalBpm) {
+      this.loopBpm = timeline.originalBpm;
+    }
     this.timeline = timeline;
+  }
+
+  setDriverMode(mode: DriverMode) {
+    this.driverMode = mode;
   }
 
   setStatusCallback(callback: (status: EngineStatus) => void) {
@@ -213,14 +226,19 @@ export class BrowserLoopEngine {
   private getCurrentStatusValues() {
     const seconds = this.getElapsedAudioSeconds();
     const roughBar = this.getCurrentBarBySeconds(seconds, this.timeline.originalBpm);
-    const timelineBpm = getTimelineBpmAtBar(this.timeline, roughBar);
+    const timelineBpm = this.driverMode === "loop"
+      ? this.loopBpm
+      : getTimelineBpmAtBar(this.timeline, roughBar);
     let actualBpm = timelineBpm;
 
     if (this.ctx && this.liveTransition) {
       const elapsed = this.ctx.currentTime - this.liveTransition.startAudioTime;
       const progress = Math.max(0, Math.min(1, elapsed / this.liveTransition.durationSeconds));
       actualBpm = this.liveTransition.fromBpm + (this.liveTransition.toBpm - this.liveTransition.fromBpm) * progress;
-      if (progress >= 1) this.liveTransition = null;
+      if (progress >= 1) {
+        if (this.driverMode === "loop") this.loopBpm = this.liveTransition.toBpm;
+        this.liveTransition = null;
+      }
     }
 
     return {
@@ -252,7 +270,9 @@ export class BrowserLoopEngine {
       actualBpm,
       tempoRatio: actualBpm / this.timeline.originalBpm,
       playbackMode: this.playbackMode,
-      pitchPreserveReady: this.pitchPreserveReady
+      pitchPreserveReady: this.pitchPreserveReady,
+      driverMode: this.driverMode,
+      loopBpm: this.loopBpm
     });
   }
 }
