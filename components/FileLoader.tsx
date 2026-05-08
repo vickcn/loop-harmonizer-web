@@ -6,11 +6,13 @@ import { AudioSourceMeta } from "@/lib/types";
 type Props = {
   audioSource: AudioSourceMeta;
   onFileConfirmed: (file: File, audioOriginalBpm: number) => void;
+  onAudioBpmChange: (bpm: number) => void;
 };
 
-export function FileLoader({ audioSource, onFileConfirmed }: Props) {
+export function FileLoader({ audioSource, onFileConfirmed, onAudioBpmChange }: Props) {
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [pendingBpm, setPendingBpm] = useState("120");
+  const [editBpm, setEditBpm] = useState("");
 
   const handleFileChange = (file: File) => {
     setPendingFile(file);
@@ -37,13 +39,33 @@ export function FileLoader({ audioSource, onFileConfirmed }: Props) {
         onChange={(e) => e.target.files?.[0] && handleFileChange(e.target.files[0])}
       />
 
-      {/* 已確認狀態 */}
-      {audioSource.userConfirmedBpm && !pendingFile && (
-        <div className="small">
-          已載入：{audioSource.fileName}
-          ｜音檔基準 BPM：<strong>{audioSource.userConfirmedBpm}</strong>
-        </div>
-      )}
+      {/* 已確認狀態：可在線微調 BPM */}
+      {audioSource.userConfirmedBpm && !pendingFile && (() => {
+        const confirmed = audioSource.userConfirmedBpm!;
+        const editVal = editBpm !== "" ? editBpm : String(confirmed);
+        const editNum = Math.max(20, Number(editVal) || confirmed);
+        const commit = (val: number) => { setEditBpm(""); onAudioBpmChange(val); };
+        return (
+          <div className="grid" style={{ gap: 6 }}>
+            <div className="small">已載入：{audioSource.fileName}</div>
+            <div className="row">
+              <span className="label">音檔基準 BPM</span>
+              <input
+                className="input"
+                type="number"
+                value={editVal}
+                min={20} max={300}
+                style={{ width: 80 }}
+                onChange={(e) => setEditBpm(e.target.value)}
+                onBlur={() => editBpm !== "" && commit(editNum)}
+                onKeyDown={(e) => e.key === "Enter" && editBpm !== "" && commit(editNum)}
+              />
+              <button className="btn" onClick={() => commit(Math.round(editNum / 2))}>÷2</button>
+              <button className="btn" onClick={() => commit(editNum * 2)}>×2</button>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* BPM 確認面板 */}
       {pendingFile && (

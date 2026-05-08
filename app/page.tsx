@@ -140,7 +140,14 @@ export default function Page() {
       </div>
 
       {/* ── 載入音檔 ── */}
-      <FileLoader audioSource={timeline.audioSource} onFileConfirmed={handleFileConfirmed} />
+      <FileLoader
+        audioSource={timeline.audioSource}
+        onFileConfirmed={handleFileConfirmed}
+        onAudioBpmChange={(bpm) => updateTimeline({
+          ...timeline,
+          audioSource: { ...timeline.audioSource, userConfirmedBpm: bpm }
+        })}
+      />
 
       {/* ── Timeline 播放 ── */}
       <TransportBar
