@@ -1,5 +1,5 @@
 import { SongTimeline } from "./types";
-import { getTimelineBpmAtBar } from "./timeline";
+import { getAudioBaseBpm, getTimelineBpmAtBar } from "./timeline";
 import { Metronome } from "./metronome";
 
 export type PlaybackMode = "quick" | "pitch-preserve";
@@ -48,13 +48,13 @@ export class BrowserLoopEngine {
 
   constructor(timeline: SongTimeline) {
     this.timeline = timeline;
-    this.loopBpm = timeline.originalBpm;
-    this.lastActualBpm = timeline.originalBpm;
+    this.loopBpm = timeline.projectBpm;
+    this.lastActualBpm = timeline.projectBpm;
   }
 
   setTimeline(timeline: SongTimeline) {
-    if (timeline.originalBpm !== this.timeline.originalBpm) {
-      this.loopBpm = timeline.originalBpm;
+    if (timeline.projectBpm !== this.timeline.projectBpm) {
+      this.loopBpm = timeline.projectBpm;
     }
     this.timeline = timeline;
   }
@@ -140,7 +140,7 @@ export class BrowserLoopEngine {
       this.metronome.start(
         this.ctx.currentTime,
         this.pausedAudioSeconds,
-        this.timeline.originalBpm,
+        this.timeline.projectBpm,
         this.timeline.timeSignature.beatsPerBar
       );
     }
@@ -166,7 +166,7 @@ export class BrowserLoopEngine {
     this.isPlaying = false;
     this.metronome?.stop();
     if (this.raf) cancelAnimationFrame(this.raf);
-    this.emitStatus(1, this.timeline.originalBpm, this.timeline.originalBpm, this.timeline.originalBpm);
+    this.emitStatus(1, this.timeline.projectBpm, this.timeline.projectBpm, this.timeline.projectBpm);
   }
 
   triggerLiveBeatChange(toBpm: number, transitionBeats: number) {
@@ -262,7 +262,7 @@ export class BrowserLoopEngine {
 
   private getCurrentStatusValues() {
     const seconds = this.getElapsedAudioSeconds();
-    const roughBar = this.getCurrentBarBySeconds(seconds, this.timeline.originalBpm);
+    const roughBar = this.getCurrentBarBySeconds(seconds, this.timeline.projectBpm);
     const timelineBpm = this.driverMode === "loop"
       ? this.loopBpm
       : getTimelineBpmAtBar(this.timeline, roughBar);
@@ -282,7 +282,7 @@ export class BrowserLoopEngine {
       bar: roughBar,
       timelineBpm,
       actualBpm,
-      ratio: actualBpm / this.timeline.originalBpm
+      ratio: actualBpm / getAudioBaseBpm(this.timeline)
     };
   }
 
@@ -306,7 +306,7 @@ export class BrowserLoopEngine {
       currentBpm,
       timelineBpm,
       actualBpm,
-      tempoRatio: actualBpm / this.timeline.originalBpm,
+      tempoRatio: actualBpm / getAudioBaseBpm(this.timeline),
       playbackMode: this.playbackMode,
       pitchPreserveReady: this.pitchPreserveReady,
       driverMode: this.driverMode,

@@ -9,12 +9,11 @@ import { TimelineEditor } from "@/components/TimelineEditor";
 import { TransportBar } from "@/components/TransportBar";
 import { BrowserLoopEngine, DriverMode, EngineStatus, PlaybackMode } from "@/lib/audioEngine";
 import { defaultTimeline } from "@/lib/timeline";
-import { SongTimeline } from "@/lib/types";
+import { AudioSourceMeta, SongTimeline } from "@/lib/types";
 
 export default function Page() {
   const [timeline, setTimeline] = useState<SongTimeline>(defaultTimeline);
   const [loaded, setLoaded] = useState(false);
-  const [fileName, setFileName] = useState<string>("");
   const [targetBpm, setTargetBpm] = useState(132);
   const [transitionBeats, setTransitionBeats] = useState(8);
   const [metronomeEnabled, setMetronomeEnabled] = useState(false);
@@ -24,14 +23,14 @@ export default function Page() {
   const [status, setStatus] = useState<EngineStatus>({
     isPlaying: false,
     currentBar: 1,
-    currentBpm: defaultTimeline.originalBpm,
-    timelineBpm: defaultTimeline.originalBpm,
-    actualBpm: defaultTimeline.originalBpm,
+    currentBpm: defaultTimeline.projectBpm,
+    timelineBpm: defaultTimeline.projectBpm,
+    actualBpm: defaultTimeline.projectBpm,
     tempoRatio: 1,
     playbackMode: "quick",
     pitchPreserveReady: false,
     driverMode: "loop",
-    loopBpm: defaultTimeline.originalBpm,
+    loopBpm: defaultTimeline.projectBpm,
   });
 
   const engineRef = useRef<BrowserLoopEngine | null>(null);
@@ -49,20 +48,24 @@ export default function Page() {
     engine.setTimeline(next);
   };
 
-  const setOriginalBpm = (bpm: number) => {
-    updateTimeline({ ...timeline, originalBpm: bpm });
-  };
+  const handleFileConfirmed = async (file: File, audioOriginalBpm: number) => {
+    const audioSource: AudioSourceMeta = {
+      id: `audio_${Date.now()}`,
+      fileName: file.name,
+      userConfirmedBpm: audioOriginalBpm,
+    };
+    // projectBpm 預設對齊音檔基準 BPM，使用者可之後用 live beat 調整
+    const nextTimeline: SongTimeline = { ...timeline, projectBpm: audioOriginalBpm, audioSource };
+    updateTimeline(nextTimeline);
 
-  const loadFile = async (file: File) => {
     await engine.loadFile(file);
     setLoaded(true);
-    setFileName(file.name);
+
     const duration = engine.getBufferDuration();
     if (duration) {
-      const bpm = timeline.originalBpm;
-      const bpb = timeline.timeSignature.beatsPerBar;
-      const totalBars = Math.max(4, Math.round(duration * bpm / 60 / bpb));
-      updateTimeline({ ...timeline, totalBars });
+      const bpb = nextTimeline.timeSignature.beatsPerBar;
+      const totalBars = Math.max(4, Math.round(duration * audioOriginalBpm / 60 / bpb));
+      updateTimeline({ ...nextTimeline, totalBars });
     }
   };
 
@@ -137,8 +140,7 @@ export default function Page() {
       </div>
 
       {/* ── 載入音檔 ── */}
-      <FileLoader originalBpm={timeline.originalBpm} onOriginalBpmChange={setOriginalBpm} onFile={loadFile} />
-      {fileName && <div className="small">已載入：{fileName}</div>}
+      <FileLoader audioSource={timeline.audioSource} onFileConfirmed={handleFileConfirmed} />
 
       {/* ── Timeline 播放 ── */}
       <TransportBar

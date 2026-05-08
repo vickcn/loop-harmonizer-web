@@ -21,7 +21,7 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
   const [ySpan, setYSpan] = useState(4);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const sectionTypeMap = useMemo(() => new Map(timeline.sectionTypes.map((t) => [t.id, t])), [timeline.sectionTypes]);
-  const centerBpm = timeline.originalBpm;
+  const centerBpm = timeline.projectBpm;
   const axisMin = centerBpm - ySpan;
   const axisMax = centerBpm + ySpan;
 

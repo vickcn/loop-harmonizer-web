@@ -2,6 +2,15 @@ import { SongTimeline, TempoAnchor, TempoSegment } from "./types";
 
 export const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 
+/** tempoRatio 的分母：優先用使用者確認的 BPM，其次偵測值，最後 projectBpm */
+export function getAudioBaseBpm(timeline: SongTimeline): number {
+  return (
+    timeline.audioSource.userConfirmedBpm ??
+    timeline.audioSource.detectedBpm ??
+    timeline.projectBpm
+  );
+}
+
 export function getOrderedAnchors(timeline: SongTimeline): TempoAnchor[] {
   return [...timeline.tempoAnchors].sort((a, b) => a.bar - b.bar);
 }
@@ -25,7 +34,7 @@ export function findTempoSegment(timeline: SongTimeline, bar: number): { from: T
 
 export function getTimelineBpmAtBar(timeline: SongTimeline, bar: number): number {
   const found = findTempoSegment(timeline, bar);
-  if (!found) return timeline.originalBpm;
+  if (!found) return timeline.projectBpm;
   if (!found.to || !found.segment) return found.from.bpm;
   if (found.segment.mode === "hold") return found.from.bpm;
 
@@ -55,7 +64,8 @@ export function makeTempoSegmentsFromAnchors(timeline: SongTimeline): TempoSegme
 export const defaultTimeline: SongTimeline = {
   id: "song_demo",
   name: "Demo Loop",
-  originalBpm: 120,
+  projectBpm: 120,
+  audioSource: { id: "default", fileName: "" },
   totalBars: 32,
   timeSignature: { beatsPerBar: 4, beatUnit: 4 },
   sectionTypes: [

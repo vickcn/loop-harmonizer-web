@@ -27,10 +27,21 @@ export type TempoSegment = {
   mode: TempoSegmentMode;
 };
 
+export type AudioSourceMeta = {
+  id: string;
+  fileName: string;
+  detectedBpm?: number;
+  userConfirmedBpm?: number;
+  bpmConfidence?: number;
+};
+
 export type SongTimeline = {
   id: string;
   name: string;
-  originalBpm: number;
+  /** 此流程 / 專案預設 BPM，timeline anchor 的參考中心 */
+  projectBpm: number;
+  /** 音檔本身的 meta，userConfirmedBpm 決定 tempoRatio 分母 */
+  audioSource: AudioSourceMeta;
   totalBars: number;
   timeSignature: {
     beatsPerBar: number;
