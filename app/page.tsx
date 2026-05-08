@@ -132,7 +132,7 @@ export default function Page() {
         onStop={() => engine.stop()}
       />
 
-      <TimelineEditor timeline={timeline} currentBar={status.currentBar} onTimelineChange={updateTimeline} />
+      <TimelineEditor timeline={timeline} currentBar={status.currentBar} dimTempo={status.driverMode === "loop"} onTimelineChange={updateTimeline} />
 
       <section className="card">
         <h2 style={{ marginTop: 0 }}>M1 說明</h2>

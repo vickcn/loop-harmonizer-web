@@ -7,6 +7,7 @@ import { getSectionAtBar, getTimelineBpmAtBar, makeTempoSegmentsFromAnchors } fr
 type Props = {
   timeline: SongTimeline;
   currentBar: number;
+  dimTempo?: boolean;
   onTimelineChange: (timeline: SongTimeline) => void;
 };
 
@@ -15,7 +16,7 @@ const SECTION_H = 74;
 const TEMPO_H = 230;
 const Y_SPAN_OPTIONS = [4, 8, 12, 16, 24];
 
-export function TimelineEditor({ timeline, currentBar, onTimelineChange }: Props) {
+export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimelineChange }: Props) {
   const [dragId, setDragId] = useState<string | null>(null);
   const [ySpan, setYSpan] = useState(4);
   const svgRef = useRef<SVGSVGElement | null>(null);
@@ -158,30 +159,32 @@ export function TimelineEditor({ timeline, currentBar, onTimelineChange }: Props
             );
           })}
 
-          <polyline points={points} fill="none" stroke="#f8c471" strokeWidth={3} />
+          <polyline points={points} fill="none" stroke="#f8c471" strokeWidth={3} opacity={dimTempo ? 0.2 : 1} />
 
-          {sortedAnchors.map((anchor) => {
-            const x = barToX(anchor.bar);
-            const y = SECTION_H + bpmToY(anchor.bpm);
-            return (
-              <g key={anchor.id}>
-                <circle
-                  className="anchor-hit"
-                  cx={x}
-                  cy={y}
-                  r={18}
-                  fill="transparent"
-                  onPointerDown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); setDragId(anchor.id); }}
-                  onDoubleClick={(e) => {
-                    e.stopPropagation();
-                    removeAnchor(anchor.id);
-                  }}
-                />
-                <circle cx={x} cy={y} r={8} fill="#f8c471" stroke="white" strokeWidth={2} pointerEvents="none" />
-                <text x={x + 10} y={y - 10} fill="#f4f4f5" fontSize="11" pointerEvents="none">{anchor.bpm} / B{anchor.bar}</text>
-              </g>
-            );
-          })}
+          <g opacity={dimTempo ? 0.2 : 1}>
+            {sortedAnchors.map((anchor) => {
+              const x = barToX(anchor.bar);
+              const y = SECTION_H + bpmToY(anchor.bpm);
+              return (
+                <g key={anchor.id}>
+                  <circle
+                    className="anchor-hit"
+                    cx={x}
+                    cy={y}
+                    r={18}
+                    fill="transparent"
+                    onPointerDown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); setDragId(anchor.id); }}
+                    onDoubleClick={(e) => {
+                      e.stopPropagation();
+                      removeAnchor(anchor.id);
+                    }}
+                  />
+                  <circle cx={x} cy={y} r={8} fill="#f8c471" stroke="white" strokeWidth={2} pointerEvents="none" />
+                  <text x={x + 10} y={y - 10} fill="#f4f4f5" fontSize="11" pointerEvents="none">{anchor.bpm} / B{anchor.bar}</text>
+                </g>
+              );
+            })}
+          </g>
 
           <line x1={barToX(currentBar)} y1={0} x2={barToX(currentBar)} y2={SECTION_H + TEMPO_H} stroke="white" strokeWidth={2} opacity={0.9} />
         </svg>
