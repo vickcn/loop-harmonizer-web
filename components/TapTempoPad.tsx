@@ -82,7 +82,7 @@ export function TapTempoPad({ songId, currentTimelineBpm, onSuggestedBpm, onSugg
       </div>
       <button className="tap-pad" onClick={tap}>
         <div>
-          <div style={{ fontSize: 24, fontWeight: 800 }}>{isSending ? "分析中..." : "點擊 / 空白鍵敲拍"}</div>
+          <div style={{ fontSize: 24, fontWeight: 800, color: isSending ? undefined : "#8ab4f8" }}>{isSending ? "分析中..." : "點擊 / 空白鍵敲拍"}</div>
           <div className="small">{tapTimes.length} / {requiredTaps} 拍｜偵測 BPM：{bpm ? bpm.toFixed(1) : "--"}</div>
         </div>
       </button>
