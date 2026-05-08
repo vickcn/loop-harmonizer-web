@@ -102,6 +102,20 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
         </div>
         <div className="row">
           <label className="row">
+            <span className="label">總 Bars</span>
+            <input
+              className="input"
+              type="number"
+              min={4}
+              style={{ width: 72 }}
+              value={timeline.totalBars}
+              onChange={(e) => {
+                const bars = Math.max(4, Number(e.target.value) || 4);
+                onTimelineChange({ ...timeline, totalBars: bars });
+              }}
+            />
+          </label>
+          <label className="row">
             <span className="label">Y 軸範圍</span>
             <select className="input" value={ySpan} onChange={(event) => setYSpan(Number(event.target.value))}>
               {Y_SPAN_OPTIONS.map((span) => (

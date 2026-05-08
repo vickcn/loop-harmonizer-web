@@ -52,6 +52,13 @@ export default function Page() {
     await engine.loadFile(file);
     setLoaded(true);
     setFileName(file.name);
+    const duration = engine.getBufferDuration();
+    if (duration) {
+      const bpm = timeline.originalBpm;
+      const bpb = timeline.timeSignature.beatsPerBar;
+      const totalBars = Math.max(4, Math.round(duration * bpm / 60 / bpb));
+      updateTimeline({ ...timeline, totalBars });
+    }
   };
 
   const playAs = (mode: DriverMode) => {

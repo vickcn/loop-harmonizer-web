@@ -59,6 +59,10 @@ export class BrowserLoopEngine {
     this.driverMode = mode;
   }
 
+  getBufferDuration(): number | null {
+    return this.buffer?.duration ?? null;
+  }
+
   setStatusCallback(callback: (status: EngineStatus) => void) {
     this.onStatus = callback;
   }
