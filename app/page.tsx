@@ -136,6 +136,10 @@ export default function Page() {
           songId={timeline.id}
           currentTimelineBpm={status.loopBpm}
           onSuggestedBpm={(bpm, beats) => triggerLiveBeat(bpm, beats)}
+          onSuggestedBaseBpm={(bpm) => updateTimeline({
+            ...timeline,
+            audioSource: { ...timeline.audioSource, userConfirmedBpm: bpm }
+          })}
         />
       </div>
 
