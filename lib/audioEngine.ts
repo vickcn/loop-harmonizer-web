@@ -1,5 +1,6 @@
 import { SongTimeline } from "./types";
 import { getTimelineBpmAtBar } from "./timeline";
+import { Metronome } from "./metronome";
 
 export type PlaybackMode = "quick" | "pitch-preserve";
 export type DriverMode = "loop" | "timeline";
@@ -42,10 +43,13 @@ export class BrowserLoopEngine {
   private workletLoading: Promise<void> | null = null;
   private driverMode: DriverMode = "loop";
   private loopBpm: number;
+  private lastActualBpm: number;
+  private metronome: Metronome | null = null;
 
   constructor(timeline: SongTimeline) {
     this.timeline = timeline;
     this.loopBpm = timeline.originalBpm;
+    this.lastActualBpm = timeline.originalBpm;
   }
 
   setTimeline(timeline: SongTimeline) {
@@ -58,6 +62,22 @@ export class BrowserLoopEngine {
   setDriverMode(mode: DriverMode) {
     this.driverMode = mode;
   }
+
+  getBpmAtAudioTime(audioTime: number): number {
+    if (this.liveTransition) {
+      const elapsed = audioTime - this.liveTransition.startAudioTime;
+      const progress = Math.max(0, Math.min(1, elapsed / this.liveTransition.durationSeconds));
+      if (progress < 1) {
+        return this.liveTransition.fromBpm + (this.liveTransition.toBpm - this.liveTransition.fromBpm) * progress;
+      }
+    }
+    return this.driverMode === "loop" ? this.loopBpm : this.lastActualBpm;
+  }
+
+  setMetronomeEnabled(v: boolean) { this.metronome?.setEnabled(v); }
+  setMetronomeVolume(v: number) { this.metronome?.setVolume(v); }
+  setMetronomeAccent(v: boolean) { this.metronome?.setAccentFirstBeat(v); }
+  setAudioVolume(v: number) { if (this.gain) this.gain.gain.setTargetAtTime(Math.max(0, Math.min(1, v)), this.ctx!.currentTime, 0.02); }
 
   getBufferDuration(): number | null {
     return this.buffer?.duration ?? null;
@@ -88,6 +108,9 @@ export class BrowserLoopEngine {
     this.ctx = this.ctx ?? new AudioContext();
     this.gain = this.gain ?? this.ctx.createGain();
     this.gain.connect(this.ctx.destination);
+    if (!this.metronome) {
+      this.metronome = new Metronome(this.ctx, (t) => this.getBpmAtAudioTime(t));
+    }
     const arrayBuffer = await file.arrayBuffer();
     this.buffer = await this.ctx.decodeAudioData(arrayBuffer);
     this.pausedAudioSeconds = 0;
@@ -113,6 +136,14 @@ export class BrowserLoopEngine {
     }
 
     this.isPlaying = true;
+    if (this.metronome && this.ctx) {
+      this.metronome.start(
+        this.ctx.currentTime,
+        this.pausedAudioSeconds,
+        this.timeline.originalBpm,
+        this.timeline.timeSignature.beatsPerBar
+      );
+    }
     this.tick();
   }
 
@@ -123,6 +154,7 @@ export class BrowserLoopEngine {
     this.postWorklet({ type: "pause" });
     this.disconnectWorkletOnly();
     this.isPlaying = false;
+    this.metronome?.pause();
     if (this.raf) cancelAnimationFrame(this.raf);
   }
 
@@ -132,6 +164,7 @@ export class BrowserLoopEngine {
     this.postWorklet({ type: "stop" });
     this.disconnectWorkletOnly();
     this.isPlaying = false;
+    this.metronome?.stop();
     if (this.raf) cancelAnimationFrame(this.raf);
     this.emitStatus(1, this.timeline.originalBpm, this.timeline.originalBpm, this.timeline.originalBpm);
   }
@@ -256,6 +289,7 @@ export class BrowserLoopEngine {
   private tick = () => {
     if (!this.isPlaying) return;
     const current = this.getCurrentStatusValues();
+    this.lastActualBpm = current.actualBpm;
     if (this.playbackMode === "pitch-preserve") {
       this.postWorklet({ type: "setTempoRatio", ratio: current.ratio });
     } else if (this.source && this.ctx) {

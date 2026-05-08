@@ -3,6 +3,7 @@
 import { useMemo, useRef, useState } from "react";
 import { FileLoader } from "@/components/FileLoader";
 import { LiveBeatPanel } from "@/components/LiveBeatPanel";
+import { MetronomePanel } from "@/components/MetronomePanel";
 import { TapTempoPad } from "@/components/TapTempoPad";
 import { TimelineEditor } from "@/components/TimelineEditor";
 import { TransportBar } from "@/components/TransportBar";
@@ -16,6 +17,10 @@ export default function Page() {
   const [fileName, setFileName] = useState<string>("");
   const [targetBpm, setTargetBpm] = useState(132);
   const [transitionBeats, setTransitionBeats] = useState(8);
+  const [metronomeEnabled, setMetronomeEnabled] = useState(false);
+  const [metronomeAccent, setMetronomeAccent] = useState(true);
+  const [metronomeVolume, setMetronomeVolume] = useState(0.8);
+  const [audioVolume, setAudioVolume] = useState(1.0);
   const [status, setStatus] = useState<EngineStatus>({
     isPlaying: false,
     currentBar: 1,
@@ -66,6 +71,11 @@ export default function Page() {
     void engine.play();
   };
 
+  const handleMetronomeEnabled = (v: boolean) => { setMetronomeEnabled(v); engine.setMetronomeEnabled(v); };
+  const handleMetronomeAccent = (v: boolean) => { setMetronomeAccent(v); engine.setMetronomeAccent(v); };
+  const handleMetronomeVolume = (v: number) => { setMetronomeVolume(v); engine.setMetronomeVolume(v); };
+  const handleAudioVolume = (v: number) => { setAudioVolume(v); engine.setAudioVolume(v); };
+
   const triggerLiveBeat = (bpm = targetBpm, beats = transitionBeats) => {
     setTargetBpm(bpm);
     setTransitionBeats(beats);
@@ -102,6 +112,16 @@ export default function Page() {
       />
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 16 }}>
+        <MetronomePanel
+          enabled={metronomeEnabled}
+          accentFirstBeat={metronomeAccent}
+          metronomeVolume={metronomeVolume}
+          audioVolume={audioVolume}
+          onEnabledChange={handleMetronomeEnabled}
+          onAccentChange={handleMetronomeAccent}
+          onMetronomeVolumeChange={handleMetronomeVolume}
+          onAudioVolumeChange={handleAudioVolume}
+        />
         <LiveBeatPanel
           targetBpm={targetBpm}
           transitionBeats={transitionBeats}
