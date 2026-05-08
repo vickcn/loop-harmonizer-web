@@ -79,6 +79,7 @@ export default function Page() {
       <TransportBar
         title="Loop 播放"
         loaded={loaded}
+        isActive={status.driverMode === "loop"}
         isPlaying={loopIsPlaying}
         currentBar={status.currentBar}
         currentBpm={status.currentBpm}
@@ -116,6 +117,7 @@ export default function Page() {
       <TransportBar
         title="Timeline 播放"
         loaded={loaded}
+        isActive={status.driverMode === "timeline"}
         isPlaying={timelineIsPlaying}
         currentBar={status.currentBar}
         currentBpm={status.currentBpm}

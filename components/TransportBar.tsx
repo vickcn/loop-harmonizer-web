@@ -6,6 +6,7 @@ type Props = {
   title: string;
   loaded: boolean;
   isPlaying: boolean;
+  isActive: boolean;
   currentBar: number;
   currentBpm: number;
   timelineBpm: number;
@@ -21,7 +22,7 @@ type Props = {
 
 export function TransportBar({ showModeSelector = true, ...props }: Props) {
   return (
-    <div className="card grid">
+    <div className="card grid" style={{ opacity: props.isActive ? 1 : 0.5 }}>
       <div className="row" style={{ justifyContent: "space-between" }}>
         <div className="row">
           <h2 style={{ margin: 0 }}>{props.title}</h2>
@@ -43,13 +44,15 @@ export function TransportBar({ showModeSelector = true, ...props }: Props) {
           </label>
         )}
       </div>
-      <div className="row">
-        <span className="label">Bar</span><strong>{props.currentBar.toFixed(2)}</strong>
-        <span className="label">BPM</span><strong>{props.timelineBpm.toFixed(1)}</strong>
-        <span className="label">Actual</span><strong>{props.currentBpm.toFixed(1)}</strong>
-        <span className="label">Ratio</span><strong>{props.tempoRatio.toFixed(3)}x</strong>
-        <span className="label">Pitch</span><strong>{props.pitchPreserveReady ? "ready" : "standby"}</strong>
-      </div>
+      {props.isActive && (
+        <div className="row">
+          <span className="label">Bar</span><strong>{props.currentBar.toFixed(2)}</strong>
+          <span className="label">BPM</span><strong>{props.timelineBpm.toFixed(1)}</strong>
+          <span className="label">Actual</span><strong>{props.currentBpm.toFixed(1)}</strong>
+          <span className="label">Ratio</span><strong>{props.tempoRatio.toFixed(3)}x</strong>
+          <span className="label">Pitch</span><strong>{props.pitchPreserveReady ? "ready" : "standby"}</strong>
+        </div>
+      )}
     </div>
   );
 }
