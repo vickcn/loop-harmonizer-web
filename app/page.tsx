@@ -27,7 +27,7 @@ export default function Page() {
     timelineBpm: defaultTimeline.projectBpm,
     actualBpm: defaultTimeline.projectBpm,
     tempoRatio: 1,
-    playbackMode: "quick",
+    playbackMode: "pitch-preserve",
     pitchPreserveReady: false,
     driverMode: "loop",
     loopBpm: defaultTimeline.projectBpm,

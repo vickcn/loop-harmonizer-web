@@ -38,7 +38,7 @@ export class BrowserLoopEngine {
   private pausedAudioSeconds = 0;
   private liveTransition: LiveTransition | null = null;
   private onStatus?: (status: EngineStatus) => void;
-  private playbackMode: PlaybackMode = "quick";
+  private playbackMode: PlaybackMode = "pitch-preserve";
   private pitchPreserveReady = false;
   private workletLoading: Promise<void> | null = null;
   private driverMode: DriverMode = "loop";

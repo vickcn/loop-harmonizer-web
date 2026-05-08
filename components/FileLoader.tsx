@@ -50,18 +50,20 @@ export function FileLoader({ audioSource, onFileConfirmed, onAudioBpmChange }: P
             <div className="small">已載入：{audioSource.fileName}</div>
             <div className="row">
               <span className="label">音檔基準 BPM</span>
+              <button className="btn" onClick={() => commit(Math.max(20, editNum - 1))}>−</button>
               <input
                 className="input"
                 type="number"
                 value={editVal}
                 min={20} max={300}
-                style={{ width: 80 }}
+                style={{ width: 72 }}
                 onChange={(e) => setEditBpm(e.target.value)}
                 onBlur={() => editBpm !== "" && commit(editNum)}
                 onKeyDown={(e) => e.key === "Enter" && editBpm !== "" && commit(editNum)}
               />
+              <button className="btn" onClick={() => commit(Math.min(300, editNum + 1))}>+</button>
               <button className="btn" onClick={() => commit(Math.round(editNum / 2))}>÷2</button>
-              <button className="btn" onClick={() => commit(editNum * 2)}>×2</button>
+              <button className="btn" onClick={() => commit(Math.min(300, editNum * 2))}>×2</button>
             </div>
           </div>
         );
@@ -81,6 +83,7 @@ export function FileLoader({ audioSource, onFileConfirmed, onAudioBpmChange }: P
           <p className="small" style={{ margin: 0 }}>請確認此音檔原始 BPM：</p>
 
           <div className="row">
+            <button className="btn" onClick={() => setPendingBpm(String(Math.max(20, bpmNum - 1)))}>−</button>
             <input
               className="input"
               type="number"
@@ -88,10 +91,11 @@ export function FileLoader({ audioSource, onFileConfirmed, onAudioBpmChange }: P
               min={20}
               max={300}
               onChange={(e) => setPendingBpm(e.target.value)}
-              style={{ width: 100 }}
+              style={{ width: 72 }}
             />
+            <button className="btn" onClick={() => setPendingBpm(String(Math.min(300, bpmNum + 1)))}>+</button>
             <button className="btn" title="半速修正" onClick={() => setPendingBpm(String(Math.round(bpmNum / 2)))}>÷2</button>
-            <button className="btn" title="雙速修正" onClick={() => setPendingBpm(String(bpmNum * 2))}>×2</button>
+            <button className="btn" title="雙速修正" onClick={() => setPendingBpm(String(Math.min(300, bpmNum * 2)))}>×2</button>
           </div>
 
           <div className="row">

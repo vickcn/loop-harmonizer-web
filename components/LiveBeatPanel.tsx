@@ -9,6 +9,7 @@ type Props = {
 };
 
 export function LiveBeatPanel({ targetBpm, transitionBeats, onTargetBpmChange, onTransitionBeatsChange, onApply }: Props) {
+  const clamp = (v: number) => Math.max(20, Math.min(300, v));
   return (
     <div className="card grid">
       <div>
@@ -18,7 +19,15 @@ export function LiveBeatPanel({ targetBpm, transitionBeats, onTargetBpmChange, o
       <div className="row">
         <label className="row">
           <span className="label">目標 BPM</span>
-          <input className="input" type="number" value={targetBpm} onChange={(e) => onTargetBpmChange(Number(e.target.value) || 120)} />
+          <button className="btn" onClick={() => onTargetBpmChange(clamp(targetBpm - 1))}>−</button>
+          <input
+            className="input"
+            type="number"
+            value={targetBpm}
+            style={{ width: 72 }}
+            onChange={(e) => onTargetBpmChange(clamp(Number(e.target.value) || targetBpm))}
+          />
+          <button className="btn" onClick={() => onTargetBpmChange(clamp(targetBpm + 1))}>+</button>
         </label>
         <label className="row">
           <span className="label">緩衝拍數</span>
