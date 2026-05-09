@@ -57,6 +57,7 @@ export default function Page() {
     // projectBpm 預設對齊音檔基準 BPM，使用者可之後用 live beat 調整
     const nextTimeline: SongTimeline = { ...timeline, projectBpm: audioOriginalBpm, audioSource };
     updateTimeline(nextTimeline);
+    setTargetBpm(audioOriginalBpm);
 
     await engine.loadFile(file);
     setLoaded(true);
@@ -136,10 +137,10 @@ export default function Page() {
           songId={timeline.id}
           currentTimelineBpm={status.loopBpm}
           onSuggestedBpm={(bpm, beats) => triggerLiveBeat(bpm, beats)}
-          onSuggestedBaseBpm={(bpm) => updateTimeline({
-            ...timeline,
-            audioSource: { ...timeline.audioSource, userConfirmedBpm: bpm }
-          })}
+          onSuggestedBaseBpm={(bpm) => {
+            updateTimeline({ ...timeline, audioSource: { ...timeline.audioSource, userConfirmedBpm: bpm } });
+            setTargetBpm(bpm);
+          }}
         />
       </div>
 
@@ -147,10 +148,10 @@ export default function Page() {
       <FileLoader
         audioSource={timeline.audioSource}
         onFileConfirmed={handleFileConfirmed}
-        onAudioBpmChange={(bpm) => updateTimeline({
-          ...timeline,
-          audioSource: { ...timeline.audioSource, userConfirmedBpm: bpm }
-        })}
+        onAudioBpmChange={(bpm) => {
+          updateTimeline({ ...timeline, audioSource: { ...timeline.audioSource, userConfirmedBpm: bpm } });
+          setTargetBpm(bpm);
+        }}
       />
 
       {/* ── Timeline 播放 ── */}
