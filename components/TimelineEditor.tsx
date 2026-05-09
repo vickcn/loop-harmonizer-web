@@ -1,7 +1,7 @@
 "use client";
 
 import { PointerEvent, WheelEvent, useMemo, useRef, useState } from "react";
-import { SongTimeline, TempoAnchor } from "@/lib/types";
+import { SectionInstance, SongTimeline, TempoAnchor } from "@/lib/types";
 import { getSectionAtBar, getTimelineBpmAtBar, makeTempoSegmentsFromAnchors } from "@/lib/timeline";
 
 type Props = {
@@ -15,10 +15,20 @@ const WIDTH = 980;
 const SECTION_H = 74;
 const TEMPO_H = 230;
 const Y_SPAN_OPTIONS = [4, 8, 12, 16, 24];
+const HANDLE_W = 8;
+
+type SectionDrag =
+  | { kind: "move"; id: string; origStart: number; origEnd: number; ptrX: number }
+  | { kind: "resize-l"; id: string; origStart: number; ptrX: number }
+  | { kind: "resize-r"; id: string; origEnd: number; ptrX: number }
+  | null;
 
 export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimelineChange }: Props) {
   const [dragId, setDragId] = useState<string | null>(null);
   const [ySpan, setYSpan] = useState(4);
+  const [editMode, setEditMode] = useState(false);
+  const [selectedSectionId, setSelectedSectionId] = useState<string | null>(null);
+  const [sectionDrag, setSectionDrag] = useState<SectionDrag>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const sectionTypeMap = useMemo(() => new Map(timeline.sectionTypes.map((t) => [t.id, t])), [timeline.sectionTypes]);
   const centerBpm = timeline.projectBpm;
@@ -27,6 +37,7 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
 
   const barToX = (bar: number) => ((bar - 1) / (timeline.totalBars - 1)) * WIDTH;
   const xToBar = (x: number) => Math.round((x / WIDTH) * (timeline.totalBars - 1) + 1);
+  const xToBarCont = (x: number) => (x / WIDTH) * (timeline.totalBars - 1) + 1;
   const bpmToY = (bpm: number) => {
     const clamped = Math.max(axisMin, Math.min(axisMax, bpm));
     return TEMPO_H - ((clamped - axisMin) / (axisMax - axisMin)) * TEMPO_H;
@@ -62,16 +73,97 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
   const addAnchor = (event: PointerEvent<SVGSVGElement>) => {
     if ((event.target as Element).classList.contains("anchor-hit")) return;
     const { x, y } = pointerToLocal(event);
+    if (event.clientY - svgRef.current!.getBoundingClientRect().top < SECTION_H) return;
     const id = `ta_${Date.now()}`;
     const anchor = { id, bar: xToBar(x), bpm: yToBpm(y) };
     const next = { ...timeline, tempoAnchors: [...timeline.tempoAnchors, anchor].sort((a, b) => a.bar - b.bar) };
     onTimelineChange({ ...next, tempoSegments: makeTempoSegmentsFromAnchors(next) });
   };
 
-  const onPointerMove = (event: PointerEvent<SVGSVGElement>) => {
-    if (!dragId) return;
-    const { x, y } = pointerToLocal(event);
-    updateAnchor(dragId, { bar: xToBar(x), bpm: yToBpm(y) });
+  // Prevent sections from overlapping; gaps are allowed
+  const clampSection = (id: string, startBar: number, endBar: number): { startBar: number; endBar: number } => {
+    const others = timeline.sections.filter((s) => s.id !== id);
+    let s = startBar;
+    let e = endBar;
+    for (const o of others) {
+      // push right if overlapping from left
+      if (s < o.endBar && e > o.startBar) {
+        if (s < o.startBar) {
+          e = Math.min(e, o.startBar);
+        } else {
+          s = Math.max(s, o.endBar);
+        }
+      }
+    }
+    s = Math.max(1, Math.round(s));
+    e = Math.min(timeline.totalBars, Math.round(e));
+    if (e <= s) e = s + 1;
+    return { startBar: s, endBar: e };
+  };
+
+  const commitSection = (id: string, patch: Partial<SectionInstance>) => {
+    const sections = timeline.sections.map((s) => (s.id === id ? { ...s, ...patch } : s));
+    onTimelineChange({ ...timeline, sections });
+  };
+
+  const addSection = (clickX: number) => {
+    const bar = xToBar(clickX);
+    // Don't add if overlapping existing
+    if (timeline.sections.some((s) => bar >= s.startBar && bar < s.endBar)) return;
+    const typeId = timeline.sectionTypes[0]?.id ?? "verse";
+    const id = `sec_${Date.now()}`;
+    const newSection: SectionInstance = {
+      id,
+      typeId,
+      label: "New",
+      startBar: bar,
+      endBar: Math.min(timeline.totalBars, bar + 8)
+    };
+    onTimelineChange({ ...timeline, sections: [...timeline.sections, newSection] });
+    setSelectedSectionId(id);
+  };
+
+  const deleteSection = (id: string) => {
+    onTimelineChange({ ...timeline, sections: timeline.sections.filter((s) => s.id !== id) });
+    if (selectedSectionId === id) setSelectedSectionId(null);
+  };
+
+  const onPointerMoveSvg = (event: PointerEvent<SVGSVGElement>) => {
+    if (dragId) {
+      const { x, y } = pointerToLocal(event);
+      updateAnchor(dragId, { bar: xToBar(x), bpm: yToBpm(y) });
+      return;
+    }
+    if (!sectionDrag) return;
+    const rect = svgRef.current!.getBoundingClientRect();
+    const curX = Math.max(0, Math.min(WIDTH, event.clientX - rect.left));
+    const dX = curX - sectionDrag.ptrX;
+    const dBar = xToBarCont(dX + (sectionDrag.ptrX)) - xToBarCont(sectionDrag.ptrX);
+
+    if (sectionDrag.kind === "move") {
+      const len = sectionDrag.origEnd - sectionDrag.origStart;
+      const rawStart = sectionDrag.origStart + dBar;
+      const rawEnd = rawStart + len;
+      const s = Math.max(1, Math.round(rawStart));
+      const e = Math.min(timeline.totalBars, s + len);
+      const clamped = clampSection(sectionDrag.id, s, Math.round(e));
+      commitSection(sectionDrag.id, clamped);
+    } else if (sectionDrag.kind === "resize-l") {
+      const rawStart = sectionDrag.origStart + dBar;
+      const section = timeline.sections.find((s) => s.id === sectionDrag.id)!;
+      const clamped = clampSection(sectionDrag.id, rawStart, section.endBar);
+      commitSection(sectionDrag.id, { startBar: clamped.startBar });
+    } else if (sectionDrag.kind === "resize-r") {
+      const rawEnd = sectionDrag.origEnd + dBar;
+      const section = timeline.sections.find((s) => s.id === sectionDrag.id)!;
+      const clamped = clampSection(sectionDrag.id, section.startBar, rawEnd);
+      commitSection(sectionDrag.id, { endBar: clamped.endBar });
+    }
+  };
+
+  const onPointerUpSvg = () => {
+    setDragId(null);
+    setSectionDrag(null);
   };
 
   const onWheelZoomY = (event: WheelEvent<SVGSVGElement>) => {
@@ -88,10 +180,23 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
     }
   };
 
+  const onSvgDoubleClick = (event: PointerEvent<SVGSVGElement>) => {
+    const rect = svgRef.current!.getBoundingClientRect();
+    const localY = event.clientY - rect.top;
+    const localX = Math.max(0, Math.min(WIDTH, event.clientX - rect.left));
+    if (localY < SECTION_H) {
+      if (editMode) addSection(localX);
+      return;
+    }
+    addAnchor(event);
+  };
+
   const currentSection = getSectionAtBar(timeline, currentBar);
   const currentBpm = getTimelineBpmAtBar(timeline, currentBar);
   const sortedAnchors = [...timeline.tempoAnchors].sort((a, b) => a.bar - b.bar);
   const points = sortedAnchors.map((a) => `${barToX(a.bar)},${SECTION_H + bpmToY(a.bpm)}`).join(" ");
+
+  const selectedSection = timeline.sections.find((s) => s.id === selectedSectionId) ?? null;
 
   return (
     <div className="card grid">
@@ -101,6 +206,12 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
           <p className="small">點擊 Tempo 區可新增錨點；拖曳錨點可改 bar / BPM。雙擊錨點可刪除。Y 軸預設顯示中心 ±4 BPM，可手動拉伸。</p>
         </div>
         <div className="row">
+          <button
+            className={`btn${editMode ? " primary" : ""}`}
+            onClick={() => { setEditMode((v) => !v); if (editMode) { setSelectedSectionId(null); setSectionDrag(null); } }}
+          >
+            {editMode ? "✎ 編輯中" : "編輯段落"}
+          </button>
           <label className="row">
             <span className="label">總 Bars</span>
             <input
@@ -133,22 +244,91 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
           className="timeline"
           width={WIDTH}
           height={SECTION_H + TEMPO_H + 34}
-          onDoubleClick={addAnchor}
+          onDoubleClick={onSvgDoubleClick as unknown as React.MouseEventHandler<SVGSVGElement>}
           onWheel={onWheelZoomY}
-          onPointerMove={onPointerMove}
-          onPointerUp={() => setDragId(null)}
-          onPointerCancel={() => setDragId(null)}
+          onPointerMove={onPointerMoveSvg}
+          onPointerUp={onPointerUpSvg}
+          onPointerCancel={onPointerUpSvg}
         >
           <rect x={0} y={0} width={WIDTH} height={SECTION_H + TEMPO_H} fill="#111520" rx={16} />
+
+          {/* Section lane */}
+          {editMode && (
+            <rect x={0} y={0} width={WIDTH} height={SECTION_H} fill="transparent"
+              style={{ cursor: "crosshair" }} />
+          )}
 
           {timeline.sections.map((section) => {
             const type = sectionTypeMap.get(section.typeId);
             const x = barToX(section.startBar);
-            const w = Math.max(8, barToX(section.endBar) - x);
+            const w = Math.max(HANDLE_W * 2 + 4, barToX(section.endBar) - x);
+            const isSelected = selectedSectionId === section.id;
+
             return (
               <g key={section.id}>
-                <rect x={x + 2} y={10} width={w - 4} height={46} rx={12} fill={type?.color ?? "#475569"} opacity={0.86} />
-                <text x={x + w / 2} y={38} textAnchor="middle" fill="white" fontSize="13" fontWeight="700">{section.label}</text>
+                <rect
+                  x={x + 2} y={10} width={w - 4} height={46} rx={12}
+                  fill={type?.color ?? "#475569"}
+                  opacity={isSelected ? 1 : 0.86}
+                  stroke={isSelected ? "#fff" : "none"}
+                  strokeWidth={isSelected ? 2 : 0}
+                  style={{ cursor: editMode ? "grab" : "default" }}
+                  onPointerDown={editMode ? (e) => {
+                    e.stopPropagation();
+                    e.currentTarget.setPointerCapture(e.pointerId);
+                    setSelectedSectionId(section.id);
+                    const rect2 = svgRef.current!.getBoundingClientRect();
+                    setSectionDrag({
+                      kind: "move",
+                      id: section.id,
+                      origStart: section.startBar,
+                      origEnd: section.endBar,
+                      ptrX: Math.max(0, Math.min(WIDTH, e.clientX - rect2.left))
+                    });
+                  } : undefined}
+                  onClick={editMode ? (e) => { e.stopPropagation(); setSelectedSectionId(section.id); } : undefined}
+                />
+                <text x={x + w / 2} y={38} textAnchor="middle" fill="white" fontSize="13" fontWeight="700" pointerEvents="none">{section.label}</text>
+
+                {/* Resize handles (edit mode only) */}
+                {editMode && (
+                  <>
+                    <rect
+                      x={x + 2} y={10} width={HANDLE_W} height={46} rx={4}
+                      fill="rgba(255,255,255,0.25)"
+                      style={{ cursor: "ew-resize" }}
+                      onPointerDown={(e) => {
+                        e.stopPropagation();
+                        e.currentTarget.setPointerCapture(e.pointerId);
+                        setSelectedSectionId(section.id);
+                        const rect2 = svgRef.current!.getBoundingClientRect();
+                        setSectionDrag({
+                          kind: "resize-l",
+                          id: section.id,
+                          origStart: section.startBar,
+                          ptrX: Math.max(0, Math.min(WIDTH, e.clientX - rect2.left))
+                        });
+                      }}
+                    />
+                    <rect
+                      x={x + w - HANDLE_W - 2} y={10} width={HANDLE_W} height={46} rx={4}
+                      fill="rgba(255,255,255,0.25)"
+                      style={{ cursor: "ew-resize" }}
+                      onPointerDown={(e) => {
+                        e.stopPropagation();
+                        e.currentTarget.setPointerCapture(e.pointerId);
+                        setSelectedSectionId(section.id);
+                        const rect2 = svgRef.current!.getBoundingClientRect();
+                        setSectionDrag({
+                          kind: "resize-r",
+                          id: section.id,
+                          origEnd: section.endBar,
+                          ptrX: Math.max(0, Math.min(WIDTH, e.clientX - rect2.left))
+                        });
+                      }}
+                    />
+                  </>
+                )}
               </g>
             );
           })}
@@ -203,6 +383,41 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
           <line x1={barToX(currentBar)} y1={0} x2={barToX(currentBar)} y2={SECTION_H + TEMPO_H} stroke="white" strokeWidth={2} opacity={0.9} />
         </svg>
       </div>
+
+      {/* Section editor panel — only visible in edit mode when a section is selected */}
+      {editMode && selectedSection && (
+        <div style={{ background: "#1a2035", borderRadius: 12, padding: "14px 16px", display: "grid", gap: 12 }}>
+          <div className="row" style={{ justifyContent: "space-between" }}>
+            <span className="label" style={{ fontSize: 14, color: "#f4f4f5" }}>編輯段落：<strong>{selectedSection.label}</strong></span>
+            <button className="btn danger" style={{ padding: "4px 10px", fontSize: 13 }} onClick={() => deleteSection(selectedSection.id)}>刪除</button>
+          </div>
+          <div className="row">
+            <label className="row">
+              <span className="label">名稱</span>
+              <input
+                className="input"
+                type="text"
+                value={selectedSection.label}
+                style={{ width: 120 }}
+                onChange={(e) => commitSection(selectedSection.id, { label: e.target.value })}
+              />
+            </label>
+            <label className="row">
+              <span className="label">類型</span>
+              <select
+                className="input"
+                value={selectedSection.typeId}
+                onChange={(e) => commitSection(selectedSection.id, { typeId: e.target.value })}
+              >
+                {timeline.sectionTypes.map((t) => (
+                  <option key={t.id} value={t.id}>{t.name}</option>
+                ))}
+              </select>
+            </label>
+            <div className="small">Bar {selectedSection.startBar} – {selectedSection.endBar}</div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
