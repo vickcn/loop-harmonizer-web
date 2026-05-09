@@ -1,7 +1,7 @@
 const LOOKAHEAD_SECS = 0.15;
 const SCHEDULE_INTERVAL_MS = 25;
 
-export class Metronome {
+export class MetronomeClock {
   private ctx: AudioContext;
   private gainNode: GainNode;
   private getBpmAt: (audioTime: number) => number;
@@ -28,18 +28,19 @@ export class Metronome {
   setAccentFirstBeat(v: boolean) { this.accentFirstBeat = v; }
   setBeatsPerBar(v: number) { this.beatsPerBar = v; }
 
-  start(audioCtxNow: number, pausedSeconds: number, originalBpm: number, beatsPerBar: number) {
+  // pausedSeconds and baseBpm are used to align beat phase when resuming mid-loop
+  start(ctxNow: number, pausedSeconds: number, baseBpm: number, beatsPerBar: number) {
     this.stop();
     this.beatsPerBar = beatsPerBar;
 
-    const totalBeats = (pausedSeconds * originalBpm) / 60;
+    const totalBeats = (pausedSeconds * baseBpm) / 60;
     const currentBeatIndex = Math.floor(totalBeats);
     const beatFraction = totalBeats - currentBeatIndex;
-    const bpmNow = this.getBpmAt(audioCtxNow);
+    const bpmNow = this.getBpmAt(ctxNow);
     const secsToNextBeat = (1 - beatFraction) * (60 / Math.max(1, bpmNow));
 
     this.beatInBar = (currentBeatIndex + 1) % this.beatsPerBar;
-    this.nextBeatTime = audioCtxNow + secsToNextBeat;
+    this.nextBeatTime = ctxNow + secsToNextBeat;
     this.isRunning = true;
     this.loop();
   }

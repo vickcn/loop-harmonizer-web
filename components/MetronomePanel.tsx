@@ -5,6 +5,10 @@ type Props = {
   accentFirstBeat: boolean;
   metronomeVolume: number;
   audioVolume: number;
+  // standalone play: only available when no audio is loaded
+  standaloneIsPlaying: boolean;
+  onStandalonePlay: () => void;
+  onStandaloneStop: () => void;
   onEnabledChange: (v: boolean) => void;
   onAccentChange: (v: boolean) => void;
   onMetronomeVolumeChange: (v: number) => void;
@@ -13,11 +17,23 @@ type Props = {
 
 export function MetronomePanel({
   enabled, accentFirstBeat, metronomeVolume, audioVolume,
+  standaloneIsPlaying, onStandalonePlay, onStandaloneStop,
   onEnabledChange, onAccentChange, onMetronomeVolumeChange, onAudioVolumeChange,
 }: Props) {
   return (
     <div className="card grid">
-      <h2 style={{ margin: 0 }}>節拍器</h2>
+      <div className="row" style={{ justifyContent: "space-between" }}>
+        <h2 style={{ margin: 0 }}>節拍器</h2>
+        {enabled && (
+          <button
+            className={`btn${standaloneIsPlaying ? " danger" : " primary"}`}
+            style={{ padding: "6px 14px" }}
+            onClick={standaloneIsPlaying ? onStandaloneStop : onStandalonePlay}
+          >
+            {standaloneIsPlaying ? "⏹ 停止" : "▶ 純節拍器"}
+          </button>
+        )}
+      </div>
       <div className="row">
         <label className="row" style={{ gap: 8, cursor: "pointer" }}>
           <input type="checkbox" checked={enabled} onChange={(e) => onEnabledChange(e.target.checked)} />
