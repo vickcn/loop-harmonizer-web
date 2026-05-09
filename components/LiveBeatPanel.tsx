@@ -1,26 +1,89 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+
+const BPM_PRESETS_STORAGE_KEY = "loop-harmonizer.liveBeat.bpmPresets";
 
 type Props = {
   targetBpm: number;
   transitionBeats: number;
+  canSaveAsAudioBase: boolean;
   onTargetBpmChange: (bpm: number) => void;
   onTransitionBeatsChange: (beats: number) => void;
   onApply: () => void;
   onApplyDirect: () => void;
+  onSaveAsAudioBase: () => void;
+  onApplyPreset: (bpm: number) => void;
+  onApplyDirectPreset: (bpm: number) => void;
 };
 
-export function LiveBeatPanel({ targetBpm, transitionBeats, onTargetBpmChange, onTransitionBeatsChange, onApply, onApplyDirect }: Props) {
+export function LiveBeatPanel({
+  targetBpm,
+  transitionBeats,
+  canSaveAsAudioBase,
+  onTargetBpmChange,
+  onTransitionBeatsChange,
+  onApply,
+  onApplyDirect,
+  onSaveAsAudioBase,
+  onApplyPreset,
+  onApplyDirectPreset,
+}: Props) {
   const [inputVal, setInputVal] = useState("");
+  const [bpmPresets, setBpmPresets] = useState<number[]>([]);
+  const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
   const clamp = (v: number) => Math.max(20, Math.min(300, v));
 
   const displayVal = inputVal !== "" ? inputVal : String(targetBpm);
+  const selectedPresetValue = useMemo(
+    () => (bpmPresets.includes(targetBpm) ? String(targetBpm) : ""),
+    [bpmPresets, targetBpm]
+  );
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(BPM_PRESETS_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return;
+      const restored = parsed
+        .map((value) => Number(value))
+        .filter((value, index, arr) => Number.isFinite(value) && arr.indexOf(value) === index)
+        .map((value) => clamp(Math.round(value)));
+      setBpmPresets(restored);
+    } catch {
+      setBpmPresets([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem(BPM_PRESETS_STORAGE_KEY, JSON.stringify(bpmPresets));
+  }, [bpmPresets]);
 
   const commit = (raw: string) => {
     const n = Number(raw);
     if (!isNaN(n) && raw.trim() !== "") onTargetBpmChange(clamp(Math.round(n)));
     setInputVal("");
+  };
+
+  const addPreset = (bpm: number) => {
+    const next = clamp(Math.round(bpm));
+    setBpmPresets((prev) => (prev.includes(next) ? prev : [...prev, next]));
+  };
+
+  const removePreset = (bpm: number) => {
+    setBpmPresets((prev) => prev.filter((value) => value !== bpm));
+  };
+
+  const movePreset = (fromIndex: number, toIndex: number) => {
+    if (fromIndex === toIndex || fromIndex < 0 || toIndex < 0) return;
+    setBpmPresets((prev) => {
+      if (fromIndex >= prev.length || toIndex >= prev.length) return prev;
+      const next = [...prev];
+      const [moved] = next.splice(fromIndex, 1);
+      next.splice(toIndex, 0, moved);
+      return next;
+    });
   };
 
   return (
@@ -29,6 +92,69 @@ export function LiveBeatPanel({ targetBpm, transitionBeats, onTargetBpmChange, o
         <h2 style={{ margin: 0 }}>即時切 Beat</h2>
         <p className="small">可選擇依設定 beat 數線性緩衝，或直接切到目標 BPM。</p>
       </div>
+      <div className="row">
+        <label className="row">
+          <span className="label">記憶 BPM</span>
+          <select
+            className="input"
+            value={selectedPresetValue}
+            onChange={(e) => {
+              if (e.target.value === "") return;
+              const next = Number(e.target.value);
+              if (!Number.isNaN(next)) onTargetBpmChange(next);
+            }}
+          >
+            <option value="">選擇記憶值</option>
+            {bpmPresets.map((bpm) => (
+              <option key={bpm} value={bpm}>{bpm}</option>
+            ))}
+          </select>
+          <button className="btn" onClick={() => addPreset(targetBpm)}>加入記憶</button>
+        </label>
+      </div>
+      {bpmPresets.length > 0 && (
+        <div className="grid" style={{ gap: 8 }}>
+          {bpmPresets.map((bpm, index) => (
+            <div
+              key={bpm}
+              className="row"
+              draggable
+              onDragStart={() => setDraggingIndex(index)}
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={(e) => {
+                e.preventDefault();
+                if (draggingIndex !== null) movePreset(draggingIndex, index);
+                setDraggingIndex(null);
+              }}
+              onDragEnd={() => setDraggingIndex(null)}
+              style={{
+                justifyContent: "space-between",
+                background: "#10131b",
+                border: "1px solid var(--line)",
+                borderRadius: 12,
+                padding: "8px 10px",
+                opacity: draggingIndex === index ? 0.6 : 1,
+              }}
+            >
+              <button className="btn" style={{ padding: "6px 10px" }} onClick={() => onTargetBpmChange(bpm)}>
+                BPM {bpm}
+              </button>
+              <div className="row" style={{ gap: 8 }}>
+                <button className="btn primary" style={{ padding: "6px 10px" }} onClick={() => onApplyPreset(bpm)}>
+                  線性切
+                </button>
+                <button className="btn" style={{ padding: "6px 10px" }} onClick={() => onApplyDirectPreset(bpm)}>
+                  直接切
+                </button>
+                <span className="small" style={{ cursor: "grab" }}>拖曳排序</span>
+                <button className="btn danger" style={{ padding: "6px 10px" }} onClick={() => removePreset(bpm)}>
+                  刪除
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
       <div className="row">
         <label className="row">
           <span className="label">目標 BPM</span>
@@ -54,6 +180,11 @@ export function LiveBeatPanel({ targetBpm, transitionBeats, onTargetBpmChange, o
         </label>
         <button className="btn primary" onClick={onApply}>線性切過去</button>
         <button className="btn" onClick={onApplyDirect}>直接切過去</button>
+      </div>
+      <div className="row" style={{ justifyContent: "flex-end" }}>
+        <button className="btn" disabled={!canSaveAsAudioBase} onClick={onSaveAsAudioBase}>
+          記為音檔基準 BPM
+        </button>
       </div>
     </div>
   );

@@ -4,20 +4,16 @@ import { useEffect, useMemo, useState } from "react";
 import { calculateTapBpm } from "@/lib/tapTempo";
 import { BeatAnalyzeResponse } from "@/lib/types";
 
-type TapTarget = "liveBeat" | "audioBase";
-
 type Props = {
   songId: string;
   currentTimelineBpm: number;
   onSuggestedBpm: (bpm: number, transitionBeats: number) => void;
-  onSuggestedBaseBpm: (bpm: number) => void;
 };
 
-export function TapTempoPad({ songId, currentTimelineBpm, onSuggestedBpm, onSuggestedBaseBpm }: Props) {
+export function TapTempoPad({ songId, currentTimelineBpm, onSuggestedBpm }: Props) {
   const [requiredTaps, setRequiredTaps] = useState(4);
   const [tapTimes, setTapTimes] = useState<number[]>([]);
   const [isSending, setIsSending] = useState(false);
-  const [tapTarget, setTapTarget] = useState<TapTarget>("liveBeat");
   const bpm = useMemo(() => calculateTapBpm(tapTimes), [tapTimes]);
 
   const tap = async () => {
@@ -25,13 +21,6 @@ export function TapTempoPad({ songId, currentTimelineBpm, onSuggestedBpm, onSugg
     setTapTimes(next);
     if (next.length === requiredTaps) {
       const rawDetectedBpm = calculateTapBpm(next);
-
-      if (tapTarget === "audioBase") {
-        // 直接用前端算出的 BPM 設定音檔基準，不送 API
-        if (rawDetectedBpm) onSuggestedBaseBpm(rawDetectedBpm);
-        setTapTimes([]);
-        return;
-      }
 
       setIsSending(true);
       try {
@@ -60,7 +49,7 @@ export function TapTempoPad({ songId, currentTimelineBpm, onSuggestedBpm, onSugg
     <div className="card grid">
       <div>
         <h2 style={{ margin: 0 }}>Tap Tempo</h2>
-        <p className="small">在下方區域點擊，或按空白鍵敲拍。敲滿指定拍數後套用到選定目標。</p>
+        <p className="small">在下方區域點擊，或按空白鍵敲拍。敲滿指定拍數後會回填到即時切 Beat，由那邊控制是否執行。</p>
       </div>
       <div className="row">
         <label className="row">
@@ -69,13 +58,6 @@ export function TapTempoPad({ songId, currentTimelineBpm, onSuggestedBpm, onSugg
             <option value={4}>4</option>
             <option value={8}>8</option>
             <option value={16}>16</option>
-          </select>
-        </label>
-        <label className="row">
-          <span className="label">套用到</span>
-          <select className="input" value={tapTarget} onChange={(e) => { setTapTarget(e.target.value as TapTarget); setTapTimes([]); }}>
-            <option value="liveBeat">變速目標 BPM</option>
-            <option value="audioBase">音檔基準 BPM</option>
           </select>
         </label>
         <button className="btn" onClick={() => setTapTimes([])}>重新敲</button>

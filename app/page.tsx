@@ -117,34 +117,41 @@ export default function Page() {
       />
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 16 }}>
-        <MetronomePanel
-          enabled={metronomeEnabled}
-          accentFirstBeat={metronomeAccent}
-          metronomeVolume={metronomeVolume}
-          audioVolume={audioVolume}
-          standaloneIsPlaying={status.isPlaying && status.isMetronomeOnly}
-          onStandalonePlay={() => { engine.setDriverMode("loop"); void engine.play(); }}
-          onStandaloneStop={() => engine.stop()}
-          onEnabledChange={handleMetronomeEnabled}
-          onAccentChange={handleMetronomeAccent}
-          onMetronomeVolumeChange={handleMetronomeVolume}
-          onAudioVolumeChange={handleAudioVolume}
-        />
+        <div style={{ gridColumn: "1 / -1" }}>
+          <MetronomePanel
+            enabled={metronomeEnabled}
+            accentFirstBeat={metronomeAccent}
+            metronomeVolume={metronomeVolume}
+            audioVolume={audioVolume}
+            standaloneIsPlaying={status.isPlaying && status.isMetronomeOnly}
+            onStandalonePlay={() => { engine.setDriverMode("loop"); void engine.play(); }}
+            onStandaloneStop={() => engine.stop()}
+            onEnabledChange={handleMetronomeEnabled}
+            onAccentChange={handleMetronomeAccent}
+            onMetronomeVolumeChange={handleMetronomeVolume}
+            onAudioVolumeChange={handleAudioVolume}
+          />
+        </div>
         <LiveBeatPanel
           targetBpm={targetBpm}
           transitionBeats={transitionBeats}
+          canSaveAsAudioBase={loaded}
           onTargetBpmChange={setTargetBpm}
           onTransitionBeatsChange={setTransitionBeats}
           onApply={() => triggerLiveBeat()}
           onApplyDirect={() => triggerLiveBeat(targetBpm, transitionBeats, true)}
+          onSaveAsAudioBase={() => {
+            updateTimeline({ ...timeline, audioSource: { ...timeline.audioSource, userConfirmedBpm: targetBpm } });
+          }}
+          onApplyPreset={(bpm) => triggerLiveBeat(bpm, transitionBeats, false)}
+          onApplyDirectPreset={(bpm) => triggerLiveBeat(bpm, transitionBeats, true)}
         />
         <TapTempoPad
           songId={timeline.id}
           currentTimelineBpm={status.loopBpm}
-          onSuggestedBpm={(bpm, beats) => triggerLiveBeat(bpm, beats)}
-          onSuggestedBaseBpm={(bpm) => {
-            updateTimeline({ ...timeline, audioSource: { ...timeline.audioSource, userConfirmedBpm: bpm } });
+          onSuggestedBpm={(bpm, beats) => {
             setTargetBpm(bpm);
+            setTransitionBeats(beats);
           }}
         />
       </div>
