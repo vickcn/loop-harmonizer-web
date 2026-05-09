@@ -275,7 +275,7 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
                   style={{ cursor: editMode ? "grab" : "default" }}
                   onPointerDown={editMode ? (e) => {
                     e.stopPropagation();
-                    e.currentTarget.setPointerCapture(e.pointerId);
+                    svgRef.current!.setPointerCapture(e.pointerId);
                     setSelectedSectionId(section.id);
                     const rect2 = svgRef.current!.getBoundingClientRect();
                     setSectionDrag({
@@ -299,7 +299,7 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
                       style={{ cursor: "ew-resize" }}
                       onPointerDown={(e) => {
                         e.stopPropagation();
-                        e.currentTarget.setPointerCapture(e.pointerId);
+                        svgRef.current!.setPointerCapture(e.pointerId);
                         setSelectedSectionId(section.id);
                         const rect2 = svgRef.current!.getBoundingClientRect();
                         setSectionDrag({
@@ -316,7 +316,7 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
                       style={{ cursor: "ew-resize" }}
                       onPointerDown={(e) => {
                         e.stopPropagation();
-                        e.currentTarget.setPointerCapture(e.pointerId);
+                        svgRef.current!.setPointerCapture(e.pointerId);
                         setSelectedSectionId(section.id);
                         const rect2 = svgRef.current!.getBoundingClientRect();
                         setSectionDrag({

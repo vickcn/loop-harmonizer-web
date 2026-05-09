@@ -1,5 +1,7 @@
 "use client";
 
+import { useState } from "react";
+
 type Props = {
   targetBpm: number;
   transitionBeats: number;
@@ -9,7 +11,17 @@ type Props = {
 };
 
 export function LiveBeatPanel({ targetBpm, transitionBeats, onTargetBpmChange, onTransitionBeatsChange, onApply }: Props) {
+  const [inputVal, setInputVal] = useState("");
   const clamp = (v: number) => Math.max(20, Math.min(300, v));
+
+  const displayVal = inputVal !== "" ? inputVal : String(targetBpm);
+
+  const commit = (raw: string) => {
+    const n = Number(raw);
+    if (!isNaN(n) && raw.trim() !== "") onTargetBpmChange(clamp(Math.round(n)));
+    setInputVal("");
+  };
+
   return (
     <div className="card grid">
       <div>
@@ -19,15 +31,17 @@ export function LiveBeatPanel({ targetBpm, transitionBeats, onTargetBpmChange, o
       <div className="row">
         <label className="row">
           <span className="label">目標 BPM</span>
-          <button className="btn" onClick={() => onTargetBpmChange(clamp(targetBpm - 1))}>−</button>
+          <button className="btn" onClick={() => { setInputVal(""); onTargetBpmChange(clamp(targetBpm - 1)); }}>−</button>
           <input
             className="input"
             type="number"
-            value={targetBpm}
+            value={displayVal}
             style={{ width: 72 }}
-            onChange={(e) => onTargetBpmChange(clamp(Number(e.target.value) || targetBpm))}
+            onChange={(e) => setInputVal(e.target.value)}
+            onBlur={(e) => commit(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") commit((e.target as HTMLInputElement).value); }}
           />
-          <button className="btn" onClick={() => onTargetBpmChange(clamp(targetBpm + 1))}>+</button>
+          <button className="btn" onClick={() => { setInputVal(""); onTargetBpmChange(clamp(targetBpm + 1)); }}>+</button>
         </label>
         <label className="row">
           <span className="label">緩衝拍數</span>
