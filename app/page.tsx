@@ -22,6 +22,7 @@ export default function Page() {
   const [audioVolume, setAudioVolume] = useState(1.0);
   const [status, setStatus] = useState<EngineStatus>({
     isPlaying: false,
+    isMetronomeOnly: false,
     currentBar: 1,
     currentBpm: defaultTimeline.projectBpm,
     timelineBpm: defaultTimeline.projectBpm,
@@ -121,6 +122,9 @@ export default function Page() {
           accentFirstBeat={metronomeAccent}
           metronomeVolume={metronomeVolume}
           audioVolume={audioVolume}
+          standaloneIsPlaying={status.isPlaying && status.isMetronomeOnly}
+          onStandalonePlay={() => { engine.setDriverMode("loop"); void engine.play(); }}
+          onStandaloneStop={() => engine.stop()}
           onEnabledChange={handleMetronomeEnabled}
           onAccentChange={handleMetronomeAccent}
           onMetronomeVolumeChange={handleMetronomeVolume}
