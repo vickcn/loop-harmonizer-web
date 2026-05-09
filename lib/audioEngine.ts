@@ -1,6 +1,6 @@
 import { AudioPlayer, PlaybackMode } from "./audio/audioPlayer";
 import { MetronomeClock } from "./metronome/metronomeClock";
-import { TempoEngine } from "./tempo/tempoEngine";
+import { TempoEngine } from "./bpm/tempoEngine";
 import { getAudioBaseBpm, getTimelineBpmAtBar } from "./timeline";
 import { SongTimeline } from "./types";
 
