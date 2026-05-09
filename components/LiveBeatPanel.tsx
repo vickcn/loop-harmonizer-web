@@ -8,9 +8,10 @@ type Props = {
   onTargetBpmChange: (bpm: number) => void;
   onTransitionBeatsChange: (beats: number) => void;
   onApply: () => void;
+  onApplyDirect: () => void;
 };
 
-export function LiveBeatPanel({ targetBpm, transitionBeats, onTargetBpmChange, onTransitionBeatsChange, onApply }: Props) {
+export function LiveBeatPanel({ targetBpm, transitionBeats, onTargetBpmChange, onTransitionBeatsChange, onApply, onApplyDirect }: Props) {
   const [inputVal, setInputVal] = useState("");
   const clamp = (v: number) => Math.max(20, Math.min(300, v));
 
@@ -26,7 +27,7 @@ export function LiveBeatPanel({ targetBpm, transitionBeats, onTargetBpmChange, o
     <div className="card grid">
       <div>
         <h2 style={{ margin: 0 }}>即時切 Beat</h2>
-        <p className="small">按下套用後，不瞬間跳拍，會依設定 beat 數線性緩衝過去。</p>
+        <p className="small">可選擇依設定 beat 數線性緩衝，或直接切到目標 BPM。</p>
       </div>
       <div className="row">
         <label className="row">
@@ -52,6 +53,7 @@ export function LiveBeatPanel({ targetBpm, transitionBeats, onTargetBpmChange, o
           </select>
         </label>
         <button className="btn primary" onClick={onApply}>線性切過去</button>
+        <button className="btn" onClick={onApplyDirect}>直接切過去</button>
       </div>
     </div>
   );

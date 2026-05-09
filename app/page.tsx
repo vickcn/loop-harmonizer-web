@@ -81,10 +81,10 @@ export default function Page() {
   const handleMetronomeVolume = (v: number) => { setMetronomeVolume(v); engine.setMetronomeVolume(v); };
   const handleAudioVolume = (v: number) => { setAudioVolume(v); engine.setAudioVolume(v); };
 
-  const triggerLiveBeat = (bpm = targetBpm, beats = transitionBeats) => {
+  const triggerLiveBeat = (bpm = targetBpm, beats = transitionBeats, isDirect = false) => {
     setTargetBpm(bpm);
     setTransitionBeats(beats);
-    engine.triggerLiveBeatChange(bpm, beats);
+    engine.triggerLiveBeatChange(bpm, beats, isDirect);
   };
 
   const loopIsPlaying = status.isPlaying && status.driverMode === "loop";
@@ -136,6 +136,7 @@ export default function Page() {
           onTargetBpmChange={setTargetBpm}
           onTransitionBeatsChange={setTransitionBeats}
           onApply={() => triggerLiveBeat()}
+          onApplyDirect={() => triggerLiveBeat(targetBpm, transitionBeats, true)}
         />
         <TapTempoPad
           songId={timeline.id}

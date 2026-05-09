@@ -128,9 +128,9 @@ export class BrowserLoopEngine {
     this.emitStatus(1, this.timeline.projectBpm, this.timeline.projectBpm);
   }
 
-  triggerLiveBeatChange(toBpm: number, transitionBeats: number) {
+  triggerLiveBeatChange(toBpm: number, transitionBeats: number, isDirect = false) {
     if (!this.ctx) return;
-    this.tempoEngine.triggerTransition(toBpm, transitionBeats, this.ctx.currentTime);
+    this.tempoEngine.triggerTransition(toBpm, transitionBeats, this.ctx.currentTime, isDirect);
   }
 
   private ensureCtx() {

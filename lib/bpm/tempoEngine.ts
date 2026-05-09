@@ -24,7 +24,13 @@ export class TempoEngine {
     this.currentBpm = bpm;
   }
 
-  triggerTransition(toBpm: number, transitionBeats: number, ctxTime: number) {
+  triggerTransition(toBpm: number, transitionBeats: number, ctxTime: number, isDirect = false) {
+    if (isDirect || transitionBeats <= 0) {
+      this.liveTransition = null;
+      this.currentBpm = toBpm;
+      if (this.driverMode === "loop") this.loopBpm = toBpm;
+      return;
+    }
     const fromBpm = this.currentBpm;
     const durationSeconds = (60 / Math.max(1, fromBpm)) * transitionBeats;
     this.liveTransition = { fromBpm, toBpm, startTime: ctxTime, durationSeconds };
