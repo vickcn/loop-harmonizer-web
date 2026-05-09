@@ -34,6 +34,9 @@ export class BrowserLoopEngine {
   private metronomeOnlyStartTime = 0;
   private driverMode: DriverMode = "loop";
   private onStatus?: (status: EngineStatus) => void;
+  private metronomeEnabled = false;
+  private metronomeVolume = 0.8;
+  private metronomeAccentFirstBeat = true;
 
   constructor(timeline: SongTimeline) {
     this.timeline = timeline;
@@ -54,9 +57,18 @@ export class BrowserLoopEngine {
     this.tempoEngine.setDriverMode(mode);
   }
 
-  setMetronomeEnabled(v: boolean) { this.clock?.setEnabled(v); }
-  setMetronomeVolume(v: number) { this.clock?.setVolume(v); }
-  setMetronomeAccent(v: boolean) { this.clock?.setAccentFirstBeat(v); }
+  setMetronomeEnabled(v: boolean) {
+    this.metronomeEnabled = v;
+    this.clock?.setEnabled(v);
+  }
+  setMetronomeVolume(v: number) {
+    this.metronomeVolume = v;
+    this.clock?.setVolume(v);
+  }
+  setMetronomeAccent(v: boolean) {
+    this.metronomeAccentFirstBeat = v;
+    this.clock?.setAccentFirstBeat(v);
+  }
   setAudioVolume(v: number) { this.audioPlayer?.setVolume(v); }
   getBufferDuration(): number | null { return this.audioPlayer?.getBufferDuration() ?? null; }
   setStatusCallback(cb: (s: EngineStatus) => void) { this.onStatus = cb; }
@@ -128,6 +140,9 @@ export class BrowserLoopEngine {
     this.outGain.connect(this.ctx.destination);
     this.audioPlayer = new AudioPlayer(this.ctx, this.outGain);
     this.clock = new MetronomeClock(this.ctx, (t) => this.tempoEngine.getBpmAtAudioTime(t));
+    this.clock.setEnabled(this.metronomeEnabled);
+    this.clock.setVolume(this.metronomeVolume);
+    this.clock.setAccentFirstBeat(this.metronomeAccentFirstBeat);
   }
 
   private getElapsedSeconds(): number {
