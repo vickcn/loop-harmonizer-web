@@ -163,6 +163,8 @@ logs/
 memo*
 *.tmp*
 *old*
+lib/audioEngine.ts.old.bak.ts
+lib/audioEngine.ts.old.bak
 env*
 tmp*/
 *test*
