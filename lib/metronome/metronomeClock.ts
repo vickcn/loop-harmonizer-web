@@ -1,3 +1,9 @@
+import {
+  BUILT_IN_SOUNDS,
+  DEFAULT_SOUND_ID,
+  MetronomeSound,
+} from "./metronomeSound";
+
 const LOOKAHEAD_SECS = 0.15;
 const SCHEDULE_INTERVAL_MS = 25;
 
@@ -9,6 +15,8 @@ export class MetronomeClock {
   private beatsPerBar = 4;
   private enabled = false;
   private accentFirstBeat = true;
+  private sound: MetronomeSound =
+    BUILT_IN_SOUNDS.find((s) => s.id === DEFAULT_SOUND_ID)!;
 
   private nextBeatTime = 0;
   private beatInBar = 0;
@@ -27,6 +35,7 @@ export class MetronomeClock {
   setVolume(v: number) { this.gainNode.gain.setTargetAtTime(Math.max(0, Math.min(1, v)), this.ctx.currentTime, 0.02); }
   setAccentFirstBeat(v: boolean) { this.accentFirstBeat = v; }
   setBeatsPerBar(v: number) { this.beatsPerBar = v; }
+  setSound(sound: MetronomeSound) { this.sound = sound; }
 
   // pausedSeconds and baseBpm are used to align beat phase when resuming mid-loop
   start(ctxNow: number, pausedSeconds: number, baseBpm: number, beatsPerBar: number) {
@@ -69,17 +78,23 @@ export class MetronomeClock {
   }
 
   private click(time: number, isAccent: boolean) {
+    const {
+      wave, accentFreq, beatFreq, accentPeak, beatPeak, attack, decay, duration,
+    } = this.sound;
+
     const osc = this.ctx.createOscillator();
     const env = this.ctx.createGain();
     osc.connect(env);
     env.connect(this.gainNode);
-    osc.type = "sine";
-    osc.frequency.value = isAccent && this.accentFirstBeat ? 1200 : 900;
-    const peak = isAccent && this.accentFirstBeat ? 1.0 : 0.6;
+
+    osc.type = wave as OscillatorType;
+    osc.frequency.value = isAccent && this.accentFirstBeat ? accentFreq : beatFreq;
+    const peak = isAccent && this.accentFirstBeat ? accentPeak : beatPeak;
+
     env.gain.setValueAtTime(0, time);
-    env.gain.linearRampToValueAtTime(peak, time + 0.005);
-    env.gain.exponentialRampToValueAtTime(0.001, time + 0.04);
+    env.gain.linearRampToValueAtTime(peak, time + attack);
+    env.gain.exponentialRampToValueAtTime(0.001, time + attack + decay);
     osc.start(time);
-    osc.stop(time + 0.05);
+    osc.stop(time + duration);
   }
 }

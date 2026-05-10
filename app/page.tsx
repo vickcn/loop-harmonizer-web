@@ -8,6 +8,14 @@ import { TapTempoPad } from "@/components/TapTempoPad";
 import { TimelineEditor } from "@/components/TimelineEditor";
 import { TransportBar } from "@/components/TransportBar";
 import { BrowserLoopEngine, DriverMode, EngineStatus, PlaybackMode } from "@/lib/audioEngine";
+import {
+  DEFAULT_SOUND_ID,
+  findSound,
+  getAllSounds,
+  loadCustomSounds,
+  MetronomeSound,
+  saveCustomSounds,
+} from "@/lib/metronome/metronomeSound";
 import { defaultTimeline } from "@/lib/timeline";
 import { AudioSourceMeta, SongTimeline } from "@/lib/types";
 
@@ -20,6 +28,8 @@ export default function Page() {
   const [metronomeAccent, setMetronomeAccent] = useState(true);
   const [metronomeVolume, setMetronomeVolume] = useState(0.8);
   const [audioVolume, setAudioVolume] = useState(1.0);
+  const [customSounds, setCustomSounds] = useState<MetronomeSound[]>(() => loadCustomSounds());
+  const [currentSoundId, setCurrentSoundId] = useState(DEFAULT_SOUND_ID);
   const [status, setStatus] = useState<EngineStatus>({
     isPlaying: false,
     isMetronomeOnly: false,
@@ -81,6 +91,30 @@ export default function Page() {
   const handleMetronomeVolume = (v: number) => { setMetronomeVolume(v); engine.setMetronomeVolume(v); };
   const handleAudioVolume = (v: number) => { setAudioVolume(v); engine.setAudioVolume(v); };
 
+  const allSounds = getAllSounds(customSounds);
+
+  const handleSoundChange = (id: string) => {
+    setCurrentSoundId(id);
+    engine.setMetronomeSound(findSound(allSounds, id));
+  };
+
+  const handleCustomSoundsChange = (next: MetronomeSound[]) => {
+    setCustomSounds(next);
+    saveCustomSounds(next);
+  };
+
+  const handlePreviewSound = (sound: MetronomeSound) => {
+    engine.setMetronomeSound(sound);
+    // briefly enable metronome and play one tick via standalone
+    engine.setMetronomeEnabled(true);
+    void engine.play();
+    setTimeout(() => {
+      engine.stop();
+      engine.setMetronomeEnabled(metronomeEnabled);
+      engine.setMetronomeSound(findSound(allSounds, currentSoundId));
+    }, 700);
+  };
+
   const triggerLiveBeat = (bpm = targetBpm, beats = transitionBeats, isDirect = false) => {
     setTargetBpm(bpm);
     setTransitionBeats(beats);
@@ -130,6 +164,11 @@ export default function Page() {
             onAccentChange={handleMetronomeAccent}
             onMetronomeVolumeChange={handleMetronomeVolume}
             onAudioVolumeChange={handleAudioVolume}
+            sounds={allSounds}
+            currentSoundId={currentSoundId}
+            onSoundChange={handleSoundChange}
+            onCustomSoundsChange={handleCustomSoundsChange}
+            onPreviewSound={handlePreviewSound}
           />
         </div>
         <LiveBeatPanel

@@ -2,11 +2,18 @@
   "name": "loop-harmonizer-web",
   "version": "0.1.0",
   "private": true,
-  "scripts": {
+  "//scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
     "lint": "next lint"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "click:test": "node scripts/render-metronome-click.mjs"
   },
   "dependencies": {
     "@types/node": "^22.10.2",

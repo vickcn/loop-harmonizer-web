@@ -1,5 +1,6 @@
 import { AudioPlayer, PlaybackMode } from "./audio/audioPlayer";
 import { MetronomeClock } from "./metronome/metronomeClock";
+import { MetronomeSound } from "./metronome/metronomeSound";
 import { TempoEngine } from "./bpm/tempoEngine";
 import { getAudioBaseBpm, getTimelineBpmAtBar } from "./timeline";
 import { SongTimeline } from "./types";
@@ -68,6 +69,9 @@ export class BrowserLoopEngine {
   setMetronomeAccent(v: boolean) {
     this.metronomeAccentFirstBeat = v;
     this.clock?.setAccentFirstBeat(v);
+  }
+  setMetronomeSound(sound: MetronomeSound) {
+    this.clock?.setSound(sound);
   }
   setAudioVolume(v: number) { this.audioPlayer?.setVolume(v); }
   getBufferDuration(): number | null { return this.audioPlayer?.getBufferDuration() ?? null; }
