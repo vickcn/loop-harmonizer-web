@@ -1,6 +1,6 @@
 "use client";
 
-import { PointerEvent, WheelEvent, useMemo, useRef, useState } from "react";
+import { PointerEvent, WheelEvent, useEffect, useMemo, useRef, useState } from "react";
 import { SectionInstance, SongTimeline, TempoAnchor } from "@/lib/types";
 import { getSectionAtBar, getTimelineBpmAtBar, makeTempoSegmentsFromAnchors } from "@/lib/timeline";
 
@@ -11,7 +11,8 @@ type Props = {
   onTimelineChange: (timeline: SongTimeline) => void;
 };
 
-const WIDTH = 980;
+const MIN_WIDTH = 720;        // 手機橫滑用的最小寬度
+const MAX_WIDTH = 1800;       // 桌機上限，避免拉太誇張
 const SECTION_H = 74;
 const TEMPO_H = 230;
 const Y_SPAN_OPTIONS = [4, 8, 12, 16, 24];
@@ -29,11 +30,30 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
   const [editMode, setEditMode] = useState(false);
   const [selectedSectionId, setSelectedSectionId] = useState<string | null>(null);
   const [sectionDrag, setSectionDrag] = useState<SectionDrag>(null);
+  const [width, setWidth] = useState<number>(MIN_WIDTH);
   const svgRef = useRef<SVGSVGElement | null>(null);
+  const wrapperRef = useRef<HTMLDivElement | null>(null);
   const sectionTypeMap = useMemo(() => new Map(timeline.sectionTypes.map((t) => [t.id, t])), [timeline.sectionTypes]);
   const centerBpm = timeline.projectBpm;
   const axisMin = centerBpm - ySpan;
   const axisMax = centerBpm + ySpan;
+  const WIDTH = width;
+
+  // 觀察容器寬度，桌機自動撐滿、手機保留 MIN_WIDTH 讓使用者橫滑
+  useEffect(() => {
+    if (!wrapperRef.current) return;
+    const el = wrapperRef.current;
+    const update = () => {
+      const cw = el.clientWidth;
+      // 容器若比 MIN 還窄就維持 MIN（觸發水平捲軸），否則 clamp 到 MAX
+      const next = Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, cw));
+      setWidth(next);
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   const barToX = (bar: number) => ((bar - 1) / (timeline.totalBars - 1)) * WIDTH;
   const xToBar = (x: number) => Math.round((x / WIDTH) * (timeline.totalBars - 1) + 1);
@@ -238,7 +258,7 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
         </div>
       </div>
 
-      <div style={{ overflowX: "auto" }}>
+      <div ref={wrapperRef} className="timeline-scroll" style={{ overflowX: "auto" }}>
         <svg
           ref={svgRef}
           className="timeline"
