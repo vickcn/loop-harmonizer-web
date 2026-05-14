@@ -293,18 +293,45 @@ export function TimelineEditor({
     setSectionDrag(null);
   };
 
-  const onWheelZoomY = (event: WheelEvent<SVGSVGElement>) => {
+  const zoomXAtPlayhead = (ratio: number) => {
+    if (!wrapperRef.current) return;
+    const nextWidth = Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, width * ratio));
+    if (Math.abs(nextWidth - width) < 0.5) return;
+    const playBar = Math.max(1, Math.min(timeline.totalBars, currentBar));
+    const oldPlayX = ((playBar - 1) / (timeline.totalBars - 1)) * width;
+    const newPlayX = ((playBar - 1) / (timeline.totalBars - 1)) * nextWidth;
+    const playheadScreenX = oldPlayX - wrapperRef.current.scrollLeft;
+    const maxScroll = Math.max(0, nextWidth - wrapperRef.current.clientWidth);
+    const nextScrollLeft = Math.max(0, Math.min(maxScroll, newPlayX - playheadScreenX));
+    setWidth(nextWidth);
+    requestAnimationFrame(() => {
+      if (wrapperRef.current) wrapperRef.current.scrollLeft = nextScrollLeft;
+    });
+  };
+
+  const onWheelTimeline = (event: WheelEvent<SVGSVGElement>) => {
     const rect = svgRef.current?.getBoundingClientRect();
     if (!rect) return;
-    if (event.clientY - rect.top < SECTION_H) return;
-    event.preventDefault();
-    const currentIndex = Y_SPAN_OPTIONS.indexOf(ySpan);
-    if (currentIndex < 0) return;
-    if (event.deltaY < 0 && currentIndex > 0) {
-      setYSpan(Y_SPAN_OPTIONS[currentIndex - 1]);
-    } else if (event.deltaY > 0 && currentIndex < Y_SPAN_OPTIONS.length - 1) {
-      setYSpan(Y_SPAN_OPTIONS[currentIndex + 1]);
+
+    const inTempoArea = event.clientY - rect.top >= SECTION_H;
+    if (event.altKey && inTempoArea) {
+      event.preventDefault();
+      const currentIndex = Y_SPAN_OPTIONS.indexOf(ySpan);
+      if (currentIndex < 0) return;
+      if (event.deltaY < 0 && currentIndex > 0) {
+        setYSpan(Y_SPAN_OPTIONS[currentIndex - 1]);
+      } else if (event.deltaY > 0 && currentIndex < Y_SPAN_OPTIONS.length - 1) {
+        setYSpan(Y_SPAN_OPTIONS[currentIndex + 1]);
+      }
+      return;
     }
+
+    event.preventDefault();
+    const primaryDelta = Math.abs(event.deltaY) >= Math.abs(event.deltaX) ? event.deltaY : event.deltaX;
+    if (!Number.isFinite(primaryDelta) || Math.abs(primaryDelta) < 0.01) return;
+    const sensitivity = event.ctrlKey ? 0.0022 : 0.0014;
+    const ratio = Math.exp(-primaryDelta * sensitivity);
+    zoomXAtPlayhead(ratio);
   };
 
   const onSvgDoubleClick = (event: PointerEvent<SVGSVGElement>) => {
@@ -330,7 +357,7 @@ export function TimelineEditor({
       <div className="row" style={{ justifyContent: "space-between" }}>
         <div>
           <h2 style={{ margin: 0 }}>Timeline Editor</h2>
-          <p className="small">點擊 Tempo 區可新增錨點；拖曳錨點可改 bar / BPM。雙擊錨點可刪除。Y 軸預設顯示中心 ±4 BPM，可手動拉伸。</p>
+          <p className="small">點擊 Tempo 區可新增錨點；拖曳錨點可改 bar / BPM。雙擊錨點可刪除。滾輪可做 X 軸縮放（觸控板/滑鼠）；`Alt + 滾輪` 調整 Y 軸範圍。</p>
         </div>
         <div className="row">
           <button
@@ -372,7 +399,7 @@ export function TimelineEditor({
           width={WIDTH}
           height={SECTION_H + TEMPO_H + 34}
           onDoubleClick={onSvgDoubleClick as unknown as React.MouseEventHandler<SVGSVGElement>}
-          onWheel={onWheelZoomY}
+          onWheel={onWheelTimeline}
           onPointerMove={onPointerMoveSvg}
           onPointerUp={onPointerUpSvg}
           onPointerCancel={onPointerUpSvg}
