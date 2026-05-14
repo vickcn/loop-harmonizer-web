@@ -51,6 +51,7 @@ export class AudioPlayer {
       await this.ensureWorklet();
       if (this.workletNode) {
         this.workletNode.connect(this.outGain);
+        this.post({ type: "setPosition", seconds: this._pausedSeconds, sampleRate: this.buffer.sampleRate });
         this.post({ type: "play" });
         this.post({ type: "setTempoRatio", ratio: playbackRate });
       }
@@ -64,6 +65,40 @@ export class AudioPlayer {
       this.source = src;
     }
     this._playing = true;
+  }
+
+  async seek(seconds: number, playbackRate: number) {
+    if (!this.buffer) return;
+    const duration = this.buffer.duration;
+    const wrapped = duration > 0
+      ? ((seconds % duration) + duration) % duration
+      : 0;
+    this._pausedSeconds = wrapped;
+
+    if (this._mode === "pitch-preserve") {
+      if (this._playing) {
+        await this.ensureWorklet();
+        if (this.workletNode) this.workletNode.connect(this.outGain);
+      }
+      this.post({ type: "setPosition", seconds: wrapped, sampleRate: this.buffer.sampleRate });
+      if (this._playing) {
+        this._startAudioTime = this.ctx.currentTime - this._pausedSeconds;
+        this.post({ type: "play" });
+        this.post({ type: "setTempoRatio", ratio: playbackRate });
+      }
+      return;
+    }
+
+    if (!this._playing) return;
+    this.stopSource();
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.buffer;
+    src.loop = true;
+    src.playbackRate.value = playbackRate;
+    src.connect(this.outGain);
+    src.start(0, this._pausedSeconds % this.buffer.duration);
+    this.source = src;
+    this._startAudioTime = this.ctx.currentTime - this._pausedSeconds;
   }
 
   pause() {

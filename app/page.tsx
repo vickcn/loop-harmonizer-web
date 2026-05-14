@@ -119,6 +119,10 @@ export default function Page() {
     engine.triggerLiveBeatChange(bpm, beats, isDirect);
   };
 
+  const handlePlayheadChange = (bar: number) => {
+    void engine.seekToBar(bar);
+  };
+
   const loopIsPlaying = status.isPlaying && status.driverMode === "loop";
   const timelineIsPlaying = status.isPlaying && status.driverMode === "timeline";
 
@@ -235,8 +239,10 @@ export default function Page() {
         <TimelineEditor
           timeline={timeline}
           currentBar={status.currentBar}
+          isPlaying={status.isPlaying}
           dimTempo={status.driverMode === "loop"}
           onTimelineChange={updateTimeline}
+          onCurrentBarChange={handlePlayheadChange}
         />
       </div>
 

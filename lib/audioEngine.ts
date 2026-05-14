@@ -33,6 +33,7 @@ export class BrowserLoopEngine {
   private isPlaying = false;
   private metronomeOnly = false;
   private metronomeOnlyStartTime = 0;
+  private pendingStartSeconds = 0;
   private driverMode: DriverMode = "loop";
   private onStatus?: (status: EngineStatus) => void;
   private metronomeEnabled = false;
@@ -98,7 +99,7 @@ export class BrowserLoopEngine {
     this.metronomeOnly = !this.audioPlayer!.isLoaded;
 
     if (this.metronomeOnly) {
-      this.metronomeOnlyStartTime = this.ctx!.currentTime;
+      this.metronomeOnlyStartTime = this.ctx!.currentTime - this.pendingStartSeconds;
     } else {
       const params = this.tempoEngine.tick(this.ctx!.currentTime);
       await this.audioPlayer!.play(params.playbackRate);
@@ -107,7 +108,7 @@ export class BrowserLoopEngine {
     this.isPlaying = true;
     this.clock!.start(
       this.ctx!.currentTime,
-      this.metronomeOnly ? 0 : this.audioPlayer!.getPausedSeconds(),
+      this.metronomeOnly ? this.pendingStartSeconds : this.audioPlayer!.getPausedSeconds(),
       this.tempoEngine.getLoopBpm(),
       this.timeline.timeSignature.beatsPerBar
     );
@@ -127,9 +128,39 @@ export class BrowserLoopEngine {
     if (!this.metronomeOnly) this.audioPlayer?.stop();
     this.isPlaying = false;
     this.metronomeOnly = false;
+    this.pendingStartSeconds = 0;
     this.clock?.stop();
     if (this.raf) cancelAnimationFrame(this.raf);
     this.emitStatus(1, this.timeline.projectBpm, this.timeline.projectBpm);
+  }
+
+  async seekToBar(bar: number) {
+    const clampedBar = Math.max(1, Math.min(this.timeline.totalBars, bar));
+    const seconds = ((clampedBar - 1) * this.timeline.timeSignature.beatsPerBar * 60) / Math.max(1, this.timeline.projectBpm);
+    this.pendingStartSeconds = seconds;
+
+    const ctxNow = this.ctx?.currentTime ?? 0;
+    const timelineBpm = this.driverMode === "loop"
+      ? this.tempoEngine.getLoopBpm()
+      : getTimelineBpmAtBar(this.timeline, clampedBar);
+    const params = this.tempoEngine.tick(ctxNow, timelineBpm);
+
+    if (!this.metronomeOnly && this.audioPlayer?.isLoaded) {
+      await this.audioPlayer.seek(seconds, params.playbackRate);
+    } else if (this.ctx) {
+      this.metronomeOnlyStartTime = ctxNow - seconds;
+    }
+
+    if (this.isPlaying && this.ctx) {
+      this.clock?.start(
+        ctxNow,
+        this.metronomeOnly ? this.pendingStartSeconds : (this.audioPlayer?.getPausedSeconds() ?? this.pendingStartSeconds),
+        this.tempoEngine.getLoopBpm(),
+        this.timeline.timeSignature.beatsPerBar
+      );
+    }
+
+    this.emitStatus(clampedBar, timelineBpm, params.currentBpm);
   }
 
   triggerLiveBeatChange(toBpm: number, transitionBeats: number, isDirect = false) {

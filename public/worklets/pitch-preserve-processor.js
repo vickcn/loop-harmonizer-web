@@ -50,6 +50,16 @@ class PitchPreserveProcessor extends AudioWorkletProcessor {
           this.targetTempoRatio = Math.max(this.minRatio, Math.min(this.maxRatio, ratio));
         }
       }
+      if (msg.type === 'setPosition') {
+        const seconds = Number(msg.seconds);
+        const sampleRate = Number(msg.sampleRate);
+        if (Number.isFinite(seconds) && Number.isFinite(sampleRate) && sampleRate > 0) {
+          this.inputPos = this.wrap(seconds * sampleRate);
+          this.frame = null;
+          this.prevTail = null;
+          this.framePos = 0;
+        }
+      }
       if (msg.type === 'setGain') {
         const gain = Number(msg.gain);
         if (Number.isFinite(gain)) this.gain = Math.max(0, Math.min(1.5, gain));

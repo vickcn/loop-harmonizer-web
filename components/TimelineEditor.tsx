@@ -7,8 +7,10 @@ import { getSectionAtBar, getTimelineBpmAtBar, makeTempoSegmentsFromAnchors } fr
 type Props = {
   timeline: SongTimeline;
   currentBar: number;
+  isPlaying?: boolean;
   dimTempo?: boolean;
   onTimelineChange: (timeline: SongTimeline) => void;
+  onCurrentBarChange?: (bar: number) => void;
 };
 
 const MIN_WIDTH = 720;        // 手機橫滑用的最小寬度
@@ -24,9 +26,21 @@ type SectionDrag =
   | { kind: "resize-r"; id: string; origEnd: number; ptrX: number }
   | null;
 
-export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimelineChange }: Props) {
+export function TimelineEditor({
+  timeline,
+  currentBar,
+  isPlaying = false,
+  dimTempo = false,
+  onTimelineChange,
+  onCurrentBarChange,
+}: Props) {
   const [dragId, setDragId] = useState<string | null>(null);
   const dragIdRef = useRef<string | null>(null);
+  const [playheadHover, setPlayheadHover] = useState(false);
+  const [playheadDragging, setPlayheadDragging] = useState(false);
+  const playheadDragRef = useRef(false);
+  const scrubRafRef = useRef<number | null>(null);
+  const scrubBarRef = useRef<number | null>(null);
   const [ySpan, setYSpan] = useState(4);
   const [editMode, setEditMode] = useState(false);
   const [selectedSectionId, setSelectedSectionId] = useState<string | null>(null);
@@ -79,6 +93,20 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
     const step = ySpan <= 8 ? 2 : ySpan <= 16 ? 4 : 8;
     return Array.from({ length: Math.floor((axisMax - axisMin) / step) + 1 }, (_, index) => axisMin + index * step);
   }, [axisMax, axisMin, ySpan]);
+  const playheadX = barToX(currentBar);
+
+  const scrubToPointer = (event: PointerEvent<SVGElement>) => {
+    if (!onCurrentBarChange) return;
+    const rect = svgRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const x = Math.max(0, Math.min(WIDTH, event.clientX - rect.left));
+    scrubBarRef.current = xToBarCont(x);
+    if (scrubRafRef.current !== null) return;
+    scrubRafRef.current = requestAnimationFrame(() => {
+      scrubRafRef.current = null;
+      if (scrubBarRef.current !== null) onCurrentBarChange(scrubBarRef.current);
+    });
+  };
 
   const pointerToLocal = (event: PointerEvent) => {
     const rect = svgRef.current!.getBoundingClientRect();
@@ -161,6 +189,11 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
   };
 
   const onPointerMoveSvg = (event: PointerEvent<SVGSVGElement>) => {
+    if (playheadDragRef.current) {
+      scrubToPointer(event);
+      return;
+    }
+
     // Pinch-to-zoom: only zoom X, anchored at the current playhead bar
     if (
       pinchRef.current &&
@@ -234,7 +267,7 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
     }
   };
 
-  const onPointerUpSvg = (event: PointerEvent<SVGSVGElement>) => {
+  const onPointerUpSvg = (event: PointerEvent<SVGElement>) => {
     bgPanRef.current = null;
     const svg = svgRef.current;
     if (svg) {
@@ -244,6 +277,17 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
     if (pinchRef.current && (event.pointerId === pinchRef.current.id0 || event.pointerId === pinchRef.current.id1)) {
       pinchRef.current = null;
     }
+    if (scrubRafRef.current !== null) {
+      cancelAnimationFrame(scrubRafRef.current);
+      scrubRafRef.current = null;
+    }
+    if (onCurrentBarChange && scrubBarRef.current !== null) {
+      onCurrentBarChange(scrubBarRef.current);
+    }
+    scrubBarRef.current = null;
+    playheadDragRef.current = false;
+    setPlayheadDragging(false);
+    if (!isPlaying) setPlayheadHover(false);
     dragIdRef.current = null;
     setDragId(null);
     setSectionDrag(null);
@@ -514,7 +558,46 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
             })}
           </g>
 
-          <line x1={barToX(currentBar)} y1={0} x2={barToX(currentBar)} y2={SECTION_H + TEMPO_H} stroke="white" strokeWidth={2} opacity={0.9} />
+          {(playheadHover || playheadDragging) && (
+            <line
+              x1={playheadX}
+              y1={0}
+              x2={playheadX}
+              y2={SECTION_H + TEMPO_H}
+              stroke="#8ab4f8"
+              strokeWidth={6}
+              opacity={0.5}
+              pointerEvents="none"
+            />
+          )}
+          <line x1={playheadX} y1={0} x2={playheadX} y2={SECTION_H + TEMPO_H} stroke="white" strokeWidth={2} opacity={0.9} pointerEvents="none" />
+          <rect
+            data-testid="playhead-handle"
+            x={playheadX - 10}
+            y={0}
+            width={20}
+            height={SECTION_H + TEMPO_H}
+            fill="rgba(255,255,255,0.001)"
+            pointerEvents="all"
+            style={{ cursor: onCurrentBarChange ? "ew-resize" : "default" }}
+            onPointerEnter={() => { if (!isPlaying) setPlayheadHover(true); }}
+            onPointerLeave={() => { if (!playheadDragRef.current) setPlayheadHover(false); }}
+            onPointerMove={onCurrentBarChange ? (e) => {
+              if (!playheadDragRef.current) return;
+              scrubToPointer(e);
+            } : undefined}
+            onPointerUp={onCurrentBarChange ? (e) => {
+              onPointerUpSvg(e);
+            } : undefined}
+            onPointerDown={onCurrentBarChange ? (e) => {
+              e.stopPropagation();
+              e.currentTarget.setPointerCapture(e.pointerId);
+              playheadDragRef.current = true;
+              setPlayheadDragging(true);
+              setPlayheadHover(true);
+              scrubToPointer(e);
+            } : undefined}
+          />
         </svg>
       </div>
 
