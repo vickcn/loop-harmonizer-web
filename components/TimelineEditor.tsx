@@ -26,6 +26,7 @@ type SectionDrag =
 
 export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimelineChange }: Props) {
   const [dragId, setDragId] = useState<string | null>(null);
+  const dragIdRef = useRef<string | null>(null);
   const [ySpan, setYSpan] = useState(4);
   const [editMode, setEditMode] = useState(false);
   const [selectedSectionId, setSelectedSectionId] = useState<string | null>(null);
@@ -154,7 +155,11 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
 
   const onPointerMoveSvg = (event: PointerEvent<SVGSVGElement>) => {
     // Pinch-to-zoom: update Y span based on two-finger distance change
-    if (pinchRef.current && (event.pointerId === pinchRef.current.id0 || event.pointerId === pinchRef.current.id1)) {
+    if (
+      pinchRef.current &&
+      pinchRef.current.id1 !== -1 &&
+      (event.pointerId === pinchRef.current.id0 || event.pointerId === pinchRef.current.id1)
+    ) {
       // We can't get both touch positions from a single PointerEvent, so we track via cache
       // Update the cached position for this pointer
       const p = pinchRef.current;
@@ -183,9 +188,10 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
       return;
     }
 
-    if (dragId) {
+    const activeDragId = dragIdRef.current ?? dragId;
+    if (activeDragId) {
       const { x, y } = pointerToLocal(event);
-      updateAnchor(dragId, { bar: xToBar(x), bpm: yToBpm(y) });
+      updateAnchor(activeDragId, { bar: xToBar(x), bpm: yToBpm(y) });
       return;
     }
     if (!sectionDrag) return;
@@ -220,6 +226,7 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
     if (pinchRef.current && (event.pointerId === pinchRef.current.id0 || event.pointerId === pinchRef.current.id1)) {
       pinchRef.current = null;
     }
+    dragIdRef.current = null;
     setDragId(null);
     setSectionDrag(null);
   };
@@ -314,8 +321,9 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
               // Two-finger pinch-to-zoom
               if (pinchRef.current) {
                 const p = pinchRef.current;
-                if (p.id0 !== e.pointerId && p.id1 === -1) {
+                if (p.id0 !== e.pointerId && p.id1 === -1 && e.pointerType === "touch") {
                   p.id1 = e.pointerId;
+                  bgPanRef.current = null;
                   const svg = svgRef.current!;
                   const touches = (svg as unknown as { _touches?: Record<number, { x: number; y: number }> })._touches ?? {};
                   touches[e.pointerId] = { x: e.clientX, y: e.clientY };
@@ -336,12 +344,14 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
                   startX: e.clientX - rect2.left,
                   startScrollLeft: wrapperRef.current?.scrollLeft ?? 0,
                 };
-                // Start tracking for potential pinch
-                const svg = svgRef.current!;
-                const touches = (svg as unknown as { _touches?: Record<number, { x: number; y: number }> })._touches ?? {};
-                touches[e.pointerId] = { x: e.clientX, y: e.clientY };
-                (svg as unknown as { _touches: Record<number, { x: number; y: number }> })._touches = touches;
-                pinchRef.current = { id0: e.pointerId, id1: -1, dist: 0, span: ySpan };
+                if (e.pointerType === "touch") {
+                  // Start tracking for potential pinch only on touch devices
+                  const svg = svgRef.current!;
+                  const touches = (svg as unknown as { _touches?: Record<number, { x: number; y: number }> })._touches ?? {};
+                  touches[e.pointerId] = { x: e.clientX, y: e.clientY };
+                  (svg as unknown as { _touches: Record<number, { x: number; y: number }> })._touches = touches;
+                  pinchRef.current = { id0: e.pointerId, id1: -1, dist: 0, span: ySpan };
+                }
               }
             }}
           />
@@ -461,7 +471,7 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
                     cy={y}
                     r={18}
                     fill="transparent"
-                    onPointerDown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); setDragId(anchor.id); }}
+                    onPointerDown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); dragIdRef.current = anchor.id; setDragId(anchor.id); }}
                     onDoubleClick={(e) => {
                       e.stopPropagation();
                       removeAnchor(anchor.id);
