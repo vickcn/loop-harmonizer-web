@@ -21,3 +21,5 @@
 - Pinch 邏輯只在「雙指成立」時啟用（`id1 !== -1`），避免單指誤入 pinch 分支吃掉拖曳事件。
 - 只有 `pointerType === "touch"` 才建立 pinch tracking；第二指進來時清掉背景 pan 狀態，避免互相干擾。
 - 錨點拖曳使用 `dragIdRef` + state 同步，避免 React state 時序造成首段 `pointermove` 漏接。
+- 雙指手勢只做 `X` 軸 zoom，不做 pan；單指背景拖曳維持 `X` 平移。
+- Pinch zoom 以「當下播放軸（playhead bar）」為縮放中心，段落色塊/小節線/錨點共用同一 X 座標系統同步縮放。

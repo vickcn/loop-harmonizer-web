@@ -34,8 +34,15 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
   const [width, setWidth] = useState<number>(MIN_WIDTH);
   // Background pan (mobile X scroll)
   const bgPanRef = useRef<{ startX: number; startScrollLeft: number } | null>(null);
-  // Pinch-to-zoom for Y axis
-  const pinchRef = useRef<{ id0: number; id1: number; dist: number; span: number } | null>(null);
+  // Pinch-to-zoom for X axis (centered by current playhead bar)
+  const pinchRef = useRef<{
+    id0: number;
+    id1: number;
+    dist: number;
+    startWidth: number;
+    startScrollLeft: number;
+    playBar: number;
+  } | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const sectionTypeMap = useMemo(() => new Map(timeline.sectionTypes.map((t) => [t.id, t])), [timeline.sectionTypes]);
@@ -154,7 +161,7 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
   };
 
   const onPointerMoveSvg = (event: PointerEvent<SVGSVGElement>) => {
-    // Pinch-to-zoom: update Y span based on two-finger distance change
+    // Pinch-to-zoom: only zoom X, anchored at the current playhead bar
     if (
       pinchRef.current &&
       pinchRef.current.id1 !== -1 &&
@@ -167,15 +174,21 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
       const touches = (svg as unknown as { _touches?: Record<number, { x: number; y: number }> })._touches ?? {};
       touches[event.pointerId] = { x: event.clientX, y: event.clientY };
       (svg as unknown as { _touches: Record<number, { x: number; y: number }> })._touches = touches;
-      if (touches[p.id0] && touches[p.id1]) {
+      if (touches[p.id0] && touches[p.id1] && wrapperRef.current) {
         const dx = touches[p.id0].x - touches[p.id1].x;
         const dy = touches[p.id0].y - touches[p.id1].y;
         const newDist = Math.sqrt(dx * dx + dy * dy);
         const ratio = p.dist > 0 ? newDist / p.dist : 1;
-        const newSpan = Math.max(Y_SPAN_OPTIONS[0], Math.min(Y_SPAN_OPTIONS[Y_SPAN_OPTIONS.length - 1], p.span / ratio));
-        // Snap to nearest option
-        const snapped = Y_SPAN_OPTIONS.reduce((a, b) => Math.abs(b - newSpan) < Math.abs(a - newSpan) ? b : a);
-        if (snapped !== ySpan) setYSpan(snapped);
+        const nextWidth = Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, p.startWidth * ratio));
+        const oldPlayX = ((p.playBar - 1) / (timeline.totalBars - 1)) * p.startWidth;
+        const newPlayX = ((p.playBar - 1) / (timeline.totalBars - 1)) * nextWidth;
+        const playheadScreenX = oldPlayX - p.startScrollLeft;
+        const maxScroll = Math.max(0, nextWidth - wrapperRef.current.clientWidth);
+        const nextScrollLeft = Math.max(0, Math.min(maxScroll, newPlayX - playheadScreenX));
+        setWidth(nextWidth);
+        requestAnimationFrame(() => {
+          if (wrapperRef.current) wrapperRef.current.scrollLeft = nextScrollLeft;
+        });
       }
       return;
     }
@@ -223,6 +236,11 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
 
   const onPointerUpSvg = (event: PointerEvent<SVGSVGElement>) => {
     bgPanRef.current = null;
+    const svg = svgRef.current;
+    if (svg) {
+      const touches = (svg as unknown as { _touches?: Record<number, { x: number; y: number }> })._touches;
+      if (touches) delete touches[event.pointerId];
+    }
     if (pinchRef.current && (event.pointerId === pinchRef.current.id0 || event.pointerId === pinchRef.current.id1)) {
       pinchRef.current = null;
     }
@@ -318,7 +336,7 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
           <rect
             x={0} y={0} width={WIDTH} height={SECTION_H + TEMPO_H} fill="#111520" rx={16}
             onPointerDown={(e) => {
-              // Two-finger pinch-to-zoom
+              // Two-finger pinch-to-zoom (X only)
               if (pinchRef.current) {
                 const p = pinchRef.current;
                 if (p.id0 !== e.pointerId && p.id1 === -1 && e.pointerType === "touch") {
@@ -331,10 +349,15 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
                     const dx = touches[p.id0].x - touches[p.id1].x;
                     const dy = touches[p.id0].y - touches[p.id1].y;
                     p.dist = Math.sqrt(dx * dx + dy * dy);
-                    p.span = ySpan;
                   }
+                  return;
                 }
-                return;
+                // Defensive reset: stale pinch state should not block new gestures
+                if (p.id1 !== -1 && p.id0 !== e.pointerId && p.id1 !== e.pointerId) {
+                  pinchRef.current = null;
+                } else {
+                  return;
+                }
               }
               // Single finger on background → X pan
               if (!dragId && !sectionDrag) {
@@ -350,7 +373,14 @@ export function TimelineEditor({ timeline, currentBar, dimTempo = false, onTimel
                   const touches = (svg as unknown as { _touches?: Record<number, { x: number; y: number }> })._touches ?? {};
                   touches[e.pointerId] = { x: e.clientX, y: e.clientY };
                   (svg as unknown as { _touches: Record<number, { x: number; y: number }> })._touches = touches;
-                  pinchRef.current = { id0: e.pointerId, id1: -1, dist: 0, span: ySpan };
+                  pinchRef.current = {
+                    id0: e.pointerId,
+                    id1: -1,
+                    dist: 0,
+                    startWidth: WIDTH,
+                    startScrollLeft: wrapperRef.current?.scrollLeft ?? 0,
+                    playBar: Math.max(1, Math.min(timeline.totalBars, currentBar)),
+                  };
                 }
               }
             }}
