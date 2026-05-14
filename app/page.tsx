@@ -130,7 +130,7 @@ export default function Page() {
     <main className="container layout">
       {/* ── Header ── */}
       <header className="col-full">
-        <h1 className="title">Loop Harmonizer M2A Web</h1>
+        <h1 className="title">Loop Harmonizer M3 Web</h1>
         <p className="subtitle">流程播放、段落時間軸、Tempo 錨點、同步節拍器、即時切 beat 線性緩衝、Tap Tempo + Vercel API，並加入免費 WSOLA-inspired 保音高變速原型。</p>
       </header>
 
@@ -246,9 +246,9 @@ export default function Page() {
         />
       </div>
 
-      {/* ── M2A 說明 ── */}
+      {/* ── M3 說明 ── */}
       <section className="card col-full">
-        <h2 style={{ marginTop: 0 }}>M2A 說明</h2>
+        <h2 style={{ marginTop: 0 }}>M3 說明</h2>
         <p className="small">
           「快速變速」仍使用 playbackRate，適合低延遲驗證控制流程；「保音高模式」使用 AudioWorklet + WSOLA-inspired time-stretch 原型，會在重疊區搜尋相似波形再交叉淡化，以改善 M1 粒狀 overlap-add 的模糊與割離感。這版不依賴外部 WASM 或商用 SDK，方便直接部署到 Vercel；音質仍屬實驗原型，後續可再加入 transient detection 或更成熟的免費 DSP 引擎。
         </p>
