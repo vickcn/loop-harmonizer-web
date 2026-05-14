@@ -144,6 +144,7 @@ export class AudioPlayer {
 
   private async ensureWorklet() {
     if (!this.buffer) return;
+    if (this.workletNode) return;
     if (!this.workletLoading) {
       this.workletLoading = this.ctx.audioWorklet.addModule("/worklets/pitch-preserve-processor.js");
     }
