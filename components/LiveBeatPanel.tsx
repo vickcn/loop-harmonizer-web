@@ -75,6 +75,14 @@ export function LiveBeatPanel({
     setBpmPresets((prev) => prev.filter((value) => value !== bpm));
   };
 
+  const adjustPreset = (index: number, delta: number) => {
+    setBpmPresets((prev) => {
+      const next = [...prev];
+      next[index] = clamp(next[index] + delta);
+      return next;
+    });
+  };
+
   const movePreset = (fromIndex: number, toIndex: number) => {
     if (fromIndex === toIndex || fromIndex < 0 || toIndex < 0) return;
     setBpmPresets((prev) => {
@@ -136,9 +144,13 @@ export function LiveBeatPanel({
                 opacity: draggingIndex === index ? 0.6 : 1,
               }}
             >
-              <button className="btn" style={{ padding: "6px 10px" }} onClick={() => onTargetBpmChange(bpm)}>
-                BPM {bpm}
-              </button>
+              <div className="row" style={{ gap: 4 }}>
+                <button className="btn" style={{ padding: "6px 8px" }} onClick={() => adjustPreset(index, -1)}>−</button>
+                <button className="btn" style={{ padding: "6px 10px", minWidth: 80 }} onClick={() => onTargetBpmChange(bpmPresets[index])}>
+                  BPM {bpm}
+                </button>
+                <button className="btn" style={{ padding: "6px 8px" }} onClick={() => adjustPreset(index, 1)}>+</button>
+              </div>
               <div className="row" style={{ gap: 8 }}>
                 <button className="btn primary" style={{ padding: "6px 10px" }} onClick={() => onApplyPreset(bpm)}>
                   線性切
