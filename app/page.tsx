@@ -103,14 +103,7 @@ export default function Page() {
   };
 
   const handlePreviewSound = (sound: MetronomeSound) => {
-    engine.setMetronomeSound(sound);
-    engine.setMetronomeEnabled(true);
-    void engine.play();
-    setTimeout(() => {
-      engine.stop();
-      engine.setMetronomeEnabled(metronomeEnabled);
-      engine.setMetronomeSound(findSound(allSounds, currentSoundId));
-    }, 700);
+    engine.previewClick(sound);
   };
 
   const triggerLiveBeat = (bpm = targetBpm, beats = transitionBeats, isDirect = false) => {
