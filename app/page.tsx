@@ -174,8 +174,8 @@ export default function Page() {
         />
       </div>
 
-      {/* ── 節拍器 (8) + Loop 載入 (4) ── */}
-      <div className="col-8">
+      {/* ── 節拍器 全幅 ── */}
+      <div className="col-full">
         <MetronomePanel
           enabled={metronomeEnabled}
           accentFirstBeat={metronomeAccent}
@@ -193,16 +193,6 @@ export default function Page() {
           onSoundChange={handleSoundChange}
           onCustomSoundsChange={handleCustomSoundsChange}
           onPreviewSound={handlePreviewSound}
-        />
-      </div>
-      <div className="col-4">
-        <FileLoader
-          audioSource={timeline.audioSource}
-          onFileConfirmed={handleFileConfirmed}
-          onAudioBpmChange={(bpm) => {
-            updateTimeline({ ...timeline, audioSource: { ...timeline.audioSource, userConfirmedBpm: bpm } });
-            setTargetBpm(bpm);
-          }}
         />
       </div>
 
@@ -230,6 +220,18 @@ export default function Page() {
           onSuggestedBpm={(bpm, beats) => {
             setTargetBpm(bpm);
             setTransitionBeats(beats);
+          }}
+        />
+      </div>
+
+      {/* ── Loop 載入 (Timeline 與 Tempo 面板之間) ── */}
+      <div className="col-4">
+        <FileLoader
+          audioSource={timeline.audioSource}
+          onFileConfirmed={handleFileConfirmed}
+          onAudioBpmChange={(bpm) => {
+            updateTimeline({ ...timeline, audioSource: { ...timeline.audioSource, userConfirmedBpm: bpm } });
+            setTargetBpm(bpm);
           }}
         />
       </div>
