@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { FileLoader } from "@/components/FileLoader";
 import { LiveBeatPanel } from "@/components/LiveBeatPanel";
 import { MetronomePanel } from "@/components/MetronomePanel";
@@ -8,6 +8,7 @@ import { TapTempoPad } from "@/components/TapTempoPad";
 import { TimelineEditor } from "@/components/TimelineEditor";
 import { TransportBar } from "@/components/TransportBar";
 import { BrowserLoopEngine, DriverMode, EngineStatus, PlaybackMode } from "@/lib/audioEngine";
+import { getSectionAtBar } from "@/lib/timeline";
 import {
   DEFAULT_SOUND_ID,
   findSound,
@@ -46,6 +47,13 @@ export default function Page() {
 
   const engineRef = useRef<BrowserLoopEngine | null>(null);
 
+  // Section loop: null = off, string = target section id
+  const [activeSectionId, setActiveSectionId] = useState<string | null>(null);
+  // pending = waiting for current section to end before jumping
+  const activeSectionIdRef = useRef<string | null>(null);
+  const pendingSectionIdRef = useRef<string | null>(null);
+  const prevBarRef = useRef(1);
+
   const engine = useMemo(() => {
     if (!engineRef.current) {
       engineRef.current = new BrowserLoopEngine(defaultTimeline);
@@ -57,6 +65,70 @@ export default function Page() {
   const updateTimeline = (next: SongTimeline) => {
     setTimeline(next);
     engine.setTimeline(next);
+  };
+
+  // Section loop boundary detection
+  useEffect(() => {
+    if (!status.isPlaying) return;
+    const currentBar = status.currentBar;
+    const prevBar = prevBarRef.current;
+    prevBarRef.current = currentBar;
+
+    const activeId = activeSectionIdRef.current;
+    const pendingId = pendingSectionIdRef.current;
+
+    if (activeId) {
+      const sec = timeline.sections.find((s) => s.id === activeId);
+      if (sec && (currentBar > sec.endBar || currentBar < sec.startBar)) {
+        void engine.seekToBar(sec.startBar);
+      }
+      return;
+    }
+
+    if (pendingId) {
+      const originSec = getSectionAtBar(timeline, prevBar);
+      if (!originSec || currentBar > originSec.endBar || currentBar < originSec.startBar) {
+        const target = timeline.sections.find((s) => s.id === pendingId);
+        if (target) {
+          pendingSectionIdRef.current = null;
+          activeSectionIdRef.current = pendingId;
+          setActiveSectionId(pendingId);
+          void engine.seekToBar(target.startBar);
+        }
+      }
+    }
+  }, [status.currentBar, status.isPlaying, timeline, engine]);
+
+  const handleSectionClick = (sectionId: string) => {
+    const section = timeline.sections.find((s) => s.id === sectionId);
+    if (!section) return;
+
+    if (sectionId === activeSectionIdRef.current) {
+      // Click active section again → cancel loop
+      activeSectionIdRef.current = null;
+      pendingSectionIdRef.current = null;
+      setActiveSectionId(null);
+      return;
+    }
+
+    if (!status.isPlaying) {
+      void engine.seekToBar(section.startBar);
+      return;
+    }
+
+    const currentSec = getSectionAtBar(timeline, status.currentBar);
+    if (!currentSec || currentSec.id === sectionId) {
+      // Already in target or in gap → activate immediately
+      activeSectionIdRef.current = sectionId;
+      pendingSectionIdRef.current = null;
+      setActiveSectionId(sectionId);
+      void engine.seekToBar(section.startBar);
+    } else {
+      // Queue: wait for current section to end
+      pendingSectionIdRef.current = sectionId;
+      activeSectionIdRef.current = null;
+      setActiveSectionId(sectionId); // visual highlight while pending too
+    }
   };
 
   const handleFileConfirmed = async (file: File, audioOriginalBpm: number) => {
@@ -88,6 +160,12 @@ export default function Page() {
   const playAs = (mode: DriverMode) => {
     engine.setDriverMode(mode);
     void engine.play();
+  };
+
+  const clearSectionLoop = () => {
+    activeSectionIdRef.current = null;
+    pendingSectionIdRef.current = null;
+    setActiveSectionId(null);
   };
 
   const handleMetronomeEnabled = (v: boolean) => { setMetronomeEnabled(v); engine.setMetronomeEnabled(v); };
@@ -149,7 +227,7 @@ export default function Page() {
           onPlaybackModeChange={(mode: PlaybackMode) => void engine.setPlaybackMode(mode)}
           onPlay={() => playAs("loop")}
           onPause={() => engine.pause()}
-          onStop={() => engine.stop()}
+          onStop={() => { engine.stop(); clearSectionLoop(); }}
         />
       </div>
 
@@ -236,7 +314,7 @@ export default function Page() {
           onPlaybackModeChange={(mode: PlaybackMode) => void engine.setPlaybackMode(mode)}
           onPlay={() => playAs("timeline")}
           onPause={() => engine.pause()}
-          onStop={() => engine.stop()}
+          onStop={() => { engine.stop(); clearSectionLoop(); }}
         />
       </div>
 
@@ -247,8 +325,10 @@ export default function Page() {
           currentBar={status.currentBar}
           isPlaying={status.isPlaying}
           dimTempo={status.driverMode === "loop"}
+          activeSectionId={activeSectionId}
           onTimelineChange={updateTimeline}
           onCurrentBarChange={handlePlayheadChange}
+          onSectionClick={handleSectionClick}
         />
       </div>
 

@@ -9,8 +9,10 @@ type Props = {
   currentBar: number;
   isPlaying?: boolean;
   dimTempo?: boolean;
+  activeSectionId?: string | null;
   onTimelineChange: (timeline: SongTimeline) => void;
   onCurrentBarChange?: (bar: number) => void;
+  onSectionClick?: (sectionId: string) => void;
 };
 
 const MIN_WIDTH = 720;        // 手機橫滑用的最小寬度
@@ -31,8 +33,10 @@ export function TimelineEditor({
   currentBar,
   isPlaying = false,
   dimTempo = false,
+  activeSectionId = null,
   onTimelineChange,
   onCurrentBarChange,
+  onSectionClick,
 }: Props) {
   const [dragId, setDragId] = useState<string | null>(null);
   const dragIdRef = useRef<string | null>(null);
@@ -468,6 +472,7 @@ export function TimelineEditor({
             const x = barToX(section.startBar);
             const w = Math.max(HANDLE_W * 2 + 4, barToX(section.endBar) - x);
             const isSelected = selectedSectionId === section.id;
+            const isActive = activeSectionId === section.id;
 
             return (
               <g key={section.id}>
@@ -475,9 +480,9 @@ export function TimelineEditor({
                   x={x + 2} y={10} width={w - 4} height={46} rx={12}
                   fill={type?.color ?? "#475569"}
                   opacity={isSelected ? 1 : 0.86}
-                  stroke={isSelected ? "#fff" : "none"}
-                  strokeWidth={isSelected ? 2 : 0}
-                  style={{ cursor: editMode ? "grab" : "default" }}
+                  stroke={isActive ? "#facc15" : isSelected ? "#fff" : "none"}
+                  strokeWidth={isActive || isSelected ? 2.5 : 0}
+                  style={{ cursor: editMode ? "grab" : onSectionClick ? "pointer" : "default" }}
                   onPointerDown={editMode ? (e) => {
                     e.stopPropagation();
                     svgRef.current!.setPointerCapture(e.pointerId);
@@ -491,7 +496,10 @@ export function TimelineEditor({
                       ptrX: Math.max(0, Math.min(WIDTH, e.clientX - rect2.left))
                     });
                   } : undefined}
-                  onClick={editMode ? (e) => { e.stopPropagation(); setSelectedSectionId(section.id); } : undefined}
+                  onClick={editMode
+                    ? (e) => { e.stopPropagation(); setSelectedSectionId(section.id); }
+                    : (e) => { e.stopPropagation(); onSectionClick?.(section.id); }
+                  }
                 />
                 <text x={x + w / 2} y={38} textAnchor="middle" fill="white" fontSize="13" fontWeight="700" pointerEvents="none">{section.label}</text>
 
