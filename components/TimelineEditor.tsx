@@ -228,6 +228,51 @@ export function TimelineEditor({
     setSelectedSectionId(id);
   };
 
+  const exportSections = () => {
+    const data = {
+      version: 1,
+      totalBars: timeline.totalBars,
+      sectionTypes: timeline.sectionTypes,
+      sections: timeline.sections,
+    };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `sections-${timeline.id ?? "export"}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const importRef = useRef<HTMLInputElement | null>(null);
+
+  const handleImportFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = "";
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const json = JSON.parse(ev.target?.result as string);
+        if (!Array.isArray(json.sections) || !Array.isArray(json.sectionTypes)) {
+          alert("格式錯誤：缺少 sections 或 sectionTypes");
+          return;
+        }
+        const next = {
+          ...timeline,
+          sectionTypes: json.sectionTypes,
+          sections: json.sections,
+          ...(typeof json.totalBars === "number" ? { totalBars: json.totalBars } : {}),
+        };
+        onTimelineChange(next);
+        setSelectedSectionId(null);
+      } catch {
+        alert("JSON 解析失敗，請確認檔案格式");
+      }
+    };
+    reader.readAsText(file);
+  };
+
   const onPointerMoveSvg = (event: PointerEvent<SVGSVGElement>) => {
     if (playheadDragRef.current) {
       scrubToPointer(event);
@@ -422,6 +467,9 @@ export function TimelineEditor({
               )}
             </>
           )}
+          <button className="btn" onClick={exportSections}>↓ 匯出</button>
+          <button className="btn" onClick={() => importRef.current?.click()}>↑ 匯入</button>
+          <input ref={importRef} type="file" accept=".json,application/json" style={{ display: "none" }} onChange={handleImportFile} />
           <label className="row">
             <span className="label">總 Bars</span>
             <input
