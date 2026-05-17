@@ -1,6 +1,6 @@
 "use client";
 
-import { PointerEvent, WheelEvent, useEffect, useMemo, useRef, useState } from "react";
+import { PointerEvent, useEffect, useMemo, useRef, useState } from "react";
 import { SectionInstance, SongTimeline, TempoAnchor } from "@/lib/types";
 import { getSectionAtBar, getTimelineBpmAtBar, makeTempoSegmentsFromAnchors } from "@/lib/timeline";
 
@@ -349,7 +349,7 @@ export function TimelineEditor({
     });
   };
 
-  const onWheelTimeline = (event: WheelEvent<SVGSVGElement>) => {
+  const onWheelTimeline = (event: globalThis.WheelEvent) => {
     const rect = svgRef.current?.getBoundingClientRect();
     if (!rect) return;
 
@@ -373,6 +373,14 @@ export function TimelineEditor({
     const ratio = Math.exp(-primaryDelta * sensitivity);
     zoomXAtPlayhead(ratio);
   };
+
+  // Must be non-passive so preventDefault() works for wheel zoom
+  useEffect(() => {
+    const el = svgRef.current;
+    if (!el) return;
+    el.addEventListener("wheel", onWheelTimeline, { passive: false });
+    return () => el.removeEventListener("wheel", onWheelTimeline);
+  });
 
   const onSvgDoubleClick = (event: PointerEvent<SVGSVGElement>) => {
     const rect = svgRef.current!.getBoundingClientRect();
@@ -447,7 +455,6 @@ export function TimelineEditor({
           width={WIDTH}
           height={SECTION_H + TEMPO_H + 34}
           onDoubleClick={onSvgDoubleClick as unknown as React.MouseEventHandler<SVGSVGElement>}
-          onWheel={onWheelTimeline}
           onPointerMove={onPointerMoveSvg}
           onPointerUp={onPointerUpSvg}
           onPointerCancel={onPointerUpSvg}
