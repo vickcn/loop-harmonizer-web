@@ -65,7 +65,12 @@ export default function Page() {
       fileName: file.name,
       userConfirmedBpm: audioOriginalBpm,
     };
-    const nextTimeline: SongTimeline = { ...timeline, projectBpm: audioOriginalBpm, audioSource };
+    const nextTimeline: SongTimeline = {
+      ...timeline,
+      projectBpm: audioOriginalBpm,
+      audioSource,
+      tempoAnchors: timeline.tempoAnchors.map((a) => ({ ...a, bpm: audioOriginalBpm })),
+    };
     updateTimeline(nextTimeline);
     setTargetBpm(audioOriginalBpm);
 
@@ -223,7 +228,11 @@ export default function Page() {
           audioSource={timeline.audioSource}
           onFileConfirmed={handleFileConfirmed}
           onAudioBpmChange={(bpm) => {
-            updateTimeline({ ...timeline, audioSource: { ...timeline.audioSource, userConfirmedBpm: bpm } });
+            updateTimeline({
+              ...timeline,
+              audioSource: { ...timeline.audioSource, userConfirmedBpm: bpm },
+              tempoAnchors: timeline.tempoAnchors.map((a) => ({ ...a, bpm })),
+            });
             setTargetBpm(bpm);
           }}
         />
