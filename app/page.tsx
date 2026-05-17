@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { FileLoader } from "@/components/FileLoader";
 import { LiveBeatPanel } from "@/components/LiveBeatPanel";
 import { MetronomePanel } from "@/components/MetronomePanel";
@@ -8,6 +8,7 @@ import { TapTempoPad } from "@/components/TapTempoPad";
 import { TimelineEditor } from "@/components/TimelineEditor";
 import { TransportBar } from "@/components/TransportBar";
 import { BrowserLoopEngine, DriverMode, EngineStatus, PlaybackMode } from "@/lib/audioEngine";
+import { getSectionAtBar } from "@/lib/timeline";
 import {
   DEFAULT_SOUND_ID,
   findSound,
@@ -46,6 +47,13 @@ export default function Page() {
 
   const engineRef = useRef<BrowserLoopEngine | null>(null);
 
+  // Section loop: null = off, string = target section id
+  const [activeSectionId, setActiveSectionId] = useState<string | null>(null);
+  // pending = waiting for current section to end before jumping
+  const activeSectionIdRef = useRef<string | null>(null);
+  const pendingSectionIdRef = useRef<string | null>(null);
+  const prevBarRef = useRef(1);
+
   const engine = useMemo(() => {
     if (!engineRef.current) {
       engineRef.current = new BrowserLoopEngine(defaultTimeline);
@@ -59,13 +67,82 @@ export default function Page() {
     engine.setTimeline(next);
   };
 
+  // Section loop boundary detection
+  useEffect(() => {
+    if (!status.isPlaying) return;
+    const currentBar = status.currentBar;
+    const prevBar = prevBarRef.current;
+    prevBarRef.current = currentBar;
+
+    const activeId = activeSectionIdRef.current;
+    const pendingId = pendingSectionIdRef.current;
+
+    if (activeId) {
+      const sec = timeline.sections.find((s) => s.id === activeId);
+      if (sec && (currentBar > sec.endBar || currentBar < sec.startBar)) {
+        void engine.seekToBar(sec.startBar);
+      }
+      return;
+    }
+
+    if (pendingId) {
+      const originSec = getSectionAtBar(timeline, prevBar);
+      if (!originSec || currentBar > originSec.endBar || currentBar < originSec.startBar) {
+        const target = timeline.sections.find((s) => s.id === pendingId);
+        if (target) {
+          pendingSectionIdRef.current = null;
+          activeSectionIdRef.current = pendingId;
+          setActiveSectionId(pendingId);
+          void engine.seekToBar(target.startBar);
+        }
+      }
+    }
+  }, [status.currentBar, status.isPlaying, timeline, engine]);
+
+  const handleSectionClick = (sectionId: string) => {
+    const section = timeline.sections.find((s) => s.id === sectionId);
+    if (!section) return;
+
+    if (sectionId === activeSectionIdRef.current) {
+      // Click active section again → cancel loop
+      activeSectionIdRef.current = null;
+      pendingSectionIdRef.current = null;
+      setActiveSectionId(null);
+      return;
+    }
+
+    if (!status.isPlaying) {
+      void engine.seekToBar(section.startBar);
+      return;
+    }
+
+    const currentSec = getSectionAtBar(timeline, status.currentBar);
+    if (!currentSec || currentSec.id === sectionId) {
+      // Already in target or in gap → activate immediately
+      activeSectionIdRef.current = sectionId;
+      pendingSectionIdRef.current = null;
+      setActiveSectionId(sectionId);
+      void engine.seekToBar(section.startBar);
+    } else {
+      // Queue: wait for current section to end
+      pendingSectionIdRef.current = sectionId;
+      activeSectionIdRef.current = null;
+      setActiveSectionId(sectionId); // visual highlight while pending too
+    }
+  };
+
   const handleFileConfirmed = async (file: File, audioOriginalBpm: number) => {
     const audioSource: AudioSourceMeta = {
       id: `audio_${Date.now()}`,
       fileName: file.name,
       userConfirmedBpm: audioOriginalBpm,
     };
-    const nextTimeline: SongTimeline = { ...timeline, projectBpm: audioOriginalBpm, audioSource };
+    const nextTimeline: SongTimeline = {
+      ...timeline,
+      projectBpm: audioOriginalBpm,
+      audioSource,
+      tempoAnchors: timeline.tempoAnchors.map((a) => ({ ...a, bpm: audioOriginalBpm })),
+    };
     updateTimeline(nextTimeline);
     setTargetBpm(audioOriginalBpm);
 
@@ -83,6 +160,12 @@ export default function Page() {
   const playAs = (mode: DriverMode) => {
     engine.setDriverMode(mode);
     void engine.play();
+  };
+
+  const clearSectionLoop = () => {
+    activeSectionIdRef.current = null;
+    pendingSectionIdRef.current = null;
+    setActiveSectionId(null);
   };
 
   const handleMetronomeEnabled = (v: boolean) => { setMetronomeEnabled(v); engine.setMetronomeEnabled(v); };
@@ -103,14 +186,7 @@ export default function Page() {
   };
 
   const handlePreviewSound = (sound: MetronomeSound) => {
-    engine.setMetronomeSound(sound);
-    engine.setMetronomeEnabled(true);
-    void engine.play();
-    setTimeout(() => {
-      engine.stop();
-      engine.setMetronomeEnabled(metronomeEnabled);
-      engine.setMetronomeSound(findSound(allSounds, currentSoundId));
-    }, 700);
+    engine.previewClick(sound);
   };
 
   const triggerLiveBeat = (bpm = targetBpm, beats = transitionBeats, isDirect = false) => {
@@ -134,8 +210,8 @@ export default function Page() {
         <p className="subtitle">流程播放、段落時間軸、Tempo 錨點、同步節拍器、即時切 beat 線性緩衝、Tap Tempo + Vercel API，並加入免費 WSOLA-inspired 保音高變速原型。</p>
       </header>
 
-      {/* ── 雙 Transport：桌機並排、平板/手機堆疊 ── */}
-      <div className="col-6">
+      {/* ── Loop Transport ── */}
+      <div className="col-full">
         <TransportBar
           title="Loop 播放"
           loaded={loaded}
@@ -151,26 +227,7 @@ export default function Page() {
           onPlaybackModeChange={(mode: PlaybackMode) => void engine.setPlaybackMode(mode)}
           onPlay={() => playAs("loop")}
           onPause={() => engine.pause()}
-          onStop={() => engine.stop()}
-        />
-      </div>
-      <div className="col-6">
-        <TransportBar
-          title="Timeline 播放"
-          loaded={loaded}
-          isActive={status.driverMode === "timeline"}
-          isPlaying={timelineIsPlaying}
-          currentBar={status.currentBar}
-          currentBpm={status.currentBpm}
-          timelineBpm={status.timelineBpm}
-          tempoRatio={status.tempoRatio}
-          playbackMode={status.playbackMode}
-          pitchPreserveReady={status.pitchPreserveReady}
-          showModeSelector={false}
-          onPlaybackModeChange={(mode: PlaybackMode) => void engine.setPlaybackMode(mode)}
-          onPlay={() => playAs("timeline")}
-          onPause={() => engine.pause()}
-          onStop={() => engine.stop()}
+          onStop={() => { engine.stop(); clearSectionLoop(); }}
         />
       </div>
 
@@ -224,15 +281,40 @@ export default function Page() {
         />
       </div>
 
-      {/* ── Loop 載入 (Timeline 與 Tempo 面板之間) ── */}
+      {/* ── Loop 載入 ── */}
       <div className="col-4">
         <FileLoader
           audioSource={timeline.audioSource}
           onFileConfirmed={handleFileConfirmed}
           onAudioBpmChange={(bpm) => {
-            updateTimeline({ ...timeline, audioSource: { ...timeline.audioSource, userConfirmedBpm: bpm } });
+            updateTimeline({
+              ...timeline,
+              audioSource: { ...timeline.audioSource, userConfirmedBpm: bpm },
+              tempoAnchors: timeline.tempoAnchors.map((a) => ({ ...a, bpm })),
+            });
             setTargetBpm(bpm);
           }}
+        />
+      </div>
+
+      {/* ── Timeline Transport ── */}
+      <div className="col-full">
+        <TransportBar
+          title="Timeline 播放"
+          loaded={loaded}
+          isActive={status.driverMode === "timeline"}
+          isPlaying={timelineIsPlaying}
+          currentBar={status.currentBar}
+          currentBpm={status.currentBpm}
+          timelineBpm={status.timelineBpm}
+          tempoRatio={status.tempoRatio}
+          playbackMode={status.playbackMode}
+          pitchPreserveReady={status.pitchPreserveReady}
+          showModeSelector={false}
+          onPlaybackModeChange={(mode: PlaybackMode) => void engine.setPlaybackMode(mode)}
+          onPlay={() => playAs("timeline")}
+          onPause={() => engine.pause()}
+          onStop={() => { engine.stop(); clearSectionLoop(); }}
         />
       </div>
 
@@ -243,8 +325,10 @@ export default function Page() {
           currentBar={status.currentBar}
           isPlaying={status.isPlaying}
           dimTempo={status.driverMode === "loop"}
+          activeSectionId={activeSectionId}
           onTimelineChange={updateTimeline}
           onCurrentBarChange={handlePlayheadChange}
+          onSectionClick={handleSectionClick}
         />
       </div>
 

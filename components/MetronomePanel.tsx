@@ -43,7 +43,11 @@ export function MetronomePanel({
 
   const openEdit = () => {
     if (!currentSound) return;
-    setEditingSound(currentSound);
+    // built-in: clone with fresh id so it saves as new custom sound
+    const forEdit = currentSound.builtIn
+      ? { ...currentSound, id: `custom-${Date.now()}`, builtIn: undefined }
+      : currentSound;
+    setEditingSound(forEdit);
     setEditorOpen(true);
   };
 
@@ -137,11 +141,10 @@ export function MetronomePanel({
           <button
             className="btn"
             style={{ padding: "4px 10px" }}
-            disabled={currentSound?.builtIn}
-            title={currentSound?.builtIn ? "內建音色不可編輯" : "編輯"}
+            title={currentSound?.builtIn ? "以此音色為基礎建立自訂音色" : "編輯音色"}
             onClick={openEdit}
           >
-            ✎ 編輯
+            {currentSound?.builtIn ? "✎ 複製編輯" : "✎ 編輯"}
           </button>
           <button
             className="btn danger"

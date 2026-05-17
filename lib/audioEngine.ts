@@ -79,6 +79,24 @@ export class BrowserLoopEngine {
   setStatusCallback(cb: (s: EngineStatus) => void) { this.onStatus = cb; }
   getPlaybackMode(): PlaybackMode { return this.audioPlayer?.playbackMode ?? "pitch-preserve"; }
 
+  previewClick(sound: MetronomeSound) {
+    this.ensureCtx();
+    const ctx = this.ctx!;
+    const t = ctx.currentTime + 0.01;
+    const { wave, accentFreq, accentPeak, attack, decay, duration } = sound;
+    const osc = ctx.createOscillator();
+    const env = ctx.createGain();
+    osc.connect(env);
+    env.connect(ctx.destination);
+    osc.type = wave as OscillatorType;
+    osc.frequency.value = accentFreq;
+    env.gain.setValueAtTime(0, t);
+    env.gain.linearRampToValueAtTime(accentPeak * (this.metronomeVolume), t + attack);
+    env.gain.exponentialRampToValueAtTime(0.001, t + attack + decay);
+    osc.start(t);
+    osc.stop(t + duration);
+  }
+
   async setPlaybackMode(mode: PlaybackMode) {
     if (!this.audioPlayer) return;
     const params = this.tempoEngine.tick(this.ctx?.currentTime ?? 0);
