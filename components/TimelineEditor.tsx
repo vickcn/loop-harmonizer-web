@@ -49,6 +49,7 @@ export function TimelineEditor({
   const [editMode, setEditMode] = useState(false);
   const [selectedSectionId, setSelectedSectionId] = useState<string | null>(null);
   const [sectionDrag, setSectionDrag] = useState<SectionDrag>(null);
+  const [copiedSection, setCopiedSection] = useState<SectionInstance | null>(null);
   const [width, setWidth] = useState<number>(MIN_WIDTH);
   // Background pan (mobile X scroll)
   const bgPanRef = useRef<{ startX: number; startScrollLeft: number } | null>(null);
@@ -190,6 +191,41 @@ export function TimelineEditor({
   const deleteSection = (id: string) => {
     onTimelineChange({ ...timeline, sections: timeline.sections.filter((s) => s.id !== id) });
     if (selectedSectionId === id) setSelectedSectionId(null);
+  };
+
+  const addSectionAtBar = (bar: number, len = 8) => {
+    // Find first free slot at or after `bar`
+    const sorted = [...timeline.sections].sort((a, b) => a.startBar - b.startBar);
+    let start = Math.max(1, Math.round(bar));
+    let end = Math.min(timeline.totalBars, start + len);
+    for (const s of sorted) {
+      if (start < s.endBar && end > s.startBar) {
+        start = s.endBar;
+        end = Math.min(timeline.totalBars, start + len);
+      }
+    }
+    if (start >= timeline.totalBars) return;
+    const typeId = timeline.sectionTypes[0]?.id ?? "";
+    const id = `sec_${Date.now()}`;
+    const newSec: SectionInstance = { id, typeId, label: "New", startBar: start, endBar: end };
+    onTimelineChange({ ...timeline, sections: [...timeline.sections, newSec] });
+    setSelectedSectionId(id);
+  };
+
+  const pasteSection = () => {
+    if (!copiedSection) return;
+    const len = copiedSection.endBar - copiedSection.startBar;
+    const sorted = [...timeline.sections].sort((a, b) => a.startBar - b.startBar);
+    let start = Math.max(1, Math.round(currentBar));
+    let end = Math.min(timeline.totalBars, start + len);
+    for (const s of sorted) {
+      if (start < s.endBar && end > s.startBar) { start = s.endBar; end = Math.min(timeline.totalBars, start + len); }
+    }
+    if (start >= timeline.totalBars) return;
+    const id = `sec_${Date.now()}`;
+    const newSec: SectionInstance = { id, typeId: copiedSection.typeId, label: copiedSection.label, startBar: start, endBar: end };
+    onTimelineChange({ ...timeline, sections: [...timeline.sections, newSec] });
+    setSelectedSectionId(id);
   };
 
   const onPointerMoveSvg = (event: PointerEvent<SVGSVGElement>) => {
@@ -370,6 +406,14 @@ export function TimelineEditor({
           >
             {editMode ? "✎ 編輯中" : "編輯段落"}
           </button>
+          {editMode && (
+            <>
+              <button className="btn" onClick={() => addSectionAtBar(Math.round(currentBar))}>＋ 新增</button>
+              {copiedSection && (
+                <button className="btn" onClick={pasteSection}>⎘ 貼上</button>
+              )}
+            </>
+          )}
           <label className="row">
             <span className="label">總 Bars</span>
             <input
@@ -641,7 +685,16 @@ export function TimelineEditor({
         <div style={{ background: "#1a2035", borderRadius: 12, padding: "14px 16px", display: "grid", gap: 12 }}>
           <div className="row" style={{ justifyContent: "space-between" }}>
             <span className="label" style={{ fontSize: 14, color: "#f4f4f5" }}>編輯段落：<strong>{selectedSection.label}</strong></span>
-            <button className="btn danger" style={{ padding: "4px 10px", fontSize: 13 }} onClick={() => deleteSection(selectedSection.id)}>刪除</button>
+            <div className="row" style={{ gap: 8 }}>
+              <button
+                className="btn"
+                style={{ padding: "4px 10px", fontSize: 13 }}
+                onClick={() => setCopiedSection(selectedSection)}
+              >
+                ⎘ 複製
+              </button>
+              <button className="btn danger" style={{ padding: "4px 10px", fontSize: 13 }} onClick={() => deleteSection(selectedSection.id)}>刪除</button>
+            </div>
           </div>
           <div className="row">
             <label className="row">
