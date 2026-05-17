@@ -132,8 +132,8 @@ export default function Page() {
         <p className="subtitle">流程播放、段落時間軸、Tempo 錨點、同步節拍器、即時切 beat 線性緩衝、Tap Tempo + Vercel API，並加入免費 WSOLA-inspired 保音高變速原型。</p>
       </header>
 
-      {/* ── 雙 Transport：桌機並排、平板/手機堆疊 ── */}
-      <div className="col-6">
+      {/* ── Loop Transport ── */}
+      <div className="col-full">
         <TransportBar
           title="Loop 播放"
           loaded={loaded}
@@ -148,25 +148,6 @@ export default function Page() {
           showModeSelector={true}
           onPlaybackModeChange={(mode: PlaybackMode) => void engine.setPlaybackMode(mode)}
           onPlay={() => playAs("loop")}
-          onPause={() => engine.pause()}
-          onStop={() => engine.stop()}
-        />
-      </div>
-      <div className="col-6">
-        <TransportBar
-          title="Timeline 播放"
-          loaded={loaded}
-          isActive={status.driverMode === "timeline"}
-          isPlaying={timelineIsPlaying}
-          currentBar={status.currentBar}
-          currentBpm={status.currentBpm}
-          timelineBpm={status.timelineBpm}
-          tempoRatio={status.tempoRatio}
-          playbackMode={status.playbackMode}
-          pitchPreserveReady={status.pitchPreserveReady}
-          showModeSelector={false}
-          onPlaybackModeChange={(mode: PlaybackMode) => void engine.setPlaybackMode(mode)}
-          onPlay={() => playAs("timeline")}
           onPause={() => engine.pause()}
           onStop={() => engine.stop()}
         />
@@ -222,7 +203,7 @@ export default function Page() {
         />
       </div>
 
-      {/* ── Loop 載入 (Timeline 與 Tempo 面板之間) ── */}
+      {/* ── Loop 載入 ── */}
       <div className="col-4">
         <FileLoader
           audioSource={timeline.audioSource}
@@ -235,6 +216,27 @@ export default function Page() {
             });
             setTargetBpm(bpm);
           }}
+        />
+      </div>
+
+      {/* ── Timeline Transport ── */}
+      <div className="col-full">
+        <TransportBar
+          title="Timeline 播放"
+          loaded={loaded}
+          isActive={status.driverMode === "timeline"}
+          isPlaying={timelineIsPlaying}
+          currentBar={status.currentBar}
+          currentBpm={status.currentBpm}
+          timelineBpm={status.timelineBpm}
+          tempoRatio={status.tempoRatio}
+          playbackMode={status.playbackMode}
+          pitchPreserveReady={status.pitchPreserveReady}
+          showModeSelector={false}
+          onPlaybackModeChange={(mode: PlaybackMode) => void engine.setPlaybackMode(mode)}
+          onPlay={() => playAs("timeline")}
+          onPause={() => engine.pause()}
+          onStop={() => engine.stop()}
         />
       </div>
 
