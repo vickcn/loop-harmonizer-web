@@ -69,10 +69,14 @@ export const defaultTimeline: SongTimeline = {
   totalBars: 32,
   timeSignature: { beatsPerBar: 4, beatUnit: 4 },
   sectionTypes: [
-    { id: "stype_intro", name: "Intro", color: "#64748b" },
-    { id: "stype_verse", name: "Verse", color: "#3b82f6" },
-    { id: "stype_chorus", name: "Chorus", color: "#f97316" },
-    { id: "stype_bridge", name: "Bridge", color: "#22c55e" }
+    { id: "stype_intro",      name: "Intro",      color: "#64748b" },
+    { id: "stype_verse",      name: "Verse",      color: "#3b82f6" },
+    { id: "stype_prechorus",  name: "Pre-Chorus", color: "#8b5cf6" },
+    { id: "stype_chorus",     name: "Chorus",     color: "#f97316" },
+    { id: "stype_bridge",     name: "Bridge",     color: "#22c55e" },
+    { id: "stype_interlude",  name: "Interlude",  color: "#06b6d4" },
+    { id: "stype_free",       name: "Free",       color: "#eab308" },
+    { id: "stype_other",      name: "Other",      color: "#6b7280" },
   ],
   sections: [
     { id: "sec_001", typeId: "stype_intro", label: "Intro", startBar: 1, endBar: 4 },
