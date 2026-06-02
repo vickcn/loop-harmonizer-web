@@ -50,5 +50,6 @@ export async function createBandTrackFromFile(file: File): Promise<BandTrack> {
     status: "stopped",
     syncMode: "manual-rate",
     loop: false,
+    playbackMode: "fast-rate",
   };
 }

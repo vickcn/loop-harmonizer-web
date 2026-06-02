@@ -1,6 +1,12 @@
 export type TrackStatus = "stopped" | "playing" | "paused";
 export type TrackSyncMode = "free" | "global-bpm" | "manual-rate";
 
+/**
+ * fast-rate   — AudioBufferSourceNode.playbackRate (M1, 已生效)
+ * pitch-preserve — 保音高變速，M2B/M2C 再實作
+ */
+export type TrackPlaybackMode = "fast-rate" | "pitch-preserve";
+
 export type BandTrack = {
   id: string;
   name: string;
@@ -15,6 +21,7 @@ export type BandTrack = {
   status: TrackStatus;
   syncMode: TrackSyncMode;
   loop: boolean;
+  playbackMode: TrackPlaybackMode;
 };
 
 export type BandSession = {
