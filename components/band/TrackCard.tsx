@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { BandTrack, TrackSyncMode } from "@/lib/band/bandTypes";
 import { TrackPlayhead } from "./TrackPlayhead";
 
@@ -23,6 +23,12 @@ const STATUS_LABEL: Record<string, string> = {
 
 export function TrackCard({ track, onChange }: Props) {
   const [showFineTune, setShowFineTune] = useState(false);
+  const fineTuneBaseRef = useRef(track.baseRate);
+
+  const toggleFineTune = () => {
+    if (!showFineTune) fineTuneBaseRef.current = track.baseRate;
+    setShowFineTune((v) => !v);
+  };
 
   const togglePlay = () =>
     onChange({ status: track.status === "playing" ? "paused" : "playing" });
@@ -103,28 +109,30 @@ export function TrackCard({ track, onChange }: Props) {
             <button
               className="btn"
               style={{ fontSize: 11, padding: "3px 7px", opacity: showFineTune ? 1 : 0.6 }}
-              onClick={() => setShowFineTune((v) => !v)}
+              onClick={toggleFineTune}
             >
               微調
             </button>
           </div>
           {showFineTune && (
-            <div className="row" style={{ gap: 6, alignItems: "center" }}>
-              <span className="small" style={{ minWidth: 36, opacity: 0.55 }}>
-                {(track.baseRate - 0.03).toFixed(3)}
-              </span>
+            <div className="grid" style={{ gap: 2 }}>
               <input
                 type="range"
-                min={track.baseRate - 0.03}
-                max={track.baseRate + 0.03}
+                min={fineTuneBaseRef.current - 0.03}
+                max={fineTuneBaseRef.current + 0.03}
                 step={0.001}
                 value={track.baseRate}
-                style={{ flex: 1 }}
+                style={{ width: "100%" }}
                 onChange={(e) => onChange({ baseRate: Math.max(0.25, Math.min(4, Number(e.target.value))) })}
               />
-              <span className="small" style={{ minWidth: 36, opacity: 0.55, textAlign: "right" }}>
-                {(track.baseRate + 0.03).toFixed(3)}
-              </span>
+              <div className="row" style={{ justifyContent: "space-between" }}>
+                <span className="small" style={{ opacity: 0.5 }}>−0.03</span>
+                <span className="small" style={{ opacity: 0.8, color: "var(--accent)" }}>
+                  {track.baseRate >= fineTuneBaseRef.current ? "+" : ""}
+                  {(track.baseRate - fineTuneBaseRef.current).toFixed(3)}
+                </span>
+                <span className="small" style={{ opacity: 0.5 }}>+0.03</span>
+              </div>
             </div>
           )}
         </div>
