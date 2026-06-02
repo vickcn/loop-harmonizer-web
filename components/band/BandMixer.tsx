@@ -8,12 +8,24 @@ import { TrackCard } from "./TrackCard";
 import { SelectedTracksBar } from "./SelectedTracksBar";
 
 export function BandMixer() {
-  const [session, setSession] = useState<BandSession>(createDefaultBandSession);  const [loading, setLoading] = useState(false);
+  const [session, setSession] = useState<BandSession>(createDefaultBandSession);
+  const [loading, setLoading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const engineRef = useRef<MultiTrackEngine | null>(null);
 
   const getEngine = (): MultiTrackEngine => {
-    if (!engineRef.current) engineRef.current = new MultiTrackEngine();
+    if (!engineRef.current) {
+      const eng = new MultiTrackEngine();
+      eng.onTrackEnded = (trackId) => {
+        setSession((prev) => ({
+          ...prev,
+          tracks: prev.tracks.map((t) =>
+            t.id === trackId ? { ...t, status: "stopped", playheadSec: 0 } : t
+          ),
+        }));
+      };
+      engineRef.current = eng;
+    }
     return engineRef.current;
   };
 
@@ -69,6 +81,7 @@ export function BandMixer() {
           durationSec,
           status: "stopped",
           syncMode: "free",
+          loop: false,
         };
         setSession((prev) => ({ ...prev, tracks: [...prev.tracks, track] }));
       } catch {
@@ -96,6 +109,7 @@ export function BandMixer() {
     if ("volume" in patch) eng.setVolume(id, patch.volume!);
     if ("muted" in patch) eng.setMuted(id, patch.muted!);
     if ("baseRate" in patch) eng.setPlaybackRate(id, patch.baseRate!);
+    if ("loop" in patch) eng.setLoop(id, patch.loop!);
 
     setSession((prev) => ({
       ...prev,

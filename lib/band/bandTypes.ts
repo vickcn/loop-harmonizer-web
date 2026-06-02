@@ -14,6 +14,7 @@ export type BandTrack = {
   durationSec: number;
   status: TrackStatus;
   syncMode: TrackSyncMode;
+  loop: boolean;
 };
 
 export type BandSession = {
