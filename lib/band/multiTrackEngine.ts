@@ -9,11 +9,13 @@ type InternalTrack = {
   playbackRate: number;
   volume: number;
   muted: boolean;
+  loop: boolean;
 };
 
 export class MultiTrackEngine {
   private ctx: AudioContext | null = null;
   private tracks = new Map<string, InternalTrack>();
+  onTrackEnded: ((trackId: string) => void) | null = null;
 
   private ensureCtx(): AudioContext {
     if (!this.ctx || this.ctx.state === "closed") {
@@ -24,21 +26,32 @@ export class MultiTrackEngine {
 
   private stopSource(t: InternalTrack): void {
     if (!t.source) return;
+    t.source.onended = null;
     try { t.source.stop(); } catch { /* already stopped */ }
     try { t.source.disconnect(); } catch { /* already disconnected */ }
     t.source = null;
   }
 
-  private startAt(t: InternalTrack, scheduleTime: number): void {
+  private startAt(t: InternalTrack, trackId: string, scheduleTime: number): void {
     this.stopSource(t);
     const dur = t.buffer.duration;
     const audioOffset = dur > 0 ? ((t.pausedAt % dur) + dur) % dur : 0;
     const src = this.ctx!.createBufferSource();
     src.buffer = t.buffer;
-    src.loop = true;
+    src.loop = t.loop;
     src.playbackRate.value = t.playbackRate;
     src.connect(t.gainNode);
     src.start(scheduleTime, audioOffset);
+    if (!t.loop) {
+      src.onended = () => {
+        // only fire if this source is still the active one
+        if (t.source !== src) return;
+        t.source = null;
+        t.isPlaying = false;
+        t.pausedAt = 0;
+        this.onTrackEnded?.(trackId);
+      };
+    }
     t.source = src;
     t.startCtxTime = scheduleTime;
     t.startAudioOffset = audioOffset;
@@ -71,6 +84,7 @@ export class MultiTrackEngine {
       playbackRate: 1,
       volume: 1,
       muted: false,
+      loop: false,
     });
 
     return buffer.duration;
@@ -81,7 +95,7 @@ export class MultiTrackEngine {
     await ctx.resume();
     const t = this.tracks.get(trackId);
     if (!t) return;
-    this.startAt(t, ctx.currentTime + 0.01);
+    this.startAt(t, trackId, ctx.currentTime + 0.01);
   }
 
   pauseTrack(trackId: string): void {
@@ -106,7 +120,7 @@ export class MultiTrackEngine {
     t.pausedAt = Math.max(0, sec);
     if (t.isPlaying) {
       const ctx = this.ensureCtx();
-      this.startAt(t, ctx.currentTime + 0.01);
+      this.startAt(t, trackId, ctx.currentTime + 0.01);
     }
   }
 
@@ -117,7 +131,7 @@ export class MultiTrackEngine {
     for (const id of trackIds) {
       const t = this.tracks.get(id);
       if (!t) continue;
-      this.startAt(t, scheduleTime);
+      this.startAt(t, id, scheduleTime);
     }
   }
 
@@ -127,6 +141,28 @@ export class MultiTrackEngine {
 
   stopTracks(trackIds: string[]): void {
     for (const id of trackIds) this.stopTrack(id);
+  }
+
+  setLoop(trackId: string, loop: boolean): void {
+    const t = this.tracks.get(trackId);
+    if (!t) return;
+    t.loop = loop;
+    if (t.source) {
+      t.source.loop = loop;
+      // if switching to non-loop while playing, re-attach onended
+      if (!loop) {
+        const src = t.source;
+        src.onended = () => {
+          if (t.source !== src) return;
+          t.source = null;
+          t.isPlaying = false;
+          t.pausedAt = 0;
+          this.onTrackEnded?.(trackId);
+        };
+      } else {
+        t.source.onended = null;
+      }
+    }
   }
 
   setVolume(trackId: string, volume: number): void {
@@ -160,7 +196,8 @@ export class MultiTrackEngine {
     const raw = t.startAudioOffset + elapsed;
     const dur = t.buffer.duration;
     if (dur <= 0) return 0;
-    return ((raw % dur) + dur) % dur;
+    if (t.loop) return ((raw % dur) + dur) % dur;
+    return Math.min(raw, dur);
   }
 
   dispose(): void {

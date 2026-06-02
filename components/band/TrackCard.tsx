@@ -146,6 +146,14 @@ export function TrackCard({ track, onChange }: Props) {
           <span className="small">靜音</span>
         </label>
 
+        <button
+          className={`btn${track.loop ? " primary" : ""}`}
+          style={{ fontSize: 12, padding: "4px 10px" }}
+          onClick={() => onChange({ loop: !track.loop })}
+        >
+          {track.loop ? "⟳ 循環" : "⟳ 單次"}
+        </button>
+
         <label className="row" style={{ gap: 4 }}>
           <span className="small">同步</span>
           <select

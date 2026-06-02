@@ -32,5 +32,6 @@ export async function createBandTrackFromFile(file: File): Promise<BandTrack> {
     durationSec,
     status: "stopped",
     syncMode: "free",
+    loop: false,
   };
 }
