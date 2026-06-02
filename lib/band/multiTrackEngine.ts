@@ -12,7 +12,7 @@
  */
 
 import { FastRateAdapter } from "./playbackAdapters/FastRateAdapter";
-import { PitchPreservePlaceholderAdapter } from "./playbackAdapters/PitchPreservePlaceholderAdapter";
+import { PitchPreserveStubAdapter } from "./playbackAdapters/PitchPreserveStubAdapter";
 import type { TrackPlaybackAdapter } from "./playbackAdapters/types";
 
 export type EnginePlaybackMode = "fast-rate" | "pitch-preserve";
@@ -33,7 +33,7 @@ type InternalTrack = {
 function createAdapter(mode: EnginePlaybackMode): TrackPlaybackAdapter {
   if (mode === "pitch-preserve") {
     // M2C: 換成真正 PitchPreserveAdapter（AudioWorklet）
-    return new PitchPreservePlaceholderAdapter();
+    return new PitchPreserveStubAdapter();
   }
   return new FastRateAdapter();
 }
