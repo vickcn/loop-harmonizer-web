@@ -1,7 +1,7 @@
 "use client";
 
 import { useRef, useState } from "react";
-import { BandTrack, TrackSyncMode } from "@/lib/band/bandTypes";
+import { BandTrack, TrackPlaybackMode, TrackSyncMode } from "@/lib/band/bandTypes";
 import { TrackPlayhead } from "./TrackPlayhead";
 
 type Props = {
@@ -187,6 +187,25 @@ export function TrackCard({ track, onChange }: Props) {
         >
           {track.loop ? "⟳ 循環" : "⟳ 單次"}
         </button>
+
+        {/* 播放模式 — M2A 架構佔位，pitch-preserve 音訊處理留至 M2B/M2C */}
+        <label className="row" style={{ gap: 4 }}>
+          <span className="small">播放模式</span>
+          <select
+            className="input"
+            value={track.playbackMode}
+            style={{ fontSize: 12 }}
+            onChange={(e) => onChange({ playbackMode: e.target.value as TrackPlaybackMode })}
+          >
+            <option value="fast-rate">快速變速</option>
+            <option value="pitch-preserve">保音高（實驗，M2B）</option>
+          </select>
+        </label>
+        {track.playbackMode === "pitch-preserve" && (
+          <span className="small" style={{ color: "#f59e0b", opacity: 0.9 }}>
+            ⚠ 保音高尚未生效，實際仍使用快速變速
+          </span>
+        )}
 
         <label className="row" style={{ gap: 4 }}>
           <span className="small">同步</span>

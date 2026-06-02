@@ -12,6 +12,13 @@ type InternalTrack = {
   loop: boolean;
 };
 
+/**
+ * M2A: playbackMode 型別佔位。
+ * 目前 engine 一律使用 fast-rate（AudioBufferSourceNode.playbackRate）。
+ * pitch-preserve 真正的音訊處理（AudioWorklet / WSOLA）留待 M2B/M2C 實作。
+ */
+export type EnginePlaybackMode = "fast-rate" | "pitch-preserve";
+
 export class MultiTrackEngine {
   private ctx: AudioContext | null = null;
   private tracks = new Map<string, InternalTrack>();
