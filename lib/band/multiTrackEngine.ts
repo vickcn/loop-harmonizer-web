@@ -1,18 +1,19 @@
 /**
- * MultiTrackEngine — M2B 重構
+ * MultiTrackEngine — M2C 更新
  *
  * 每軌依 playbackMode 使用對應 adapter：
- *   fast-rate     → FastRateAdapter（AudioBufferSourceNode.playbackRate，M1 行為）
- *   pitch-preserve → PitchPreservePlaceholderAdapter（M2B：fallback 到 fast-rate）
+ *   fast-rate      → FastRateAdapter（AudioBufferSourceNode.playbackRate，M1 行為）
+ *   pitch-preserve → PitchPreserveAdapter（AudioWorklet WSOLA，真正保音高）
  *
- * M2C：PitchPreservePlaceholderAdapter 換成真正 AudioWorklet/WSOLA 實作，
- *       MultiTrackEngine 本身不需修改。
+ * 多軌 pitch-preserve 注意：playTracks() 共用同一 scheduleTime，
+ * 但 PitchPreserveAdapter 的 worklet 不支援 scheduleTime，
+ * 多條 pitch-preserve 軌道無法精確同步。建議僅單軌使用保音高模式。
  *
  * 公開 API 與 M1/M2A 完全相同，BandMixer 無需重寫。
  */
 
 import { FastRateAdapter } from "./playbackAdapters/FastRateAdapter";
-import { PitchPreserveStubAdapter } from "./playbackAdapters/PitchPreserveStubAdapter";
+import { PitchPreserveAdapter } from "./playbackAdapters/PitchPreserveAdapter";
 import type { TrackPlaybackAdapter } from "./playbackAdapters/types";
 
 export type EnginePlaybackMode = "fast-rate" | "pitch-preserve";
@@ -32,8 +33,7 @@ type InternalTrack = {
 
 function createAdapter(mode: EnginePlaybackMode): TrackPlaybackAdapter {
   if (mode === "pitch-preserve") {
-    // M2C: 換成真正 PitchPreserveAdapter（AudioWorklet）
-    return new PitchPreserveStubAdapter();
+    return new PitchPreserveAdapter();
   }
   return new FastRateAdapter();
 }
@@ -123,6 +123,7 @@ export class MultiTrackEngine {
     const ctx = this.ensureCtx();
     await ctx.resume();
     const scheduleTime = ctx.currentTime + 0.02;
+    // pitch-preserve 軌道的 scheduleTime 無法精確對齊，多軌同步以 fast-rate 為準
     for (const id of trackIds) {
       const t = this.tracks.get(id);
       if (!t) continue;
