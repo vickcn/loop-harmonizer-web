@@ -129,6 +129,7 @@ export function BandMixer() {
         if ("muted" in resolved) eng.setMuted(id, resolved.muted!);
         if ("loop" in resolved) eng.setLoop(id, resolved.loop!);
         if ("baseRate" in resolved) eng.setPlaybackRate(id, resolved.baseRate!);
+        if ("playbackMode" in resolved) eng.setPlaybackMode(id, resolved.playbackMode!);
       })();
 
       return {
