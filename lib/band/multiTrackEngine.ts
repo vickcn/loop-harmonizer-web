@@ -1,23 +1,42 @@
+/**
+ * MultiTrackEngine — M2B 重構
+ *
+ * 每軌依 playbackMode 使用對應 adapter：
+ *   fast-rate     → FastRateAdapter（AudioBufferSourceNode.playbackRate，M1 行為）
+ *   pitch-preserve → PitchPreservePlaceholderAdapter（M2B：fallback 到 fast-rate）
+ *
+ * M2C：PitchPreservePlaceholderAdapter 換成真正 AudioWorklet/WSOLA 實作，
+ *       MultiTrackEngine 本身不需修改。
+ *
+ * 公開 API 與 M1/M2A 完全相同，BandMixer 無需重寫。
+ */
+
+import { FastRateAdapter } from "./playbackAdapters/FastRateAdapter";
+import { PitchPreservePlaceholderAdapter } from "./playbackAdapters/PitchPreservePlaceholderAdapter";
+import type { TrackPlaybackAdapter } from "./playbackAdapters/types";
+
+export type EnginePlaybackMode = "fast-rate" | "pitch-preserve";
+
 type InternalTrack = {
   buffer: AudioBuffer;
   gainNode: GainNode;
-  source: AudioBufferSourceNode | null;
-  startCtxTime: number;
-  startAudioOffset: number;
+  adapter: TrackPlaybackAdapter;
   pausedAt: number;
   isPlaying: boolean;
   playbackRate: number;
   volume: number;
   muted: boolean;
   loop: boolean;
+  playbackMode: EnginePlaybackMode;
 };
 
-/**
- * M2A: playbackMode 型別佔位。
- * 目前 engine 一律使用 fast-rate（AudioBufferSourceNode.playbackRate）。
- * pitch-preserve 真正的音訊處理（AudioWorklet / WSOLA）留待 M2B/M2C 實作。
- */
-export type EnginePlaybackMode = "fast-rate" | "pitch-preserve";
+function createAdapter(mode: EnginePlaybackMode): TrackPlaybackAdapter {
+  if (mode === "pitch-preserve") {
+    // M2C: 換成真正 PitchPreserveAdapter（AudioWorklet）
+    return new PitchPreservePlaceholderAdapter();
+  }
+  return new FastRateAdapter();
+}
 
 export class MultiTrackEngine {
   private ctx: AudioContext | null = null;
@@ -31,40 +50,6 @@ export class MultiTrackEngine {
     return this.ctx;
   }
 
-  private stopSource(t: InternalTrack): void {
-    if (!t.source) return;
-    t.source.onended = null;
-    try { t.source.stop(); } catch { /* already stopped */ }
-    try { t.source.disconnect(); } catch { /* already disconnected */ }
-    t.source = null;
-  }
-
-  private startAt(t: InternalTrack, trackId: string, scheduleTime: number): void {
-    this.stopSource(t);
-    const dur = t.buffer.duration;
-    const audioOffset = dur > 0 ? ((t.pausedAt % dur) + dur) % dur : 0;
-    const src = this.ctx!.createBufferSource();
-    src.buffer = t.buffer;
-    src.loop = t.loop;
-    src.playbackRate.value = t.playbackRate;
-    src.connect(t.gainNode);
-    src.start(scheduleTime, audioOffset);
-    if (!t.loop) {
-      src.onended = () => {
-        // only fire if this source is still the active one
-        if (t.source !== src) return;
-        t.source = null;
-        t.isPlaying = false;
-        t.pausedAt = 0;
-        this.onTrackEnded?.(trackId);
-      };
-    }
-    t.source = src;
-    t.startCtxTime = scheduleTime;
-    t.startAudioOffset = audioOffset;
-    t.isPlaying = true;
-  }
-
   async loadTrack(trackId: string, file: File): Promise<number> {
     const ctx = this.ensureCtx();
     const ab = await file.arrayBuffer();
@@ -72,7 +57,7 @@ export class MultiTrackEngine {
 
     const existing = this.tracks.get(trackId);
     if (existing) {
-      this.stopSource(existing);
+      existing.adapter.dispose();
       try { existing.gainNode.disconnect(); } catch { /* ok */ }
     }
 
@@ -80,18 +65,20 @@ export class MultiTrackEngine {
     gainNode.gain.value = 1;
     gainNode.connect(ctx.destination);
 
+    const adapter = createAdapter("fast-rate");
+    adapter.load(buffer, gainNode, ctx);
+
     this.tracks.set(trackId, {
       buffer,
       gainNode,
-      source: null,
-      startCtxTime: 0,
-      startAudioOffset: 0,
+      adapter,
       pausedAt: 0,
       isPlaying: false,
       playbackRate: 1,
       volume: 1,
       muted: false,
       loop: false,
+      playbackMode: "fast-rate",
     });
 
     return buffer.duration;
@@ -102,21 +89,22 @@ export class MultiTrackEngine {
     await ctx.resume();
     const t = this.tracks.get(trackId);
     if (!t) return;
-    this.startAt(t, trackId, ctx.currentTime + 0.01);
+    this._startAt(t, trackId, ctx.currentTime + 0.01);
   }
 
   pauseTrack(trackId: string): void {
     const t = this.tracks.get(trackId);
     if (!t || !t.isPlaying) return;
-    t.pausedAt = this.getTrackPosition(trackId);
-    this.stopSource(t);
+    const ctx = this.ensureCtx();
+    t.pausedAt = t.adapter.getPosition(ctx);
+    t.adapter.pause(ctx);
     t.isPlaying = false;
   }
 
   stopTrack(trackId: string): void {
     const t = this.tracks.get(trackId);
     if (!t) return;
-    this.stopSource(t);
+    t.adapter.stop();
     t.pausedAt = 0;
     t.isPlaying = false;
   }
@@ -127,7 +115,7 @@ export class MultiTrackEngine {
     t.pausedAt = Math.max(0, sec);
     if (t.isPlaying) {
       const ctx = this.ensureCtx();
-      this.startAt(t, trackId, ctx.currentTime + 0.01);
+      this._startAt(t, trackId, ctx.currentTime + 0.01);
     }
   }
 
@@ -138,7 +126,7 @@ export class MultiTrackEngine {
     for (const id of trackIds) {
       const t = this.tracks.get(id);
       if (!t) continue;
-      this.startAt(t, id, scheduleTime);
+      this._startAt(t, id, scheduleTime);
     }
   }
 
@@ -150,26 +138,42 @@ export class MultiTrackEngine {
     for (const id of trackIds) this.stopTrack(id);
   }
 
+  /**
+   * 切換播放模式。
+   * 若播放中：暫停 → 換 adapter → 從原位置繼續播放。
+   * M2C 備忘：pitch-preserve adapter 初始化可能為 async（需 addModule），
+   *           屆時此方法需改為 async 並 await adapter.init()。
+   */
+  setPlaybackMode(trackId: string, mode: EnginePlaybackMode): void {
+    const t = this.tracks.get(trackId);
+    if (!t || t.playbackMode === mode) return;
+
+    const ctx = this.ensureCtx();
+    const wasPlaying = t.isPlaying;
+    const savedPos = t.adapter.getPosition(ctx);
+
+    // 停止舊 adapter
+    t.adapter.dispose();
+    t.pausedAt = savedPos;
+    t.isPlaying = false;
+
+    // 建立新 adapter
+    const newAdapter = createAdapter(mode);
+    newAdapter.load(t.buffer, t.gainNode, ctx);
+    t.adapter = newAdapter;
+    t.playbackMode = mode;
+
+    if (wasPlaying) {
+      this._startAt(t, trackId, ctx.currentTime + 0.01);
+    }
+  }
+
   setLoop(trackId: string, loop: boolean): void {
     const t = this.tracks.get(trackId);
     if (!t) return;
     t.loop = loop;
-    if (t.source) {
-      t.source.loop = loop;
-      // if switching to non-loop while playing, re-attach onended
-      if (!loop) {
-        const src = t.source;
-        src.onended = () => {
-          if (t.source !== src) return;
-          t.source = null;
-          t.isPlaying = false;
-          t.pausedAt = 0;
-          this.onTrackEnded?.(trackId);
-        };
-      } else {
-        t.source.onended = null;
-      }
-    }
+    const onEnded = loop ? null : () => this._handleTrackEnded(trackId);
+    t.adapter.setLoop(loop, onEnded);
   }
 
   setVolume(trackId: string, volume: number): void {
@@ -190,26 +194,19 @@ export class MultiTrackEngine {
     const t = this.tracks.get(trackId);
     if (!t) return;
     t.playbackRate = Math.max(0.1, Math.min(4, rate));
-    if (t.source && this.ctx) {
-      t.source.playbackRate.setTargetAtTime(t.playbackRate, this.ctx.currentTime, 0.05);
-    }
+    if (this.ctx) t.adapter.setPlaybackRate(t.playbackRate, this.ctx);
   }
 
   getTrackPosition(trackId: string): number {
     const t = this.tracks.get(trackId);
     if (!t) return 0;
     if (!t.isPlaying || !this.ctx) return t.pausedAt;
-    const elapsed = Math.max(0, this.ctx.currentTime - t.startCtxTime) * t.playbackRate;
-    const raw = t.startAudioOffset + elapsed;
-    const dur = t.buffer.duration;
-    if (dur <= 0) return 0;
-    if (t.loop) return ((raw % dur) + dur) % dur;
-    return Math.min(raw, dur);
+    return t.adapter.getPosition(this.ctx);
   }
 
   dispose(): void {
     for (const t of this.tracks.values()) {
-      this.stopSource(t);
+      t.adapter.dispose();
       try { t.gainNode.disconnect(); } catch { /* ok */ }
     }
     this.tracks.clear();
@@ -217,5 +214,26 @@ export class MultiTrackEngine {
       void this.ctx.close();
     }
     this.ctx = null;
+  }
+
+  // ── private ──
+
+  private _startAt(t: InternalTrack, trackId: string, scheduleTime: number): void {
+    t.adapter.onEnded = () => this._handleTrackEnded(trackId);
+    t.adapter.play(scheduleTime, {
+      offsetSec: t.pausedAt,
+      playbackRate: t.playbackRate,
+      loop: t.loop,
+    });
+    t.isPlaying = true;
+  }
+
+  private _handleTrackEnded(trackId: string): void {
+    const t = this.tracks.get(trackId);
+    if (t) {
+      t.isPlaying = false;
+      t.pausedAt = 0;
+    }
+    this.onTrackEnded?.(trackId);
   }
 }
