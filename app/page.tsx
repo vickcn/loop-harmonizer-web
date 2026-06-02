@@ -10,6 +10,13 @@ const TOOLS = [
     icon: "🥁",
     ready: true,
   },
+  {
+    href: "/band-mixer",
+    title: "樂團即時配搭",
+    desc: "多音檔載入、每軌播放線、倍率基準設定、未來支援多軌同步觸發。",
+    icon: "🎸",
+    ready: true,
+  },
 ];
 
 export default function IndexPage() {
