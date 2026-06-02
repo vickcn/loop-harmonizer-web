@@ -8,8 +8,7 @@ import { TrackCard } from "./TrackCard";
 import { SelectedTracksBar } from "./SelectedTracksBar";
 
 export function BandMixer() {
-  const [session, setSession] = useState<BandSession>(createDefaultBandSession);
-  const [loading, setLoading] = useState(false);
+  const [session, setSession] = useState<BandSession>(createDefaultBandSession);  const [loading, setLoading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const engineRef = useRef<MultiTrackEngine | null>(null);
 
@@ -142,19 +141,6 @@ export function BandMixer() {
 
       {/* ── 全域控制 ── */}
       <div className="card row" style={{ flexWrap: "wrap", gap: 16 }}>
-        <label className="row">
-          <span className="label">全域 BPM</span>
-          <input
-            className="input"
-            type="number"
-            min={20} max={300} step={1}
-            value={session.globalBpm}
-            style={{ width: 80 }}
-            onChange={(e) =>
-              setSession((prev) => ({ ...prev, globalBpm: Math.max(20, Math.min(300, Number(e.target.value) || 120)) }))
-            }
-          />
-        </label>
         <button
           className="btn primary"
           disabled={loading}

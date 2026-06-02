@@ -3,7 +3,6 @@ import { BandSession, BandTrack } from "./bandTypes";
 export function createDefaultBandSession(): BandSession {
   return {
     id: `session_${Date.now()}`,
-    globalBpm: 120,
     tracks: [],
   };
 }
