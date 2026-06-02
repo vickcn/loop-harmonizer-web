@@ -95,46 +95,34 @@ export function TrackCard({ track, onChange }: Props) {
           />
         </label>
 
-        <div className="grid" style={{ gap: 4 }}>
-          <div className="row" style={{ gap: 6, alignItems: "center" }}>
-            <span className="small">倍率</span>
-            <input
-              className="input"
-              type="number"
-              min={0.25} max={4} step={0.01}
-              value={track.baseRate}
-              style={{ width: 76, fontWeight: 700, fontSize: 16, textAlign: "center", padding: "4px 6px" }}
-              onChange={(e) => onChange({ baseRate: Math.max(0.25, Math.min(4, Number(e.target.value) || 1)) })}
-            />
-            <button
-              className="btn"
-              style={{ fontSize: 11, padding: "3px 7px", opacity: showFineTune ? 1 : 0.6 }}
-              onClick={toggleFineTune}
-            >
-              微調
-            </button>
-          </div>
-          {showFineTune && (
-            <div className="grid" style={{ gap: 2 }}>
-              <input
-                type="range"
-                min={fineTuneBaseRef.current - 0.03}
-                max={fineTuneBaseRef.current + 0.03}
-                step={0.001}
-                value={track.baseRate}
-                style={{ width: "100%" }}
-                onChange={(e) => onChange({ baseRate: Math.max(0.25, Math.min(4, Number(e.target.value))) })}
-              />
-              <div className="row" style={{ justifyContent: "space-between" }}>
-                <span className="small" style={{ opacity: 0.5 }}>−0.03</span>
-                <span className="small" style={{ opacity: 0.8, color: "var(--accent)" }}>
-                  {track.baseRate >= fineTuneBaseRef.current ? "+" : ""}
-                  {(track.baseRate - fineTuneBaseRef.current).toFixed(3)}
-                </span>
-                <span className="small" style={{ opacity: 0.5 }}>+0.03</span>
-              </div>
-            </div>
-          )}
+        {/* 倍率粗調 */}
+        <div className="row" style={{ gap: 4, alignItems: "center" }}>
+          <span className="small">倍率</span>
+          <button
+            className="btn"
+            style={{ padding: "3px 8px", fontWeight: 700 }}
+            onClick={() => onChange({ baseRate: Math.max(0.25, Math.min(4, Math.round((track.baseRate - 0.01) * 1000) / 1000)) })}
+          >−</button>
+          <input
+            className="input"
+            type="number"
+            min={0.25} max={4} step={0.01}
+            value={track.baseRate}
+            style={{ width: 76, fontWeight: 700, fontSize: 16, textAlign: "center", padding: "4px 6px" }}
+            onChange={(e) => onChange({ baseRate: Math.max(0.25, Math.min(4, Number(e.target.value) || 1)) })}
+          />
+          <button
+            className="btn"
+            style={{ padding: "3px 8px", fontWeight: 700 }}
+            onClick={() => onChange({ baseRate: Math.max(0.25, Math.min(4, Math.round((track.baseRate + 0.01) * 1000) / 1000)) })}
+          >+</button>
+          <button
+            className="btn"
+            style={{ fontSize: 11, padding: "3px 7px", opacity: showFineTune ? 1 : 0.6 }}
+            onClick={toggleFineTune}
+          >
+            微調
+          </button>
         </div>
 
         <label className="row" style={{ gap: 4 }}>
@@ -172,6 +160,29 @@ export function TrackCard({ track, onChange }: Props) {
           </select>
         </label>
       </div>
+
+      {/* ── 微調滑桿（獨立全寬列）── */}
+      {showFineTune && (
+        <div className="grid" style={{ gap: 4 }}>
+          <input
+            type="range"
+            min={fineTuneBaseRef.current - 0.03}
+            max={fineTuneBaseRef.current + 0.03}
+            step={0.001}
+            value={track.baseRate}
+            style={{ width: "100%" }}
+            onChange={(e) => onChange({ baseRate: Math.max(0.25, Math.min(4, Number(e.target.value))) })}
+          />
+          <div className="row" style={{ justifyContent: "space-between" }}>
+            <span className="small" style={{ opacity: 0.5 }}>−0.03</span>
+            <span className="small" style={{ opacity: 0.8, color: "var(--accent)" }}>
+              {track.baseRate >= fineTuneBaseRef.current ? "+" : ""}
+              {(track.baseRate - fineTuneBaseRef.current).toFixed(3)}
+            </span>
+            <span className="small" style={{ opacity: 0.5 }}>+0.03</span>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
