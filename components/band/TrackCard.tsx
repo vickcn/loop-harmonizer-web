@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import { BandTrack, TrackSyncMode } from "@/lib/band/bandTypes";
 import { TrackPlayhead } from "./TrackPlayhead";
 
@@ -21,6 +22,8 @@ const STATUS_LABEL: Record<string, string> = {
 };
 
 export function TrackCard({ track, onChange }: Props) {
+  const [showFineTune, setShowFineTune] = useState(false);
+
   const togglePlay = () =>
     onChange({ status: track.status === "playing" ? "paused" : "playing" });
 
@@ -86,17 +89,45 @@ export function TrackCard({ track, onChange }: Props) {
           />
         </label>
 
-        <label className="row" style={{ gap: 4 }}>
-          <span className="small">倍率</span>
-          <input
-            className="input"
-            type="number"
-            min={0.25} max={4} step={0.01}
-            value={track.baseRate}
-            style={{ width: 60 }}
-            onChange={(e) => onChange({ baseRate: Math.max(0.25, Math.min(4, Number(e.target.value) || 1)) })}
-          />
-        </label>
+        <div className="grid" style={{ gap: 4 }}>
+          <div className="row" style={{ gap: 6, alignItems: "center" }}>
+            <span className="small">倍率</span>
+            <input
+              className="input"
+              type="number"
+              min={0.25} max={4} step={0.01}
+              value={track.baseRate}
+              style={{ width: 76, fontWeight: 700, fontSize: 16, textAlign: "center", padding: "4px 6px" }}
+              onChange={(e) => onChange({ baseRate: Math.max(0.25, Math.min(4, Number(e.target.value) || 1)) })}
+            />
+            <button
+              className="btn"
+              style={{ fontSize: 11, padding: "3px 7px", opacity: showFineTune ? 1 : 0.6 }}
+              onClick={() => setShowFineTune((v) => !v)}
+            >
+              微調
+            </button>
+          </div>
+          {showFineTune && (
+            <div className="row" style={{ gap: 6, alignItems: "center" }}>
+              <span className="small" style={{ minWidth: 36, opacity: 0.55 }}>
+                {(track.baseRate - 0.03).toFixed(3)}
+              </span>
+              <input
+                type="range"
+                min={track.baseRate - 0.03}
+                max={track.baseRate + 0.03}
+                step={0.001}
+                value={track.baseRate}
+                style={{ flex: 1 }}
+                onChange={(e) => onChange({ baseRate: Math.max(0.25, Math.min(4, Number(e.target.value))) })}
+              />
+              <span className="small" style={{ minWidth: 36, opacity: 0.55, textAlign: "right" }}>
+                {(track.baseRate + 0.03).toFixed(3)}
+              </span>
+            </div>
+          )}
+        </div>
 
         <label className="row" style={{ gap: 4 }}>
           <span className="small">音量</span>
