@@ -188,7 +188,7 @@ export function TrackCard({ track, onChange }: Props) {
           {track.loop ? "⟳ 循環" : "⟳ 單次"}
         </button>
 
-        {/* 播放模式 — M2A 架構佔位，pitch-preserve 音訊處理留至 M2B/M2C */}
+        {/* 播放模式 — M2C: pitch-preserve 已接 AudioWorklet WSOLA */}
         <label className="row" style={{ gap: 4 }}>
           <span className="small">播放模式</span>
           <select
@@ -198,12 +198,12 @@ export function TrackCard({ track, onChange }: Props) {
             onChange={(e) => onChange({ playbackMode: e.target.value as TrackPlaybackMode })}
           >
             <option value="fast-rate">快速變速</option>
-            <option value="pitch-preserve">保音高（實驗，M2B）</option>
+            <option value="pitch-preserve">保音高（實驗）</option>
           </select>
         </label>
         {track.playbackMode === "pitch-preserve" && (
           <span className="small" style={{ color: "#f59e0b", opacity: 0.9 }}>
-            ⚠ 保音高尚未生效，實際仍使用快速變速
+            ⚠ 實驗功能：保音高變速（WSOLA），倍率限 0.5–1.8×；多軌不保證同步
           </span>
         )}
 
