@@ -19,5 +19,6 @@ export type BandTrack = {
 
 export type BandSession = {
   id: string;
+  globalBpm: number;
   tracks: BandTrack[];
 };

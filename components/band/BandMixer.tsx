@@ -80,7 +80,7 @@ export function BandMixer() {
           playheadSec: 0,
           durationSec,
           status: "stopped",
-          syncMode: "free",
+          syncMode: "manual-rate",
           loop: false,
         };
         setSession((prev) => ({ ...prev, tracks: [...prev.tracks, track] }));
@@ -95,26 +95,60 @@ export function BandMixer() {
   const updateTrack = async (id: string, patch: Partial<BandTrack>) => {
     const eng = getEngine();
 
-    if ("status" in patch) {
-      if (patch.status === "playing") await eng.playTrack(id);
-      else if (patch.status === "paused") eng.pauseTrack(id);
-      else if (patch.status === "stopped") eng.stopTrack(id);
-    }
+    setSession((prev) => {
+      const track = prev.tracks.find((t) => t.id === id);
+      if (!track) return prev;
 
-    // User-initiated seek (not a status change carrying playheadSec: 0)
-    if ("playheadSec" in patch && !("status" in patch)) {
-      await eng.seekTrack(id, patch.playheadSec!);
-    }
+      let resolved = { ...patch };
 
-    if ("volume" in patch) eng.setVolume(id, patch.volume!);
-    if ("muted" in patch) eng.setMuted(id, patch.muted!);
-    if ("baseRate" in patch) eng.setPlaybackRate(id, patch.baseRate!);
-    if ("loop" in patch) eng.setLoop(id, patch.loop!);
+      // syncMode switching: recalculate baseRate for global-bpm
+      if ("syncMode" in resolved && resolved.syncMode === "global-bpm") {
+        const obpm = ("originalBpm" in resolved ? resolved.originalBpm : track.originalBpm) ?? track.originalBpm;
+        resolved.baseRate = Math.max(0.25, Math.min(4, prev.globalBpm / obpm));
+      }
 
-    setSession((prev) => ({
-      ...prev,
-      tracks: prev.tracks.map((t) => (t.id === id ? { ...t, ...patch } : t)),
-    }));
+      // originalBpm change while in global-bpm mode: recalculate baseRate
+      if ("originalBpm" in resolved && !("syncMode" in resolved) && track.syncMode === "global-bpm") {
+        resolved.baseRate = Math.max(0.25, Math.min(4, prev.globalBpm / (resolved.originalBpm ?? track.originalBpm)));
+      }
+
+      const updated = { ...track, ...resolved };
+
+      // push to engine (must be synchronous sub-calls, no await inside setSession)
+      void (async () => {
+        if ("status" in resolved) {
+          if (resolved.status === "playing") await eng.playTrack(id);
+          else if (resolved.status === "paused") eng.pauseTrack(id);
+          else if (resolved.status === "stopped") eng.stopTrack(id);
+        }
+        if ("playheadSec" in resolved && !("status" in resolved)) {
+          await eng.seekTrack(id, resolved.playheadSec!);
+        }
+        if ("volume" in resolved) eng.setVolume(id, resolved.volume!);
+        if ("muted" in resolved) eng.setMuted(id, resolved.muted!);
+        if ("loop" in resolved) eng.setLoop(id, resolved.loop!);
+        if ("baseRate" in resolved) eng.setPlaybackRate(id, resolved.baseRate!);
+      })();
+
+      return {
+        ...prev,
+        tracks: prev.tracks.map((t) => (t.id === id ? updated : t)),
+      };
+    });
+  };
+
+  // Global BPM change: recalculate baseRate for all global-bpm tracks
+  const handleGlobalBpm = (newBpm: number) => {
+    const eng = getEngine();
+    setSession((prev) => {
+      const tracks = prev.tracks.map((t) => {
+        if (t.syncMode !== "global-bpm") return t;
+        const baseRate = Math.max(0.25, Math.min(4, newBpm / t.originalBpm));
+        eng.setPlaybackRate(t.id, baseRate);
+        return { ...t, baseRate };
+      });
+      return { ...prev, globalBpm: newBpm, tracks };
+    });
   };
 
   const selectedIds = session.tracks.filter((t) => t.selected).map((t) => t.id);
@@ -154,7 +188,7 @@ export function BandMixer() {
     <div className="grid" style={{ gap: 16 }}>
 
       {/* ── 全域控制 ── */}
-      <div className="card row" style={{ flexWrap: "wrap", gap: 16 }}>
+      <div className="card row" style={{ flexWrap: "wrap", gap: 16, alignItems: "center" }}>
         <button
           className="btn primary"
           disabled={loading}
@@ -170,6 +204,32 @@ export function BandMixer() {
           style={{ display: "none" }}
           onChange={(e) => { void handleFiles(e.target.files); e.target.value = ""; }}
         />
+
+        {/* 輔助 BPM */}
+        <div className="row" style={{ gap: 6, alignItems: "center", marginLeft: "auto" }}>
+          <span className="small" style={{ opacity: 0.6 }}>輔助 BPM</span>
+          <button
+            className="btn"
+            style={{ padding: "3px 8px", fontWeight: 700 }}
+            onClick={() => handleGlobalBpm(Math.max(20, session.globalBpm - 1))}
+          >−</button>
+          <input
+            className="input"
+            type="number"
+            min={20} max={300} step={1}
+            value={session.globalBpm}
+            style={{ width: 64, fontWeight: 700, fontSize: 16, textAlign: "center", padding: "4px 6px" }}
+            onChange={(e) => {
+              const v = Math.max(20, Math.min(300, Number(e.target.value) || 120));
+              handleGlobalBpm(v);
+            }}
+          />
+          <button
+            className="btn"
+            style={{ padding: "3px 8px", fontWeight: 700 }}
+            onClick={() => handleGlobalBpm(Math.min(300, session.globalBpm + 1))}
+          >+</button>
+        </div>
       </div>
 
       {/* ── 多選控制列 ── */}

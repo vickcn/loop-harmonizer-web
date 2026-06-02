@@ -25,9 +25,33 @@ export function TrackCard({ track, onChange }: Props) {
   const [showFineTune, setShowFineTune] = useState(false);
   const fineTuneBaseRef = useRef(track.baseRate);
 
+  const isAutoRate = track.syncMode === "global-bpm";
+
   const toggleFineTune = () => {
     if (!showFineTune) fineTuneBaseRef.current = track.baseRate;
     setShowFineTune((v) => !v);
+  };
+
+  // If user touches rate controls in global-bpm mode, switch to manual-rate first
+  const coarseStep = (delta: number) => {
+    const patch: Partial<BandTrack> = {};
+    if (isAutoRate) patch.syncMode = "manual-rate";
+    patch.baseRate = Math.max(0.25, Math.min(4, Math.round((track.baseRate + delta) * 1000) / 1000));
+    onChange(patch);
+  };
+
+  const handleRateInput = (val: number) => {
+    const patch: Partial<BandTrack> = {};
+    if (isAutoRate) patch.syncMode = "manual-rate";
+    patch.baseRate = Math.max(0.25, Math.min(4, val || 1));
+    onChange(patch);
+  };
+
+  const handleFineTuneSlider = (val: number) => {
+    const patch: Partial<BandTrack> = {};
+    if (isAutoRate) { patch.syncMode = "manual-rate"; fineTuneBaseRef.current = track.baseRate; }
+    patch.baseRate = Math.max(0.25, Math.min(4, val));
+    onChange(patch);
   };
 
   const togglePlay = () =>
@@ -97,24 +121,31 @@ export function TrackCard({ track, onChange }: Props) {
 
         {/* 倍率粗調 */}
         <div className="row" style={{ gap: 4, alignItems: "center" }}>
-          <span className="small">倍率</span>
+          <span className="small" style={{ opacity: isAutoRate ? 0.45 : 1 }}>倍率</span>
           <button
             className="btn"
             style={{ padding: "3px 8px", fontWeight: 700 }}
-            onClick={() => onChange({ baseRate: Math.max(0.25, Math.min(4, Math.round((track.baseRate - 0.01) * 1000) / 1000)) })}
+            onClick={() => coarseStep(-0.01)}
+            title={isAutoRate ? "點擊切換為手動倍率" : undefined}
           >−</button>
           <input
             className="input"
             type="number"
             min={0.25} max={4} step={0.01}
             value={track.baseRate}
-            style={{ width: 76, fontWeight: 700, fontSize: 16, textAlign: "center", padding: "4px 6px" }}
-            onChange={(e) => onChange({ baseRate: Math.max(0.25, Math.min(4, Number(e.target.value) || 1)) })}
+            readOnly={isAutoRate}
+            style={{
+              width: 76, fontWeight: 700, fontSize: 16, textAlign: "center", padding: "4px 6px",
+              opacity: isAutoRate ? 0.6 : 1,
+              cursor: isAutoRate ? "default" : "text",
+            }}
+            onChange={(e) => handleRateInput(Number(e.target.value))}
           />
           <button
             className="btn"
             style={{ padding: "3px 8px", fontWeight: 700 }}
-            onClick={() => onChange({ baseRate: Math.max(0.25, Math.min(4, Math.round((track.baseRate + 0.01) * 1000) / 1000)) })}
+            onClick={() => coarseStep(0.01)}
+            title={isAutoRate ? "點擊切換為手動倍率" : undefined}
           >+</button>
           <button
             className="btn"
@@ -123,6 +154,9 @@ export function TrackCard({ track, onChange }: Props) {
           >
             微調
           </button>
+          {isAutoRate && (
+            <span className="small" style={{ opacity: 0.5, fontStyle: "italic" }}>自動</span>
+          )}
         </div>
 
         <label className="row" style={{ gap: 4 }}>
@@ -162,9 +196,9 @@ export function TrackCard({ track, onChange }: Props) {
             style={{ fontSize: 12 }}
             onChange={(e) => onChange({ syncMode: e.target.value as TrackSyncMode })}
           >
-            <option value="free">自由</option>
-            <option value="global-bpm">全域 BPM</option>
             <option value="manual-rate">手動倍率</option>
+            <option value="global-bpm">跟隨 BPM</option>
+            <option value="free">自由</option>
           </select>
         </label>
       </div>
@@ -179,7 +213,7 @@ export function TrackCard({ track, onChange }: Props) {
             step={0.001}
             value={track.baseRate}
             style={{ width: "100%" }}
-            onChange={(e) => onChange({ baseRate: Math.max(0.25, Math.min(4, Number(e.target.value))) })}
+            onChange={(e) => handleFineTuneSlider(Number(e.target.value))}
           />
           <div className="row" style={{ justifyContent: "space-between" }}>
             <span className="small" style={{ opacity: 0.5 }}>−0.03</span>
