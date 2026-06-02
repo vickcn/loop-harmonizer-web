@@ -7,6 +7,8 @@ import { TrackPlayhead } from "./TrackPlayhead";
 type Props = {
   track: BandTrack;
   onChange: (patch: Partial<BandTrack>) => void;
+  collapsed?: boolean;
+  onToggleCollapse?: () => void;
 };
 
 const STATUS_COLOR: Record<string, string> = {
@@ -21,7 +23,7 @@ const STATUS_LABEL: Record<string, string> = {
   paused: "暫停",
 };
 
-export function TrackCard({ track, onChange }: Props) {
+export function TrackCard({ track, onChange, collapsed = false, onToggleCollapse }: Props) {
   const [showFineTune, setShowFineTune] = useState(false);
   const fineTuneBaseRef = useRef(track.baseRate);
 
@@ -69,9 +71,13 @@ export function TrackCard({ track, onChange }: Props) {
         transition: "border-color .15s, opacity .15s",
       }}
     >
-      {/* ── 標頭 ── */}
-      <div className="row" style={{ justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
-        <label className="row" style={{ gap: 10, cursor: "pointer" }}>
+      {/* ── 標頭（點擊折疊）── */}
+      <div
+        className="row"
+        style={{ justifyContent: "space-between", flexWrap: "wrap", gap: 8, cursor: "pointer", userSelect: "none" }}
+        onClick={onToggleCollapse}
+      >
+        <div className="row" style={{ gap: 10 }} onClick={(e) => e.stopPropagation()}>
           <input
             type="checkbox"
             checked={track.selected}
@@ -79,22 +85,25 @@ export function TrackCard({ track, onChange }: Props) {
           />
           <div>
             <div style={{ fontWeight: 700, fontSize: 14 }}>{track.name}</div>
-            <div className="small" style={{ opacity: 0.45 }}>{track.fileName}</div>
+            {!collapsed && <div className="small" style={{ opacity: 0.45 }}>{track.fileName}</div>}
           </div>
-        </label>
-        <span className="small" style={{ color: STATUS_COLOR[track.status] }}>
-          ● {STATUS_LABEL[track.status]}
-        </span>
+        </div>
+        <div className="row" style={{ gap: 8 }}>
+          <span className="small" style={{ color: STATUS_COLOR[track.status] }}>
+            ● {STATUS_LABEL[track.status]}
+          </span>
+          <span style={{ opacity: 0.4, fontSize: 12 }}>{collapsed ? "▶" : "▼"}</span>
+        </div>
       </div>
 
-      {/* ── 播放線 ── */}
-      <TrackPlayhead
+      {/* ── 可折疊內容 ── */}
+      {!collapsed && <TrackPlayhead
         playheadSec={track.playheadSec}
         durationSec={track.durationSec}
         onChange={(sec) => onChange({ playheadSec: sec })}
-      />
+      />}
 
-      {/* ── 播放控制 ── */}
+      {!collapsed && <>{/* ── 播放控制 ── */}
       <div className="row" style={{ flexWrap: "wrap", gap: 8 }}>
         <button
           className={`btn${track.status === "playing" ? " primary" : ""}`}
@@ -244,6 +253,7 @@ export function TrackCard({ track, onChange }: Props) {
           </div>
         </div>
       )}
+      </>}
     </div>
   );
 }

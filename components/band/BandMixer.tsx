@@ -10,8 +10,30 @@ import { SelectedTracksBar } from "./SelectedTracksBar";
 export function BandMixer() {
   const [session, setSession] = useState<BandSession>(createDefaultBandSession);
   const [loading, setLoading] = useState(false);
+  const [collapsedIds, setCollapsedIds] = useState<Set<string>>(new Set());
+  const [draggingId, setDraggingId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const engineRef = useRef<MultiTrackEngine | null>(null);
+
+  const toggleCollapse = (id: string) =>
+    setCollapsedIds((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+
+  const moveTrack = (fromId: string, toId: string) => {
+    if (fromId === toId) return;
+    setSession((prev) => {
+      const tracks = [...prev.tracks];
+      const fromIdx = tracks.findIndex((t) => t.id === fromId);
+      const toIdx = tracks.findIndex((t) => t.id === toId);
+      if (fromIdx === -1 || toIdx === -1) return prev;
+      const [item] = tracks.splice(fromIdx, 1);
+      tracks.splice(toIdx, 0, item);
+      return { ...prev, tracks };
+    });
+  };
 
   const getEngine = (): MultiTrackEngine => {
     if (!engineRef.current) {
@@ -251,11 +273,22 @@ export function BandMixer() {
       ) : (
         <div className="grid" style={{ gap: 12 }}>
           {session.tracks.map((track) => (
-            <TrackCard
+            <div
               key={track.id}
-              track={track}
-              onChange={(patch) => void updateTrack(track.id, patch)}
-            />
+              draggable
+              onDragStart={() => setDraggingId(track.id)}
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={(e) => { e.preventDefault(); if (draggingId) moveTrack(draggingId, track.id); setDraggingId(null); }}
+              onDragEnd={() => setDraggingId(null)}
+              style={{ opacity: draggingId === track.id ? 0.45 : 1, transition: "opacity .15s" }}
+            >
+              <TrackCard
+                track={track}
+                onChange={(patch) => void updateTrack(track.id, patch)}
+                collapsed={collapsedIds.has(track.id)}
+                onToggleCollapse={() => toggleCollapse(track.id)}
+              />
+            </div>
           ))}
         </div>
       )}
