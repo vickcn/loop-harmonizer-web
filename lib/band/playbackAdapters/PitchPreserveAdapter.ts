@@ -60,6 +60,7 @@ export class PitchPreserveAdapter implements TrackPlaybackAdapter {
   // ── TrackPlaybackAdapter ──
 
   load(buffer: AudioBuffer, gainNode: GainNode, ctx: AudioContext): void {
+    this._stopRampTimer();
     this._teardownWorklet();
     this.buffer = buffer;
     this.gainNode = gainNode;
@@ -101,6 +102,7 @@ export class PitchPreserveAdapter implements TrackPlaybackAdapter {
   pause(ctx: AudioContext): void {
     if (!this._isPlaying) return;
     this._pausedAt = this.getPosition(ctx);
+    this._stopRampTimer();
     this._stopEndedTimer();
     if (this.workletNode) {
       this.workletNode.port.postMessage({ type: "pause" });
