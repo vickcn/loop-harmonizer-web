@@ -44,8 +44,8 @@ export interface TrackPlaybackAdapter {
   /** 停止並歸零位置。 */
   stop(): void;
 
-  /** 即時設定播放速率；播放中生效。 */
-  setPlaybackRate(rate: number, ctx: AudioContext): void;
+  /** 設定播放速率；rampSec 內線性漸變（預設 0.5 秒）。 */
+  setPlaybackRate(rate: number, ctx: AudioContext, rampSec?: number): void;
 
   /** 即時切換 loop；播放中生效。 */
   setLoop(loop: boolean, onEnded: (() => void) | null): void;
