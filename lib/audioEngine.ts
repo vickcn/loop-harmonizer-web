@@ -128,7 +128,8 @@ export class BrowserLoopEngine {
       this.ctx!.currentTime,
       this.metronomeOnly ? this.pendingStartSeconds : this.audioPlayer!.getPausedSeconds(),
       this.tempoEngine.getLoopBpm(),
-      this.timeline.timeSignature.beatsPerBar
+      this.timeline.timeSignature.beatsPerBar,
+      this.metronomeOnly
     );
     if (this.raf) cancelAnimationFrame(this.raf);
     this.tick();

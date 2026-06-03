@@ -38,9 +38,23 @@ export class MetronomeClock {
   setSound(sound: MetronomeSound) { this.sound = sound; }
 
   // pausedSeconds and baseBpm are used to align beat phase when resuming mid-loop
-  start(ctxNow: number, pausedSeconds: number, baseBpm: number, beatsPerBar: number) {
+  start(
+    ctxNow: number,
+    pausedSeconds: number,
+    baseBpm: number,
+    beatsPerBar: number,
+    immediateFirstBeat = false
+  ) {
     this.stop();
     this.beatsPerBar = beatsPerBar;
+
+    if (immediateFirstBeat) {
+      this.beatInBar = 0;
+      this.nextBeatTime = ctxNow + 0.02;
+      this.isRunning = true;
+      this.loop();
+      return;
+    }
 
     const totalBeats = (pausedSeconds * baseBpm) / 60;
     const currentBeatIndex = Math.floor(totalBeats);
