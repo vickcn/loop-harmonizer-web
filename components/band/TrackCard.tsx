@@ -24,7 +24,7 @@ const STATUS_LABEL: Record<string, string> = {
 };
 
 export function TrackCard({ track, onChange, collapsed = false, onToggleCollapse }: Props) {
-  const [showFineTune, setShowFineTune] = useState(false);
+  const [showFineTune, setShowFineTune] = useState(true);
   const fineTuneBaseRef = useRef(track.baseRate);
 
   const isAutoRate = track.syncMode === "global-bpm";
@@ -128,46 +128,6 @@ export function TrackCard({ track, onChange, collapsed = false, onToggleCollapse
           />
         </label>
 
-        {/* 倍率粗調 */}
-        <div className="row" style={{ gap: 4, alignItems: "center" }}>
-          <span className="small" style={{ opacity: isAutoRate ? 0.45 : 1 }}>倍率</span>
-          <button
-            className="btn"
-            style={{ padding: "3px 8px", fontWeight: 700 }}
-            onClick={() => coarseStep(-0.01)}
-            title={isAutoRate ? "點擊切換為手動倍率" : undefined}
-          >−</button>
-          <input
-            className="input"
-            type="number"
-            min={0.25} max={4} step={0.01}
-            value={track.baseRate}
-            readOnly={isAutoRate}
-            style={{
-              width: 76, fontWeight: 700, fontSize: 16, textAlign: "center", padding: "4px 6px",
-              opacity: isAutoRate ? 0.6 : 1,
-              cursor: isAutoRate ? "default" : "text",
-            }}
-            onChange={(e) => handleRateInput(Number(e.target.value))}
-          />
-          <button
-            className="btn"
-            style={{ padding: "3px 8px", fontWeight: 700 }}
-            onClick={() => coarseStep(0.01)}
-            title={isAutoRate ? "點擊切換為手動倍率" : undefined}
-          >+</button>
-          <button
-            className="btn"
-            style={{ fontSize: 11, padding: "3px 7px", opacity: showFineTune ? 1 : 0.6 }}
-            onClick={toggleFineTune}
-          >
-            微調
-          </button>
-          {isAutoRate && (
-            <span className="small" style={{ opacity: 0.5, fontStyle: "italic" }}>自動</span>
-          )}
-        </div>
-
         <label className="row" style={{ gap: 4 }}>
           <span className="small">音量</span>
           <input
@@ -189,13 +149,60 @@ export function TrackCard({ track, onChange, collapsed = false, onToggleCollapse
           <span className="small">靜音</span>
         </label>
 
-        <button
-          className={`btn${track.loop ? " primary" : ""}`}
-          style={{ fontSize: 12, padding: "4px 10px" }}
-          onClick={() => onChange({ loop: !track.loop })}
-        >
-          {track.loop ? "⟳ 循環" : "⟳ 單次"}
-        </button>
+        {/* 倍率粗調：獨立全寬一列 */}
+        <div className="grid" style={{ gap: 6, width: "100%" }}>
+          <div className="row" style={{ gap: 8, alignItems: "center", width: "100%", flexWrap: "wrap" }}>
+            <span className="small" style={{ opacity: isAutoRate ? 0.45 : 1, minWidth: 36 }}>倍率</span>
+            <button
+              className="btn"
+              style={{ padding: "3px 8px", fontWeight: 700 }}
+              onClick={() => coarseStep(-0.01)}
+              title={isAutoRate ? "點擊切換為手動倍率" : undefined}
+            >−</button>
+            <input
+              className="input"
+              type="number"
+              min={0.25} max={4} step={0.01}
+              value={track.baseRate}
+              readOnly={isAutoRate}
+              style={{
+                flex: "1 1 160px",
+                minWidth: 0,
+                fontWeight: 700,
+                fontSize: 16,
+                textAlign: "center",
+                padding: "4px 6px",
+                opacity: isAutoRate ? 0.6 : 1,
+                cursor: isAutoRate ? "default" : "text",
+              }}
+              onChange={(e) => handleRateInput(Number(e.target.value))}
+            />
+            <button
+              className="btn"
+              style={{ padding: "3px 8px", fontWeight: 700 }}
+              onClick={() => coarseStep(0.01)}
+              title={isAutoRate ? "點擊切換為手動倍率" : undefined}
+            >+</button>
+            <button
+              className="btn"
+              style={{ padding: "3px 10px", fontWeight: 700, marginLeft: "auto" }}
+              onClick={() => handleRateInput(1)}
+              title="恢復 1x"
+            >
+              1x
+            </button>
+            <button
+              className="btn"
+              style={{ fontSize: 11, padding: "3px 7px", opacity: showFineTune ? 1 : 0.6 }}
+              onClick={toggleFineTune}
+            >
+              微調
+            </button>
+            {isAutoRate && (
+              <span className="small" style={{ opacity: 0.5, fontStyle: "italic" }}>自動</span>
+            )}
+          </div>
+        </div>
 
         {/* 播放模式 — M2C: pitch-preserve 已接 AudioWorklet WSOLA */}
         <label className="row" style={{ gap: 4 }}>
@@ -210,6 +217,14 @@ export function TrackCard({ track, onChange, collapsed = false, onToggleCollapse
             <option value="pitch-preserve">保音高（實驗）</option>
           </select>
         </label>
+
+        <button
+          className={`btn${track.loop ? " primary" : ""}`}
+          style={{ fontSize: 12, padding: "4px 10px", width: "100%" }}
+          onClick={() => onChange({ loop: !track.loop })}
+        >
+          {track.loop ? "⟳ 循環" : "⟳ 單次"}
+        </button>
         {track.playbackMode === "pitch-preserve" && (
           <span className="small" style={{ color: "#f59e0b", opacity: 0.9 }}>
             ⚠ 實驗功能：保音高變速（WSOLA），倍率限 0.5–1.8×；多軌不保證同步

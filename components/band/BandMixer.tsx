@@ -104,7 +104,7 @@ export function BandMixer() {
           status: "stopped",
           syncMode: "manual-rate",
           loop: false,
-          playbackMode: "fast-rate",
+          playbackMode: "pitch-preserve",
         };
         setSession((prev) => ({ ...prev, tracks: [...prev.tracks, track] }));
       } catch {
