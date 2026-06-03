@@ -54,6 +54,9 @@ export class PitchPreserveAdapter implements TrackPlaybackAdapter {
   // Non-loop ended detection
   private _endedTimer: ReturnType<typeof setInterval> | null = null;
 
+  // Rate ramp (JS-side, since worklet has no AudioParam)
+  private _rampTimer: ReturnType<typeof setInterval> | null = null;
+
   // ── TrackPlaybackAdapter ──
 
   load(buffer: AudioBuffer, gainNode: GainNode, ctx: AudioContext): void {
@@ -108,6 +111,7 @@ export class PitchPreserveAdapter implements TrackPlaybackAdapter {
   }
 
   stop(): void {
+    this._stopRampTimer();
     this._stopEndedTimer();
     if (this.workletNode) {
       this.workletNode.port.postMessage({ type: "stop" });
@@ -118,10 +122,24 @@ export class PitchPreserveAdapter implements TrackPlaybackAdapter {
     this._workletStarted = false;
   }
 
-  setPlaybackRate(rate: number, _ctx: AudioContext): void {
+  setPlaybackRate(rate: number, _ctx: AudioContext, rampSec = 0.5): void {
+    if (this._rampTimer !== null) { clearInterval(this._rampTimer); this._rampTimer = null; }
+    const fromRate = Math.max(0.5, Math.min(1.8, this._playbackRate));
+    const toRate   = Math.max(0.5, Math.min(1.8, rate));
     this._playbackRate = rate;
-    const clamped = Math.max(0.5, Math.min(1.8, rate));
-    this.workletNode?.port.postMessage({ type: "setTempoRatio", ratio: clamped });
+    if (Math.abs(toRate - fromRate) < 0.001) {
+      this.workletNode?.port.postMessage({ type: "setTempoRatio", ratio: toRate });
+      return;
+    }
+    const steps = Math.max(1, Math.round(rampSec / 0.016));
+    let step = 0;
+    this._rampTimer = setInterval(() => {
+      step++;
+      const t = Math.min(step / steps, 1);
+      const r = fromRate + (toRate - fromRate) * t;
+      this.workletNode?.port.postMessage({ type: "setTempoRatio", ratio: r });
+      if (t >= 1) { clearInterval(this._rampTimer!); this._rampTimer = null; }
+    }, Math.round(rampSec / steps * 1000));
   }
 
   setLoop(loop: boolean, onEnded: (() => void) | null): void {
@@ -135,6 +153,7 @@ export class PitchPreserveAdapter implements TrackPlaybackAdapter {
   }
 
   dispose(): void {
+    this._stopRampTimer();
     this._stopEndedTimer();
     this._teardownWorklet();
     this.buffer = null;
@@ -228,6 +247,13 @@ export class PitchPreserveAdapter implements TrackPlaybackAdapter {
     if (this._endedTimer !== null) {
       clearInterval(this._endedTimer);
       this._endedTimer = null;
+    }
+  }
+
+  private _stopRampTimer(): void {
+    if (this._rampTimer !== null) {
+      clearInterval(this._rampTimer);
+      this._rampTimer = null;
     }
   }
 }

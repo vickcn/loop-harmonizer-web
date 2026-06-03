@@ -89,10 +89,12 @@ export class FastRateAdapter implements TrackPlaybackAdapter {
     this._isPlaying = false;
   }
 
-  setPlaybackRate(rate: number, ctx: AudioContext): void {
+  setPlaybackRate(rate: number, ctx: AudioContext, rampSec = 0.5): void {
     this._playbackRate = rate;
     if (this.source) {
-      this.source.playbackRate.setTargetAtTime(rate, ctx.currentTime, 0.05);
+      const now = ctx.currentTime;
+      this.source.playbackRate.setValueAtTime(this.source.playbackRate.value, now);
+      this.source.playbackRate.linearRampToValueAtTime(rate, now + rampSec);
     }
   }
 

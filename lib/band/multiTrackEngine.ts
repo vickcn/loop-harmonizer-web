@@ -191,11 +191,11 @@ export class MultiTrackEngine {
     t.gainNode.gain.setTargetAtTime(muted ? 0 : t.volume, this.ctx.currentTime, 0.02);
   }
 
-  setPlaybackRate(trackId: string, rate: number): void {
+  setPlaybackRate(trackId: string, rate: number, rampSec = 0.5): void {
     const t = this.tracks.get(trackId);
     if (!t) return;
     t.playbackRate = Math.max(0.1, Math.min(4, rate));
-    if (this.ctx) t.adapter.setPlaybackRate(t.playbackRate, this.ctx);
+    if (this.ctx) t.adapter.setPlaybackRate(t.playbackRate, this.ctx, rampSec);
   }
 
   getTrackPosition(trackId: string): number {
