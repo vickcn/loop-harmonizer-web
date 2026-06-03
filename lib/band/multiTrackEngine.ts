@@ -65,7 +65,7 @@ export class MultiTrackEngine {
     gainNode.gain.value = 1;
     gainNode.connect(ctx.destination);
 
-    const adapter = createAdapter("fast-rate");
+    const adapter = createAdapter("pitch-preserve");
     adapter.load(buffer, gainNode, ctx);
 
     this.tracks.set(trackId, {
@@ -78,7 +78,7 @@ export class MultiTrackEngine {
       volume: 1,
       muted: false,
       loop: false,
-      playbackMode: "fast-rate",
+      playbackMode: "pitch-preserve",
     });
 
     return buffer.duration;
