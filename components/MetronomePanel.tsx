@@ -75,15 +75,6 @@ export function MetronomePanel({
       <div className="card grid">
         <div className="row" style={{ justifyContent: "space-between" }}>
           <h2 style={{ margin: 0 }}>節拍器</h2>
-          {enabled && (
-            <button
-              className={`btn${standaloneIsPlaying ? " danger" : " primary"}`}
-              style={{ padding: "6px 14px" }}
-              onClick={standaloneIsPlaying ? onStandaloneStop : onStandalonePlay}
-            >
-              {standaloneIsPlaying ? "⏹ 停止" : "▶ 純節拍器"}
-            </button>
-          )}
         </div>
 
         {/* on/off + accent */}
@@ -156,6 +147,18 @@ export function MetronomePanel({
             × 刪除
           </button>
         </div>
+
+        {enabled && (
+          <div className="row" style={{ justifyContent: "flex-end", marginTop: 4 }}>
+            <button
+              className={`btn${standaloneIsPlaying ? " danger" : " primary"}`}
+              style={{ padding: "6px 14px" }}
+              onClick={standaloneIsPlaying ? onStandaloneStop : onStandalonePlay}
+            >
+              {standaloneIsPlaying ? "⏹ 停止" : "▶ 純節拍器"}
+            </button>
+          </div>
+        )}
       </div>
 
       {editorOpen && (
