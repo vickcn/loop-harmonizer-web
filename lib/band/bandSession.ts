@@ -41,6 +41,7 @@ export async function createBandTrackFromFile(file: File): Promise<BandTrack> {
     name: file.name.replace(/\.[^.]+$/, ""),
     fileName: file.name,
     originalBpm: 120,
+    coarseRate: 1.0,
     baseRate: 1.0,
     volume: 1.0,
     muted: false,
