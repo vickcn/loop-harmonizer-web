@@ -50,8 +50,10 @@ export function LiveBeatPanel({
   const [collapsed, setCollapsed] = useState(false);
   const [previewingBpm, setPreviewingBpm] = useState<number | null>(null);
   const [flashOn, setFlashOn] = useState(false);
+  const [confirmDeleteBpm, setConfirmDeleteBpm] = useState<number | null>(null);
   const previewIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const previewFlashRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const confirmDeleteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const clearPreviewTimers = () => {
     if (previewIntervalRef.current) { clearInterval(previewIntervalRef.current); previewIntervalRef.current = null; }
@@ -187,7 +189,7 @@ export function LiveBeatPanel({
                   <BpmLed on={flashOn && previewingBpm === bpm} />
                   <button
                     className={`btn${previewingBpm === bpm ? " primary" : ""}`}
-                    style={{ padding: "6px 10px", fontSize: 12 }}
+                    style={{ padding: "8px 14px", fontSize: 14 }}
                     onClick={() => togglePreview(bpm)}
                   >
                     {previewingBpm === bpm ? "■ 停止" : "▶ 預覽"}
@@ -203,9 +205,30 @@ export function LiveBeatPanel({
                   直接切
                 </button>
                 <span className="small" style={{ cursor: "grab", marginLeft: "auto" }}>拖曳排序</span>
-                <button className="btn danger" style={{ padding: "6px 10px" }} onClick={() => removePreset(bpm)}>
-                  刪除
-                </button>
+                {confirmDeleteBpm === bpm ? (
+                  <button
+                    className="btn danger"
+                    style={{ padding: "6px 10px" }}
+                    onClick={() => {
+                      if (confirmDeleteTimerRef.current) clearTimeout(confirmDeleteTimerRef.current);
+                      setConfirmDeleteBpm(null);
+                      removePreset(bpm);
+                    }}
+                  >
+                    確認刪除？
+                  </button>
+                ) : (
+                  <button
+                    className="btn"
+                    style={{ padding: "6px 10px" }}
+                    onClick={() => {
+                      setConfirmDeleteBpm(bpm);
+                      confirmDeleteTimerRef.current = setTimeout(() => setConfirmDeleteBpm(null), 3000);
+                    }}
+                  >
+                    刪除
+                  </button>
+                )}
               </div>
             </div>
           ))}
