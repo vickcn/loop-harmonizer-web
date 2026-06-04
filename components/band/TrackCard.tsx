@@ -288,19 +288,19 @@ export function TrackCard({ track, onChange, collapsed = false, onToggleCollapse
         <div className="grid" style={{ gap: 4 }}>
           <input
             type="range"
-            min={track.coarseRate - 0.03}
-            max={track.coarseRate + 0.03}
+            min={track.coarseRate - 0.05}
+            max={track.coarseRate + 0.05}
             step={0.001}
             value={track.baseRate}
             style={{ width: "100%" }}
             onChange={(e) => handleFineTuneSlider(Number(e.target.value))}
           />
           <div className="row" style={{ justifyContent: "space-between" }}>
-            <span className="small" style={{ opacity: 0.5 }}>−0.03</span>
+            <span className="small" style={{ opacity: 0.5 }}>−0.05</span>
             <span className="small" style={{ opacity: 0.8, color: "var(--accent)" }}>
               {fineOffset >= 0 ? "+" : ""}{fineOffset.toFixed(3)}
             </span>
-            <span className="small" style={{ opacity: 0.5 }}>+0.03</span>
+            <span className="small" style={{ opacity: 0.5 }}>+0.05</span>
           </div>
         </div>
       )}
