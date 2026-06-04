@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { BandTrack, TrackPlaybackMode, TrackSyncMode } from "@/lib/band/bandTypes";
 import { TrackPlayhead } from "./TrackPlayhead";
 
@@ -25,33 +25,32 @@ const STATUS_LABEL: Record<string, string> = {
 
 export function TrackCard({ track, onChange, collapsed = false, onToggleCollapse }: Props) {
   const [showFineTune, setShowFineTune] = useState(true);
-  const fineTuneBaseRef = useRef(track.baseRate);
 
   const isAutoRate = track.syncMode === "global-bpm";
+  const fineOffset = track.baseRate - track.coarseRate;
 
-  const toggleFineTune = () => {
-    if (!showFineTune) fineTuneBaseRef.current = track.baseRate;
-    setShowFineTune((v) => !v);
-  };
+  const toggleFineTune = () => setShowFineTune((v) => !v);
 
   // If user touches rate controls in global-bpm mode, switch to manual-rate first
+  // Coarse step: update coarseRate (BandMixer resets baseRate = coarseRate)
   const coarseStep = (delta: number) => {
     const patch: Partial<BandTrack> = {};
     if (isAutoRate) patch.syncMode = "manual-rate";
-    patch.baseRate = Math.max(0.25, Math.min(4, Math.round((track.baseRate + delta) * 1000) / 1000));
+    patch.coarseRate = Math.max(0.25, Math.min(4, Math.round((track.coarseRate + delta) * 1000) / 1000));
     onChange(patch);
   };
 
   const handleRateInput = (val: number) => {
     const patch: Partial<BandTrack> = {};
     if (isAutoRate) patch.syncMode = "manual-rate";
-    patch.baseRate = Math.max(0.25, Math.min(4, val || 1));
+    patch.coarseRate = Math.max(0.25, Math.min(4, val || 1));
     onChange(patch);
   };
 
+  // Fine-tune: only changes baseRate, coarseRate stays fixed
   const handleFineTuneSlider = (val: number) => {
     const patch: Partial<BandTrack> = {};
-    if (isAutoRate) { patch.syncMode = "manual-rate"; fineTuneBaseRef.current = track.baseRate; }
+    if (isAutoRate) patch.syncMode = "manual-rate";
     patch.baseRate = Math.max(0.25, Math.min(4, val));
     onChange(patch);
   };
@@ -163,7 +162,7 @@ export function TrackCard({ track, onChange, collapsed = false, onToggleCollapse
               className="input"
               type="number"
               min={0.25} max={4} step={0.01}
-              value={track.baseRate}
+              value={track.coarseRate}
               readOnly={isAutoRate}
               style={{
                 flex: "1 1 160px",
@@ -251,8 +250,8 @@ export function TrackCard({ track, onChange, collapsed = false, onToggleCollapse
         <div className="grid" style={{ gap: 4 }}>
           <input
             type="range"
-            min={fineTuneBaseRef.current - 0.03}
-            max={fineTuneBaseRef.current + 0.03}
+            min={track.coarseRate - 0.03}
+            max={track.coarseRate + 0.03}
             step={0.001}
             value={track.baseRate}
             style={{ width: "100%" }}
@@ -261,8 +260,7 @@ export function TrackCard({ track, onChange, collapsed = false, onToggleCollapse
           <div className="row" style={{ justifyContent: "space-between" }}>
             <span className="small" style={{ opacity: 0.5 }}>−0.03</span>
             <span className="small" style={{ opacity: 0.8, color: "var(--accent)" }}>
-              {track.baseRate >= fineTuneBaseRef.current ? "+" : ""}
-              {(track.baseRate - fineTuneBaseRef.current).toFixed(3)}
+              {fineOffset >= 0 ? "+" : ""}{fineOffset.toFixed(3)}
             </span>
             <span className="small" style={{ opacity: 0.5 }}>+0.03</span>
           </div>

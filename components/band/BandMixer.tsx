@@ -95,6 +95,7 @@ export function BandMixer() {
           name: file.name.replace(/\.[^.]+$/, ""),
           fileName: file.name,
           originalBpm: 120,
+          coarseRate: 1.0,
           baseRate: 1.0,
           volume: 1.0,
           muted: false,
@@ -124,15 +125,24 @@ export function BandMixer() {
 
       let resolved = { ...patch };
 
-      // syncMode switching: recalculate baseRate for global-bpm
+      // syncMode switching: recalculate coarseRate/baseRate for global-bpm (fine offset resets)
       if ("syncMode" in resolved && resolved.syncMode === "global-bpm") {
         const obpm = ("originalBpm" in resolved ? resolved.originalBpm : track.originalBpm) ?? track.originalBpm;
-        resolved.baseRate = Math.max(0.25, Math.min(4, prev.globalBpm / obpm));
+        const r = Math.max(0.25, Math.min(4, prev.globalBpm / obpm));
+        resolved.coarseRate = r;
+        resolved.baseRate = r;
       }
 
-      // originalBpm change while in global-bpm mode: recalculate baseRate
+      // originalBpm change while in global-bpm mode: recalculate (fine offset resets)
       if ("originalBpm" in resolved && !("syncMode" in resolved) && track.syncMode === "global-bpm") {
-        resolved.baseRate = Math.max(0.25, Math.min(4, prev.globalBpm / (resolved.originalBpm ?? track.originalBpm)));
+        const r = Math.max(0.25, Math.min(4, prev.globalBpm / (resolved.originalBpm ?? track.originalBpm)));
+        resolved.coarseRate = r;
+        resolved.baseRate = r;
+      }
+
+      // coarseRate change (from UI coarse controls): reset fine offset
+      if ("coarseRate" in resolved && !("baseRate" in resolved)) {
+        resolved.baseRate = resolved.coarseRate!;
       }
 
       const updated = { ...track, ...resolved };
@@ -161,15 +171,15 @@ export function BandMixer() {
     });
   };
 
-  // Global BPM change: recalculate baseRate for all global-bpm tracks
+  // Global BPM change: recalculate coarseRate/baseRate for all global-bpm tracks (fine offset resets)
   const handleGlobalBpm = (newBpm: number) => {
     const eng = getEngine();
     setSession((prev) => {
       const tracks = prev.tracks.map((t) => {
         if (t.syncMode !== "global-bpm") return t;
-        const baseRate = Math.max(0.25, Math.min(4, newBpm / t.originalBpm));
-        eng.setPlaybackRate(t.id, baseRate);
-        return { ...t, baseRate };
+        const r = Math.max(0.25, Math.min(4, newBpm / t.originalBpm));
+        eng.setPlaybackRate(t.id, r);
+        return { ...t, coarseRate: r, baseRate: r };
       });
       return { ...prev, globalBpm: newBpm, tracks };
     });

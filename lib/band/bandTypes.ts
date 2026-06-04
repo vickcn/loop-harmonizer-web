@@ -12,6 +12,9 @@ export type BandTrack = {
   name: string;
   fileName: string;
   originalBpm: number;
+  /** 粗調中心速率（引擎實際速率 = coarseRate + fineOffset） */
+  coarseRate: number;
+  /** 引擎實際播放速率 = coarseRate + fineOffset */
   baseRate: number;
   volume: number;
   muted: boolean;
