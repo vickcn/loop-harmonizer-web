@@ -17,6 +17,21 @@ type Props = {
   onApplyDirectPreset: (bpm: number) => void;
 };
 
+function BpmLed({ on }: { on: boolean }) {
+  return (
+    <span style={{
+      display: "inline-block",
+      width: 14,
+      height: 14,
+      borderRadius: "50%",
+      flexShrink: 0,
+      background: on ? "#22c55e" : "var(--muted)",
+      boxShadow: on ? "0 0 8px #22c55e, 0 0 18px #22c55e66" : "none",
+      transition: on ? "none" : "background 0.12s, box-shadow 0.12s",
+    }} />
+  );
+}
+
 export function LiveBeatPanel({
   targetBpm,
   transitionBeats,
@@ -33,7 +48,7 @@ export function LiveBeatPanel({
   const [bpmPresets, setBpmPresets] = useState<number[]>([]);
   const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
   const [collapsed, setCollapsed] = useState(false);
-  const [previewing, setPreviewing] = useState(false);
+  const [previewingBpm, setPreviewingBpm] = useState<number | null>(null);
   const [flashOn, setFlashOn] = useState(false);
   const previewIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const previewFlashRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -43,8 +58,12 @@ export function LiveBeatPanel({
     if (previewFlashRef.current) { clearTimeout(previewFlashRef.current); previewFlashRef.current = null; }
   };
 
+  const togglePreview = (bpm: number) => {
+    setPreviewingBpm((prev) => (prev === bpm ? null : bpm));
+  };
+
   useEffect(() => {
-    if (!previewing) {
+    if (previewingBpm === null) {
       clearPreviewTimers();
       setFlashOn(false);
       return;
@@ -53,12 +72,11 @@ export function LiveBeatPanel({
       setFlashOn(true);
       previewFlashRef.current = setTimeout(() => setFlashOn(false), 120);
     };
-    flash(); // 第一拍立即閃
-    const ms = Math.round(60000 / targetBpm);
+    flash();
+    const ms = Math.round(60000 / previewingBpm);
     previewIntervalRef.current = setInterval(flash, ms);
     return clearPreviewTimers;
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [previewing, targetBpm]);
+  }, [previewingBpm]);
   const clamp = (v: number) => Math.max(20, Math.min(300, v));
 
   const displayVal = inputVal !== "" ? inputVal : String(targetBpm);
@@ -164,6 +182,14 @@ export function LiveBeatPanel({
                 <button className="btn" style={{ padding: "6px 8px" }} onClick={() => adjustPreset(index, 1)}>+</button>
               </div>
               <div className="row" style={{ gap: 8 }}>
+                <BpmLed on={flashOn && previewingBpm === bpm} />
+                <button
+                  className={`btn${previewingBpm === bpm ? " primary" : ""}`}
+                  style={{ padding: "6px 8px", fontSize: 12 }}
+                  onClick={() => togglePreview(bpm)}
+                >
+                  {previewingBpm === bpm ? "■" : "▶"}
+                </button>
                 <button className="btn primary" style={{ padding: "6px 10px" }} onClick={() => onApplyPreset(bpm)}>
                   線性切
                 </button>
@@ -207,22 +233,13 @@ export function LiveBeatPanel({
           <button className="btn" style={{ fontSize: 12, padding: "5px 9px" }} onClick={() => addPreset(targetBpm)} title="記憶目前 BPM">＋記憶</button>
         </label>
         <div className="row" style={{ gap: 10, alignItems: "center" }}>
-          <span style={{
-            display: "inline-block",
-            width: 16,
-            height: 16,
-            borderRadius: "50%",
-            flexShrink: 0,
-            background: flashOn ? "#22c55e" : "var(--muted)",
-            boxShadow: flashOn ? "0 0 10px #22c55e, 0 0 20px #22c55e66" : "none",
-            transition: flashOn ? "none" : "background 0.12s, box-shadow 0.12s",
-          }} />
+          <BpmLed on={flashOn && previewingBpm === targetBpm} />
           <button
-            className={`btn${previewing ? " primary" : ""}`}
+            className={`btn${previewingBpm === targetBpm ? " primary" : ""}`}
             style={{ fontSize: 14, padding: "5px 11px" }}
-            onClick={() => setPreviewing((v) => !v)}
+            onClick={() => togglePreview(targetBpm)}
           >
-            {previewing ? "■ 停止預覽" : "▶ 預覽節拍"}
+            {previewingBpm === targetBpm ? "■ 停止預覽" : "▶ 預覽節拍"}
           </button>
         </div>
         <label className="row">
