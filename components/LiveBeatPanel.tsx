@@ -205,6 +205,8 @@ export function LiveBeatPanel({
           />
           <button className="btn" style={{ fontSize: 15, padding: "5px 10px" }} onClick={() => { setInputVal(""); onTargetBpmChange(clamp(targetBpm + 1)); }}>+</button>
           <button className="btn" style={{ fontSize: 12, padding: "5px 9px" }} onClick={() => addPreset(targetBpm)} title="記憶目前 BPM">＋記憶</button>
+        </label>
+        <div className="row" style={{ gap: 10, alignItems: "center" }}>
           <span style={{
             display: "inline-block",
             width: 16,
@@ -220,9 +222,9 @@ export function LiveBeatPanel({
             style={{ fontSize: 14, padding: "5px 11px" }}
             onClick={() => setPreviewing((v) => !v)}
           >
-            {previewing ? "■ 停止" : "▶ 預覽"}
+            {previewing ? "■ 停止預覽" : "▶ 預覽節拍"}
           </button>
-        </label>
+        </div>
         <label className="row">
           <span className="label">緩衝拍數</span>
           <select className="input" value={transitionBeats} onChange={(e) => onTransitionBeatsChange(Number(e.target.value))}>
