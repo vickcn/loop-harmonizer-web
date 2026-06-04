@@ -28,6 +28,7 @@ export function TrackCard({ track, onChange, collapsed = false, onToggleCollapse
 
   const isAutoRate = track.syncMode === "global-bpm";
   const fineOffset = track.baseRate - track.coarseRate;
+  const isSaved = track.savedRates.some((r) => Math.abs(r - track.coarseRate) < 0.0001);
 
   const toggleFineTune = () => setShowFineTune((v) => !v);
 
@@ -150,49 +151,51 @@ export function TrackCard({ track, onChange, collapsed = false, onToggleCollapse
 
         {/* 倍率粗調：獨立全寬一列 */}
         <div className="grid" style={{ gap: 6, width: "100%" }}>
+          {/* 第一列：− 選單 + 微調 */}
           <div className="row" style={{ gap: 8, alignItems: "center", width: "100%", flexWrap: "wrap" }}>
             <span className="small" style={{ opacity: isAutoRate ? 0.45 : 1, minWidth: 36 }}>倍率</span>
             <button
               className="btn"
-              style={{ padding: "3px 8px", fontWeight: 700 }}
+              style={{ padding: "8px 10px", fontWeight: 700 }}
               onClick={() => coarseStep(-0.01)}
               title={isAutoRate ? "點擊切換為手動倍率" : undefined}
             >−</button>
-            <input
+            <select
               className="input"
-              type="number"
-              min={0.25} max={4} step={0.01}
-              value={track.coarseRate}
-              readOnly={isAutoRate}
+              value={isSaved ? track.coarseRate.toFixed(3) : "__current__"}
+              disabled={isAutoRate}
               style={{
-                flex: "1 1 160px",
+                flex: "1 1 120px",
                 minWidth: 0,
                 fontWeight: 700,
-                fontSize: 16,
+                fontSize: 15,
                 textAlign: "center",
-                padding: "4px 6px",
+                padding: "6px",
                 opacity: isAutoRate ? 0.6 : 1,
-                cursor: isAutoRate ? "default" : "text",
               }}
-              onChange={(e) => handleRateInput(Number(e.target.value))}
-            />
+              onChange={(e) => {
+                if (e.target.value === "__current__") return;
+                handleRateInput(Number(e.target.value));
+              }}
+            >
+              {!isSaved && (
+                <option value="__current__">{track.coarseRate.toFixed(3)}×（未儲存）</option>
+              )}
+              {track.savedRates.map((r) => (
+                <option key={r.toFixed(3)} value={r.toFixed(3)}>
+                  {r === 1 ? "1×" : `${r.toFixed(3)}×`}
+                </option>
+              ))}
+            </select>
             <button
               className="btn"
-              style={{ padding: "3px 8px", fontWeight: 700 }}
+              style={{ padding: "8px 10px", fontWeight: 700 }}
               onClick={() => coarseStep(0.01)}
               title={isAutoRate ? "點擊切換為手動倍率" : undefined}
             >+</button>
             <button
               className="btn"
-              style={{ padding: "3px 10px", fontWeight: 700, marginLeft: "auto" }}
-              onClick={() => handleRateInput(1)}
-              title="恢復 1x"
-            >
-              1x
-            </button>
-            <button
-              className="btn"
-              style={{ fontSize: 11, padding: "3px 7px", opacity: showFineTune ? 1 : 0.6 }}
+              style={{ fontSize: 11, padding: "6px 9px", opacity: showFineTune ? 1 : 0.6 }}
               onClick={toggleFineTune}
             >
               微調
@@ -200,6 +203,33 @@ export function TrackCard({ track, onChange, collapsed = false, onToggleCollapse
             {isAutoRate && (
               <span className="small" style={{ opacity: 0.5, fontStyle: "italic" }}>自動</span>
             )}
+          </div>
+          {/* 第二列：1x 快捷 + 記憶/刪除 */}
+          <div className="row" style={{ gap: 8, alignItems: "center" }}>
+            <button
+              className="btn"
+              style={{ padding: "5px 14px", fontWeight: 700 }}
+              onClick={() => handleRateInput(1)}
+            >
+              1×
+            </button>
+            <button
+              className={`btn${isSaved ? " primary" : ""}`}
+              style={{ padding: "5px 12px", fontSize: 12 }}
+              onClick={() => {
+                const r = Math.round(track.coarseRate * 1000) / 1000;
+                if (isSaved) {
+                  // 1.0 至少保留一個
+                  if (track.savedRates.length <= 1) return;
+                  onChange({ savedRates: track.savedRates.filter((x) => Math.abs(x - r) > 0.0001) });
+                } else {
+                  const next = [...track.savedRates, r].sort((a, b) => a - b);
+                  onChange({ savedRates: next });
+                }
+              }}
+            >
+              {isSaved ? "✕ 刪除此倍率" : "＋ 記憶此倍率"}
+            </button>
           </div>
         </div>
 
