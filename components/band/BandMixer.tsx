@@ -97,6 +97,7 @@ export function BandMixer() {
           originalBpm: 120,
           coarseRate: 1.0,
           baseRate: 1.0,
+          savedRates: [1.0],
           volume: 1.0,
           muted: false,
           selected: false,

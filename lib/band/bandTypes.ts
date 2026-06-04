@@ -16,6 +16,8 @@ export type BandTrack = {
   coarseRate: number;
   /** 引擎實際播放速率 = coarseRate + fineOffset */
   baseRate: number;
+  /** 使用者儲存的倍率快捷選項 */
+  savedRates: number[];
   volume: number;
   muted: boolean;
   selected: boolean;
