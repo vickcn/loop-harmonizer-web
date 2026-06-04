@@ -25,6 +25,8 @@ const STATUS_LABEL: Record<string, string> = {
 
 export function TrackCard({ track, onChange, collapsed = false, onToggleCollapse }: Props) {
   const [showFineTune, setShowFineTune] = useState(true);
+  const [inputVal, setInputVal] = useState<string>("");
+  const [inputFocused, setInputFocused] = useState(false);
 
   const isAutoRate = track.syncMode === "global-bpm";
   const fineOffset = track.baseRate - track.coarseRate;
@@ -151,7 +153,7 @@ export function TrackCard({ track, onChange, collapsed = false, onToggleCollapse
 
         {/* 倍率粗調：獨立全寬一列 */}
         <div className="grid" style={{ gap: 6, width: "100%" }}>
-          {/* 第一列：− 選單 + 微調 */}
+          {/* 第一列：− 輸入框(含下拉) + 微調 */}
           <div className="row" style={{ gap: 8, alignItems: "center", width: "100%", flexWrap: "wrap" }}>
             <span className="small" style={{ opacity: isAutoRate ? 0.45 : 1, minWidth: 36 }}>倍率</span>
             <button
@@ -160,10 +162,18 @@ export function TrackCard({ track, onChange, collapsed = false, onToggleCollapse
               onClick={() => coarseStep(-0.01)}
               title={isAutoRate ? "點擊切換為手動倍率" : undefined}
             >−</button>
-            <select
+            <datalist id={`rates-${track.id}`}>
+              {track.savedRates.map((r) => (
+                <option key={r.toFixed(3)} value={r.toFixed(3)} />
+              ))}
+            </datalist>
+            <input
               className="input"
-              value={isSaved ? track.coarseRate.toFixed(3) : "__current__"}
-              disabled={isAutoRate}
+              type="number"
+              list={`rates-${track.id}`}
+              min={0.25} max={4} step={0.01}
+              readOnly={isAutoRate}
+              value={inputFocused ? inputVal : track.coarseRate.toFixed(3)}
               style={{
                 flex: "1 1 120px",
                 minWidth: 0,
@@ -172,21 +182,19 @@ export function TrackCard({ track, onChange, collapsed = false, onToggleCollapse
                 textAlign: "center",
                 padding: "6px",
                 opacity: isAutoRate ? 0.6 : 1,
+                cursor: isAutoRate ? "default" : "text",
               }}
-              onChange={(e) => {
-                if (e.target.value === "__current__") return;
-                handleRateInput(Number(e.target.value));
+              onFocus={() => { setInputVal(track.coarseRate.toFixed(3)); setInputFocused(true); }}
+              onChange={(e) => setInputVal(e.target.value)}
+              onBlur={() => {
+                setInputFocused(false);
+                const v = parseFloat(inputVal);
+                if (!isNaN(v)) handleRateInput(v);
               }}
-            >
-              {!isSaved && (
-                <option value="__current__">{track.coarseRate.toFixed(3)}×（未儲存）</option>
-              )}
-              {track.savedRates.map((r) => (
-                <option key={r.toFixed(3)} value={r.toFixed(3)}>
-                  {r === 1 ? "1×" : `${r.toFixed(3)}×`}
-                </option>
-              ))}
-            </select>
+              onKeyDown={(e) => {
+                if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+              }}
+            />
             <button
               className="btn"
               style={{ padding: "8px 10px", fontWeight: 700 }}
