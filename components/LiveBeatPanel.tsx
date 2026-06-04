@@ -32,6 +32,7 @@ export function LiveBeatPanel({
   const [inputVal, setInputVal] = useState("");
   const [bpmPresets, setBpmPresets] = useState<number[]>([]);
   const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
+  const [collapsed, setCollapsed] = useState(false);
   const clamp = (v: number) => Math.max(20, Math.min(300, v));
 
   const displayVal = inputVal !== "" ? inputVal : String(targetBpm);
@@ -96,10 +97,18 @@ export function LiveBeatPanel({
 
   return (
     <div className="card grid">
-      <div>
-        <h2 style={{ margin: 0 }}>即時切 Beat</h2>
-        <p className="small">可選擇依設定 beat 數線性緩衝，或直接切到目標 BPM。</p>
+      <div
+        className="row"
+        style={{ justifyContent: "space-between", cursor: "pointer", userSelect: "none" }}
+        onClick={() => setCollapsed((v) => !v)}
+      >
+        <div>
+          <h2 style={{ margin: 0 }}>即時切 Beat</h2>
+          {!collapsed && <p className="small" style={{ margin: 0 }}>可選擇依設定 beat 數線性緩衝，或直接切到目標 BPM。</p>}
+        </div>
+        <span style={{ opacity: 0.4, fontSize: 12, alignSelf: "flex-start", paddingTop: 4 }}>{collapsed ? "▶" : "▼"}</span>
       </div>
+      {!collapsed && <>
       <div className="row">
         <label className="row">
           <span className="label">記憶 BPM</span>
@@ -198,6 +207,7 @@ export function LiveBeatPanel({
           記為音檔基準 BPM
         </button>
       </div>
+      </>}
     </div>
   );
 }
