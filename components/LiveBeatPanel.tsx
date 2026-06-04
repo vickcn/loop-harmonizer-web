@@ -203,32 +203,32 @@ export function LiveBeatPanel({
         </div>
       )}
       <div className="row">
-        <label className="row">
-          <span className="label">目標 BPM</span>
-          <button className="btn" onClick={() => { setInputVal(""); onTargetBpmChange(clamp(targetBpm - 1)); }}>−</button>
+        <label className="row" style={{ fontSize: 15 }}>
+          <span className="label" style={{ fontSize: 15 }}>目標 BPM</span>
+          <button className="btn" style={{ fontSize: 15, padding: "5px 10px" }} onClick={() => { setInputVal(""); onTargetBpmChange(clamp(targetBpm - 1)); }}>−</button>
           <input
             className="input"
             type="number"
             value={displayVal}
-            style={{ width: 72 }}
+            style={{ width: 80, fontSize: 16, fontWeight: 700 }}
             onChange={(e) => setInputVal(e.target.value)}
             onBlur={(e) => commit(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Enter") commit((e.target as HTMLInputElement).value); }}
           />
-          <button className="btn" onClick={() => { setInputVal(""); onTargetBpmChange(clamp(targetBpm + 1)); }}>+</button>
+          <button className="btn" style={{ fontSize: 15, padding: "5px 10px" }} onClick={() => { setInputVal(""); onTargetBpmChange(clamp(targetBpm + 1)); }}>+</button>
           <span style={{
             display: "inline-block",
-            width: 10,
-            height: 10,
+            width: 16,
+            height: 16,
             borderRadius: "50%",
             flexShrink: 0,
             background: flashOn ? "#22c55e" : "var(--muted)",
-            boxShadow: flashOn ? "0 0 7px #22c55e" : "none",
+            boxShadow: flashOn ? "0 0 10px #22c55e, 0 0 20px #22c55e66" : "none",
             transition: flashOn ? "none" : "background 0.12s, box-shadow 0.12s",
           }} />
           <button
             className={`btn${previewing ? " primary" : ""}`}
-            style={{ fontSize: 12, padding: "4px 9px" }}
+            style={{ fontSize: 14, padding: "5px 11px" }}
             onClick={() => setPreviewing((v) => !v)}
           >
             {previewing ? "■ 停止" : "▶ 預覽"}
