@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 const BPM_PRESETS_STORAGE_KEY = "loop-harmonizer.liveBeat.bpmPresets";
 
@@ -62,10 +62,7 @@ export function LiveBeatPanel({
   const clamp = (v: number) => Math.max(20, Math.min(300, v));
 
   const displayVal = inputVal !== "" ? inputVal : String(targetBpm);
-  const selectedPresetValue = useMemo(
-    () => (bpmPresets.includes(targetBpm) ? String(targetBpm) : ""),
-    [bpmPresets, targetBpm]
-  );
+
 
   useEffect(() => {
     try {
@@ -135,26 +132,6 @@ export function LiveBeatPanel({
         <span style={{ opacity: 0.4, fontSize: 12, alignSelf: "flex-start", paddingTop: 4 }}>{collapsed ? "▶" : "▼"}</span>
       </div>
       {!collapsed && <>
-      <div className="row">
-        <label className="row">
-          <span className="label">記憶 BPM</span>
-          <select
-            className="input"
-            value={selectedPresetValue}
-            onChange={(e) => {
-              if (e.target.value === "") return;
-              const next = Number(e.target.value);
-              if (!Number.isNaN(next)) onTargetBpmChange(next);
-            }}
-          >
-            <option value="">選擇記憶值</option>
-            {bpmPresets.map((bpm) => (
-              <option key={bpm} value={bpm}>{bpm}</option>
-            ))}
-          </select>
-          <button className="btn" onClick={() => addPreset(targetBpm)}>加入記憶</button>
-        </label>
-      </div>
       {bpmPresets.length > 0 && (
         <div className="grid" style={{ gap: 8 }}>
           {bpmPresets.map((bpm, index) => (
@@ -206,16 +183,28 @@ export function LiveBeatPanel({
         <label className="row" style={{ fontSize: 15 }}>
           <span className="label" style={{ fontSize: 15 }}>目標 BPM</span>
           <button className="btn" style={{ fontSize: 15, padding: "5px 10px" }} onClick={() => { setInputVal(""); onTargetBpmChange(clamp(targetBpm - 1)); }}>−</button>
+          <datalist id="bpm-presets-list">
+            {bpmPresets.map((bpm) => (
+              <option key={bpm} value={bpm} />
+            ))}
+          </datalist>
           <input
             className="input"
             type="number"
+            list="bpm-presets-list"
             value={displayVal}
-            style={{ width: 80, fontSize: 16, fontWeight: 700 }}
-            onChange={(e) => setInputVal(e.target.value)}
+            style={{ width: 96, fontSize: 16, fontWeight: 700 }}
+            onChange={(e) => {
+              setInputVal(e.target.value);
+              // 從 datalist 選取時 onChange 立即觸發，直接 commit
+              const v = parseFloat(e.target.value);
+              if (!isNaN(v) && bpmPresets.includes(v)) commit(e.target.value);
+            }}
             onBlur={(e) => commit(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Enter") commit((e.target as HTMLInputElement).value); }}
           />
           <button className="btn" style={{ fontSize: 15, padding: "5px 10px" }} onClick={() => { setInputVal(""); onTargetBpmChange(clamp(targetBpm + 1)); }}>+</button>
+          <button className="btn" style={{ fontSize: 12, padding: "5px 9px" }} onClick={() => addPreset(targetBpm)} title="記憶目前 BPM">＋記憶</button>
           <span style={{
             display: "inline-block",
             width: 16,
