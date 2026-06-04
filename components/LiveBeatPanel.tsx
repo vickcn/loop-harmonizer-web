@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 const BPM_PRESETS_STORAGE_KEY = "loop-harmonizer.liveBeat.bpmPresets";
 
@@ -33,6 +33,32 @@ export function LiveBeatPanel({
   const [bpmPresets, setBpmPresets] = useState<number[]>([]);
   const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
   const [collapsed, setCollapsed] = useState(false);
+  const [previewing, setPreviewing] = useState(false);
+  const [flashOn, setFlashOn] = useState(false);
+  const previewIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const previewFlashRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearPreviewTimers = () => {
+    if (previewIntervalRef.current) { clearInterval(previewIntervalRef.current); previewIntervalRef.current = null; }
+    if (previewFlashRef.current) { clearTimeout(previewFlashRef.current); previewFlashRef.current = null; }
+  };
+
+  useEffect(() => {
+    if (!previewing) {
+      clearPreviewTimers();
+      setFlashOn(false);
+      return;
+    }
+    const flash = () => {
+      setFlashOn(true);
+      previewFlashRef.current = setTimeout(() => setFlashOn(false), 120);
+    };
+    flash(); // 第一拍立即閃
+    const ms = Math.round(60000 / targetBpm);
+    previewIntervalRef.current = setInterval(flash, ms);
+    return clearPreviewTimers;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [previewing, targetBpm]);
   const clamp = (v: number) => Math.max(20, Math.min(300, v));
 
   const displayVal = inputVal !== "" ? inputVal : String(targetBpm);
@@ -190,6 +216,23 @@ export function LiveBeatPanel({
             onKeyDown={(e) => { if (e.key === "Enter") commit((e.target as HTMLInputElement).value); }}
           />
           <button className="btn" onClick={() => { setInputVal(""); onTargetBpmChange(clamp(targetBpm + 1)); }}>+</button>
+          <span style={{
+            display: "inline-block",
+            width: 10,
+            height: 10,
+            borderRadius: "50%",
+            flexShrink: 0,
+            background: flashOn ? "#22c55e" : "var(--muted)",
+            boxShadow: flashOn ? "0 0 7px #22c55e" : "none",
+            transition: flashOn ? "none" : "background 0.12s, box-shadow 0.12s",
+          }} />
+          <button
+            className={`btn${previewing ? " primary" : ""}`}
+            style={{ fontSize: 12, padding: "4px 9px" }}
+            onClick={() => setPreviewing((v) => !v)}
+          >
+            {previewing ? "■ 停止" : "▶ 預覽"}
+          </button>
         </label>
         <label className="row">
           <span className="label">緩衝拍數</span>
