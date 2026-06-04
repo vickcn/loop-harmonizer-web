@@ -155,7 +155,7 @@ export function LiveBeatPanel({
           {bpmPresets.map((bpm, index) => (
             <div
               key={bpm}
-              className="row"
+              className="grid"
               draggable
               onDragStart={() => setDraggingIndex(index)}
               onDragOver={(e) => e.preventDefault()}
@@ -166,7 +166,7 @@ export function LiveBeatPanel({
               }}
               onDragEnd={() => setDraggingIndex(null)}
               style={{
-                justifyContent: "space-between",
+                gap: 6,
                 background: "#10131b",
                 border: "1px solid var(--line)",
                 borderRadius: 12,
@@ -174,29 +174,35 @@ export function LiveBeatPanel({
                 opacity: draggingIndex === index ? 0.6 : 1,
               }}
             >
-              <div className="row" style={{ gap: 4 }}>
-                <button className="btn" style={{ padding: "6px 8px" }} onClick={() => adjustPreset(index, -1)}>−</button>
-                <button className="btn" style={{ padding: "6px 10px", minWidth: 80 }} onClick={() => onTargetBpmChange(bpmPresets[index])}>
-                  BPM {bpm}
-                </button>
-                <button className="btn" style={{ padding: "6px 8px" }} onClick={() => adjustPreset(index, 1)}>+</button>
+              {/* 第一列：數值 + 燈號 + 預覽 */}
+              <div className="row" style={{ gap: 6, justifyContent: "space-between" }}>
+                <div className="row" style={{ gap: 4 }}>
+                  <button className="btn" style={{ padding: "6px 8px" }} onClick={() => adjustPreset(index, -1)}>−</button>
+                  <button className="btn" style={{ padding: "6px 10px", minWidth: 80 }} onClick={() => onTargetBpmChange(bpmPresets[index])}>
+                    BPM {bpm}
+                  </button>
+                  <button className="btn" style={{ padding: "6px 8px" }} onClick={() => adjustPreset(index, 1)}>+</button>
+                </div>
+                <div className="row" style={{ gap: 8, alignItems: "center" }}>
+                  <BpmLed on={flashOn && previewingBpm === bpm} />
+                  <button
+                    className={`btn${previewingBpm === bpm ? " primary" : ""}`}
+                    style={{ padding: "6px 10px", fontSize: 12 }}
+                    onClick={() => togglePreview(bpm)}
+                  >
+                    {previewingBpm === bpm ? "■ 停止" : "▶ 預覽"}
+                  </button>
+                </div>
               </div>
+              {/* 第二列：操作 */}
               <div className="row" style={{ gap: 8 }}>
-                <BpmLed on={flashOn && previewingBpm === bpm} />
-                <button
-                  className={`btn${previewingBpm === bpm ? " primary" : ""}`}
-                  style={{ padding: "6px 8px", fontSize: 12 }}
-                  onClick={() => togglePreview(bpm)}
-                >
-                  {previewingBpm === bpm ? "■" : "▶"}
-                </button>
                 <button className="btn primary" style={{ padding: "6px 10px" }} onClick={() => onApplyPreset(bpm)}>
                   線性切
                 </button>
                 <button className="btn" style={{ padding: "6px 10px" }} onClick={() => onApplyDirectPreset(bpm)}>
                   直接切
                 </button>
-                <span className="small" style={{ cursor: "grab" }}>拖曳排序</span>
+                <span className="small" style={{ cursor: "grab", marginLeft: "auto" }}>拖曳排序</span>
                 <button className="btn danger" style={{ padding: "6px 10px" }} onClick={() => removePreset(bpm)}>
                   刪除
                 </button>
