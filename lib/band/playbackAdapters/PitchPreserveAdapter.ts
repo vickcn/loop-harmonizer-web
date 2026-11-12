@@ -144,6 +144,10 @@ export class PitchPreserveAdapter implements TrackPlaybackAdapter {
     }, Math.round(rampSec / steps * 1000));
   }
 
+  setPitchSemitones(_semitones: number, _ctx: AudioContext): void {
+    // 現有 WSOLA worklet 僅保音高變速，未提供獨立變調參數。
+  }
+
   setLoop(loop: boolean, onEnded: (() => void) | null): void {
     const wasLoop = this._loop;
     this._loop = loop;

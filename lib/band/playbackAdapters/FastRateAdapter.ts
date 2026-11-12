@@ -98,6 +98,10 @@ export class FastRateAdapter implements TrackPlaybackAdapter {
     }
   }
 
+  setPitchSemitones(_semitones: number, _ctx: AudioContext): void {
+    // AudioBufferSourceNode 無法獨立變調；維持既有 fast-rate 行為。
+  }
+
   setLoop(loop: boolean, onEnded: (() => void) | null): void {
     this._loop = loop;
     this.onEnded = onEnded;

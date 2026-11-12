@@ -1,0 +1,105 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+let buildSeparatedStemSet;
+let encodeStereoWav;
+let createStemTrackDescriptors;
+let createAudioBufferFromStem;
+
+try {
+  ({ buildSeparatedStemSet } = await import("../lib/separation/stemTypes.ts"));
+  ({ createStemTrackDescriptors } = await import("../lib/separation/stemTypes.ts"));
+  ({ encodeStereoWav } = await import("../lib/separation/wavEncoder.ts"));
+  ({ createAudioBufferFromStem } = await import("../lib/separation/audioBuffer.ts"));
+} catch {
+  // The assertions below intentionally fail until the separation modules exist.
+}
+
+const fourStemResult = {
+  vocals: { left: new Float32Array([0.1, 0.2]), right: new Float32Array([0.3, 0.4]) },
+  drums: { left: new Float32Array([0.2, 0.1]), right: new Float32Array([0.4, 0.3]) },
+  bass: { left: new Float32Array([0.3, 0.2]), right: new Float32Array([0.5, 0.4]) },
+  other: { left: new Float32Array([0.4, 0.3]), right: new Float32Array([0.6, 0.5]) },
+};
+
+function assertSamplesClose(actual, expected) {
+  assert.equal(actual.length, expected.length);
+  actual.forEach((sample, index) => {
+    assert.ok(Math.abs(sample - expected[index]) < 0.000001, `sample ${index} differs`);
+  });
+}
+
+test("two-stem result preserves vocals and sums the other three stems", () => {
+  const result = buildSeparatedStemSet(fourStemResult, 44100, "two_stem");
+
+  assert.deepEqual(result.tracks.map((track) => track.stemType), ["vocals", "instrumental"]);
+  assertSamplesClose(result.tracks[0].left, [0.1, 0.2]);
+  assertSamplesClose(result.tracks[1].left, [0.9, 0.6]);
+  assertSamplesClose(result.tracks[1].right, [1.5, 1.2]);
+});
+
+test("four-stem result keeps the expected track order", () => {
+  const result = buildSeparatedStemSet(fourStemResult, 44100, "four_stem");
+
+  assert.deepEqual(result.tracks.map((track) => track.stemType), ["vocals", "drums", "bass", "other"]);
+  assert.equal(result.sampleRate, 44100);
+});
+
+test("WAV encoder outputs a 16-bit stereo RIFF payload", () => {
+  const blob = encodeStereoWav(new Float32Array([-1, 1]), new Float32Array([0, 0.5]), 44100);
+  const view = new DataView(blob);
+
+  assert.equal(new TextDecoder().decode(new Uint8Array(blob, 0, 4)), "RIFF");
+  assert.equal(new TextDecoder().decode(new Uint8Array(blob, 8, 4)), "WAVE");
+  assert.equal(view.getUint16(22, true), 2);
+  assert.equal(view.getUint32(24, true), 44100);
+  assert.equal(view.getUint16(34, true), 16);
+  assert.equal(view.getUint32(40, true), 8);
+  assert.equal(view.getInt16(44, true), -32768);
+  assert.equal(view.getInt16(46, true), 0);
+});
+
+test("stem track descriptors share a source group and default to sync-safe playback", () => {
+  const stems = buildSeparatedStemSet(fourStemResult, 44100, "two_stem");
+  const tracks = createStemTrackDescriptors(stems, "full-song.mp3", "group_demo", (stemType) => `track_${stemType}`);
+
+  assert.deepEqual(tracks.map((track) => track.id), ["track_vocals", "track_instrumental"]);
+  assert.deepEqual(tracks.map((track) => track.stemMetadata?.sourceGroupId), ["group_demo", "group_demo"]);
+  assert.deepEqual(tracks.map((track) => track.playbackMode), ["soundtouch", "soundtouch"]);
+  assert.deepEqual(tracks.map((track) => track.syncMode), ["global-bpm", "global-bpm"]);
+  assert.deepEqual(tracks.map((track) => track.followsGlobalKey), [true, true]);
+  assert.deepEqual(tracks.map((track) => track.selected), [true, true]);
+  assert.equal(tracks[0].durationSec, 2 / 44100);
+});
+
+test("PCM stem data becomes a stereo AudioBuffer without a WAV round-trip", () => {
+  const copiedChannels = [];
+  const context = {
+    createBuffer(numberOfChannels, length, sampleRate) {
+      return {
+        numberOfChannels,
+        length,
+        sampleRate,
+        getChannelData(index) {
+          return {
+            set(channel) {
+              copiedChannels[index] = [...channel];
+            },
+          };
+        },
+      };
+    },
+  };
+
+  const buffer = createAudioBufferFromStem(context, {
+    stemType: "vocals",
+    left: new Float32Array([0.1, 0.2]),
+    right: new Float32Array([0.3, 0.4]),
+  }, 44100);
+
+  assert.equal(buffer.numberOfChannels, 2);
+  assert.equal(buffer.length, 2);
+  assert.equal(buffer.sampleRate, 44100);
+  assertSamplesClose(copiedChannels[0], [0.1, 0.2]);
+  assertSamplesClose(copiedChannels[1], [0.3, 0.4]);
+});

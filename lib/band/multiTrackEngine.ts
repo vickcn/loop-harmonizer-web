@@ -14,9 +14,12 @@
 
 import { FastRateAdapter } from "./playbackAdapters/FastRateAdapter";
 import { PitchPreserveAdapter } from "./playbackAdapters/PitchPreserveAdapter";
+import { SoundTouchAdapter } from "./playbackAdapters/SoundTouchAdapter";
 import type { TrackPlaybackAdapter } from "./playbackAdapters/types";
+import { createAudioBufferFromStem } from "@/lib/separation/audioBuffer";
+import type { StereoPcm } from "@/lib/separation/stemTypes";
 
-export type EnginePlaybackMode = "fast-rate" | "pitch-preserve";
+export type EnginePlaybackMode = "fast-rate" | "pitch-preserve" | "soundtouch";
 
 type InternalTrack = {
   buffer: AudioBuffer;
@@ -29,11 +32,15 @@ type InternalTrack = {
   muted: boolean;
   loop: boolean;
   playbackMode: EnginePlaybackMode;
+  keyShiftSemitones: number;
 };
 
 function createAdapter(mode: EnginePlaybackMode): TrackPlaybackAdapter {
   if (mode === "pitch-preserve") {
     return new PitchPreserveAdapter();
+  }
+  if (mode === "soundtouch") {
+    return new SoundTouchAdapter();
   }
   return new FastRateAdapter();
 }
@@ -55,6 +62,20 @@ export class MultiTrackEngine {
     const ab = await file.arrayBuffer();
     const buffer = await ctx.decodeAudioData(ab);
 
+    return this.loadAudioBuffer(trackId, buffer, "pitch-preserve");
+  }
+
+  /**
+   * 直接載入已解碼的 AudioBuffer，供瀏覽器端音源分離結果使用。
+   * 不經 WAV 編碼／解碼，以避免額外延遲與音質損失。
+   */
+  loadAudioBuffer(
+    trackId: string,
+    buffer: AudioBuffer,
+    playbackMode: EnginePlaybackMode = "fast-rate",
+  ): number {
+    const ctx = this.ensureCtx();
+
     const existing = this.tracks.get(trackId);
     if (existing) {
       existing.adapter.dispose();
@@ -65,7 +86,7 @@ export class MultiTrackEngine {
     gainNode.gain.value = 1;
     gainNode.connect(ctx.destination);
 
-    const adapter = createAdapter("pitch-preserve");
+    const adapter = createAdapter(playbackMode);
     adapter.load(buffer, gainNode, ctx);
 
     this.tracks.set(trackId, {
@@ -78,10 +99,25 @@ export class MultiTrackEngine {
       volume: 1,
       muted: false,
       loop: false,
-      playbackMode: "pitch-preserve",
+      playbackMode,
+      keyShiftSemitones: 0,
     });
 
     return buffer.duration;
+  }
+
+  /** 將分離出的 PCM 直接轉成引擎持有的 AudioBuffer，並預設以 SoundTouch 支援同步變速與變調。 */
+  loadStem(trackId: string, stem: StereoPcm, sampleRate: number): number {
+    const buffer = createAudioBufferFromStem(this.ensureCtx(), stem, sampleRate);
+    return this.loadAudioBuffer(trackId, buffer, "soundtouch");
+  }
+
+  removeTrack(trackId: string): void {
+    const track = this.tracks.get(trackId);
+    if (!track) return;
+    track.adapter.dispose();
+    try { track.gainNode.disconnect(); } catch { /* already disconnected */ }
+    this.tracks.delete(trackId);
   }
 
   async playTrack(trackId: string): Promise<void> {
@@ -110,12 +146,21 @@ export class MultiTrackEngine {
   }
 
   async seekTrack(trackId: string, sec: number): Promise<void> {
-    const t = this.tracks.get(trackId);
-    if (!t) return;
-    t.pausedAt = Math.max(0, sec);
-    if (t.isPlaying) {
-      const ctx = this.ensureCtx();
-      this._startAt(t, trackId, ctx.currentTime + 0.01);
+    this.seekTracks([trackId], sec);
+  }
+
+  /** 同一群分軌共用一個 schedule time 重新定位，避免逐軌 seek 造成起點漂移。 */
+  seekTracks(trackIds: string[], sec: number): void {
+    const ctx = this.ensureCtx();
+    const tracks = trackIds
+      .map((trackId) => ({ trackId, track: this.tracks.get(trackId) }))
+      .filter((entry): entry is { trackId: string; track: InternalTrack } => Boolean(entry.track));
+    const offset = Math.max(0, sec);
+    for (const { track } of tracks) track.pausedAt = offset;
+
+    const scheduleTime = ctx.currentTime + 0.02;
+    for (const { trackId, track } of tracks) {
+      if (track.isPlaying) this._startAt(track, trackId, scheduleTime);
     }
   }
 
@@ -163,6 +208,8 @@ export class MultiTrackEngine {
     newAdapter.load(t.buffer, t.gainNode, ctx);
     t.adapter = newAdapter;
     t.playbackMode = mode;
+    t.adapter.setPlaybackRate(t.playbackRate, ctx, 0);
+    t.adapter.setPitchSemitones(t.keyShiftSemitones, ctx);
 
     if (wasPlaying) {
       this._startAt(t, trackId, ctx.currentTime + 0.01);
@@ -196,6 +243,13 @@ export class MultiTrackEngine {
     if (!t) return;
     t.playbackRate = Math.max(0.1, Math.min(4, rate));
     if (this.ctx) t.adapter.setPlaybackRate(t.playbackRate, this.ctx, rampSec);
+  }
+
+  setPitchSemitones(trackId: string, semitones: number): void {
+    const t = this.tracks.get(trackId);
+    if (!t) return;
+    t.keyShiftSemitones = Math.max(-12, Math.min(12, Math.round(semitones)));
+    if (this.ctx) t.adapter.setPitchSemitones(t.keyShiftSemitones, this.ctx);
   }
 
   getTrackPosition(trackId: string): number {

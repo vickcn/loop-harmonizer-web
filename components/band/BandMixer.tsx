@@ -3,15 +3,21 @@
 import { useEffect, useRef, useState } from "react";
 import { BandSession, BandTrack, TrackSyncMode } from "@/lib/band/bandTypes";
 import { createDefaultBandSession } from "@/lib/band/bandSession";
+import { calculateGlobalPlaybackRate, normalizeKeyShift } from "@/lib/band/globalPlaybackControls";
 import { MultiTrackEngine } from "@/lib/band/multiTrackEngine";
+import { getLinkedStemTrackIds } from "@/lib/band/stemSync";
+import { createStemTrackDescriptors } from "@/lib/separation/stemTypes";
+import { disposeStemSeparator, type StemSeparationResult } from "@/lib/separation/stemSeparator";
 import { TrackCard } from "./TrackCard";
 import { SelectedTracksBar } from "./SelectedTracksBar";
+import { StemSeparationDialog } from "./StemSeparationDialog";
 
 export function BandMixer() {
   const [session, setSession] = useState<BandSession>(createDefaultBandSession);
   const [loading, setLoading] = useState(false);
   const [collapsedIds, setCollapsedIds] = useState<Set<string>>(new Set());
   const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [separatorOpen, setSeparatorOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const engineRef = useRef<MultiTrackEngine | null>(null);
 
@@ -56,6 +62,7 @@ export function BandMixer() {
     return () => {
       engineRef.current?.dispose();
       engineRef.current = null;
+      void disposeStemSeparator();
     };
   }, []);
 
@@ -107,6 +114,8 @@ export function BandMixer() {
           syncMode: "manual-rate",
           loop: false,
           playbackMode: "pitch-preserve",
+          keyShiftSemitones: 0,
+          followsGlobalKey: false,
         };
         setSession((prev) => ({ ...prev, tracks: [...prev.tracks, track] }));
       } catch {
@@ -114,6 +123,34 @@ export function BandMixer() {
       }
     }
     setLoading(false);
+  };
+
+  const handleAddSeparatedStems = async (result: StemSeparationResult, sourceFileName: string) => {
+    const eng = getEngine();
+    const sourceGroupId = `stem_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const descriptors = createStemTrackDescriptors(
+      result.stems,
+      sourceFileName,
+      sourceGroupId,
+      (stemType) => `track_${Date.now()}_${stemType}_${Math.random().toString(36).slice(2, 6)}`,
+    );
+    const loadedIds: string[] = [];
+
+    try {
+      const tracks = descriptors.map((descriptor, index) => {
+        const durationSec = eng.loadStem(
+          descriptor.id,
+          result.stems.tracks[index],
+          result.stems.sampleRate,
+        );
+        loadedIds.push(descriptor.id);
+        return { ...descriptor, durationSec } satisfies BandTrack;
+      });
+      setSession((prev) => ({ ...prev, tracks: [...prev.tracks, ...tracks] }));
+    } catch (error) {
+      loadedIds.forEach((id) => eng.removeTrack(id));
+      throw error;
+    }
   };
 
   // Per-track change handler — intercepts engine-relevant fields
@@ -147,6 +184,14 @@ export function BandMixer() {
       }
 
       const updated = { ...track, ...resolved };
+      const shouldSyncTempo = Boolean(track.stemMetadata) && (
+        "originalBpm" in resolved || "coarseRate" in resolved || "baseRate" in resolved || "syncMode" in resolved
+      );
+      const shouldSyncPlayhead = "playheadSec" in resolved && !("status" in resolved) && Boolean(track.stemMetadata);
+      const shouldSyncLoop = "loop" in resolved && Boolean(track.stemMetadata);
+      const linkedTrackIds = shouldSyncTempo || shouldSyncPlayhead || shouldSyncLoop
+        ? getLinkedStemTrackIds(prev.tracks, id)
+        : [id];
 
       // push to engine (must be synchronous sub-calls, no await inside setSession)
       void (async () => {
@@ -156,18 +201,37 @@ export function BandMixer() {
           else if (resolved.status === "stopped") eng.stopTrack(id);
         }
         if ("playheadSec" in resolved && !("status" in resolved)) {
-          await eng.seekTrack(id, resolved.playheadSec!);
+          if (shouldSyncPlayhead) eng.seekTracks(linkedTrackIds, resolved.playheadSec!);
+          else await eng.seekTrack(id, resolved.playheadSec!);
         }
         if ("volume" in resolved) eng.setVolume(id, resolved.volume!);
         if ("muted" in resolved) eng.setMuted(id, resolved.muted!);
-        if ("loop" in resolved) eng.setLoop(id, resolved.loop!);
-        if ("baseRate" in resolved) eng.setPlaybackRate(id, resolved.baseRate!);
+        if ("loop" in resolved) {
+          linkedTrackIds.forEach((trackId) => eng.setLoop(trackId, resolved.loop!));
+        }
+        if ("baseRate" in resolved) {
+          if (shouldSyncTempo) linkedTrackIds.forEach((trackId) => eng.setPlaybackRate(trackId, resolved.baseRate!));
+          else eng.setPlaybackRate(id, resolved.baseRate!);
+        }
+        if ("keyShiftSemitones" in resolved) eng.setPitchSemitones(id, resolved.keyShiftSemitones!);
         if ("playbackMode" in resolved) eng.setPlaybackMode(id, resolved.playbackMode!);
       })();
 
       return {
         ...prev,
-        tracks: prev.tracks.map((t) => (t.id === id ? updated : t)),
+        tracks: prev.tracks.map((t) => {
+          if (t.id === id) return updated;
+          if (!linkedTrackIds.includes(t.id)) return t;
+          return {
+            ...t,
+            ...(shouldSyncTempo && "originalBpm" in resolved ? { originalBpm: resolved.originalBpm! } : {}),
+            ...(shouldSyncTempo && "coarseRate" in resolved ? { coarseRate: resolved.coarseRate! } : {}),
+            ...(shouldSyncTempo && "baseRate" in resolved ? { baseRate: resolved.baseRate! } : {}),
+            ...(shouldSyncTempo && "syncMode" in resolved ? { syncMode: resolved.syncMode! } : {}),
+            ...(shouldSyncPlayhead ? { playheadSec: resolved.playheadSec! } : {}),
+            ...(shouldSyncLoop ? { loop: resolved.loop! } : {}),
+          };
+        }),
       };
     });
   };
@@ -178,7 +242,7 @@ export function BandMixer() {
     setSession((prev) => {
       const tracks = prev.tracks.map((t) => {
         if (t.syncMode !== "global-bpm") return t;
-        const r = Math.max(0.25, Math.min(4, newBpm / t.originalBpm));
+        const r = calculateGlobalPlaybackRate(newBpm, t.originalBpm);
         eng.setPlaybackRate(t.id, r);
         return { ...t, coarseRate: r, baseRate: r };
       });
@@ -186,7 +250,37 @@ export function BandMixer() {
     });
   };
 
+  const handleGlobalKeyShift = (semitones: number) => {
+    const nextSemitones = normalizeKeyShift(semitones);
+    const eng = getEngine();
+    setSession((prev) => {
+      const tracks = prev.tracks.map((track) => {
+        if (!track.followsGlobalKey) return track;
+        eng.setPitchSemitones(track.id, nextSemitones);
+        return { ...track, keyShiftSemitones: nextSemitones };
+      });
+      return { ...prev, globalKeyShiftSemitones: nextSemitones, tracks };
+    });
+  };
+
+  const resetGlobalBpm = () => {
+    const eng = getEngine();
+    setSession((prev) => ({
+      ...prev,
+      globalBpm: 120,
+      tracks: prev.tracks.map((track) => {
+        if (track.syncMode !== "global-bpm") return track;
+        eng.setPlaybackRate(track.id, 1, 0);
+        return { ...track, coarseRate: 1, baseRate: 1 };
+      }),
+    }));
+  };
+
+  const resetGlobalKey = () => handleGlobalKeyShift(0);
+
   const selectedIds = session.tracks.filter((t) => t.selected).map((t) => t.id);
+  const globalRate = session.tracks.find((track) => track.followsGlobalKey)?.baseRate
+    ?? calculateGlobalPlaybackRate(session.globalBpm, 120);
 
   const handlePlaySelected = async () => {
     const eng = getEngine();
@@ -231,6 +325,9 @@ export function BandMixer() {
         >
           {loading ? "載入中…" : "＋ 載入音檔"}
         </button>
+        <button className="btn" disabled={loading} onClick={() => setSeparatorOpen(true)}>
+          ✦ 分離音源
+        </button>
         <input
           ref={fileInputRef}
           type="file"
@@ -240,30 +337,50 @@ export function BandMixer() {
           onChange={(e) => { void handleFiles(e.target.files); e.target.value = ""; }}
         />
 
-        {/* 輔助 BPM */}
-        <div className="row" style={{ gap: 6, alignItems: "center", marginLeft: "auto" }}>
-          <span className="small" style={{ opacity: 0.6 }}>輔助 BPM</span>
-          <button
-            className="btn"
-            style={{ padding: "3px 8px", fontWeight: 700 }}
-            onClick={() => handleGlobalBpm(Math.max(20, session.globalBpm - 1))}
-          >−</button>
-          <input
-            className="input"
-            type="number"
-            min={20} max={300} step={1}
-            value={session.globalBpm}
-            style={{ width: 64, fontWeight: 700, fontSize: 16, textAlign: "center", padding: "4px 6px" }}
-            onChange={(e) => {
-              const v = Math.max(20, Math.min(300, Number(e.target.value) || 120));
-              handleGlobalBpm(v);
-            }}
-          />
-          <button
-            className="btn"
-            style={{ padding: "3px 8px", fontWeight: 700 }}
-            onClick={() => handleGlobalBpm(Math.min(300, session.globalBpm + 1))}
-          >+</button>
+        <div className="row" style={{ gap: 12, alignItems: "center", marginLeft: "auto" }}>
+          <div className="row" style={{ gap: 6, alignItems: "center" }}>
+            <span className="small" style={{ opacity: 0.6 }}>全域 BPM</span>
+            <button
+              className="btn"
+              style={{ padding: "3px 8px", fontWeight: 700 }}
+              onClick={() => handleGlobalBpm(Math.max(20, session.globalBpm - 1))}
+            >−</button>
+            <input
+              className="input"
+              type="number"
+              min={20} max={300} step={1}
+              value={session.globalBpm}
+              style={{ width: 64, fontWeight: 700, fontSize: 16, textAlign: "center", padding: "4px 6px" }}
+              onChange={(e) => handleGlobalBpm(Math.max(20, Math.min(300, Number(e.target.value) || 120)))}
+            />
+            <button
+              className="btn"
+              style={{ padding: "3px 8px", fontWeight: 700 }}
+              onClick={() => handleGlobalBpm(Math.min(300, session.globalBpm + 1))}
+            >+</button>
+            <button className="btn" style={{ padding: "4px 8px", fontSize: 12 }} onClick={resetGlobalBpm}>↺ 原始 BPM</button>
+          </div>
+
+          <div className="row" style={{ gap: 6, alignItems: "center" }}>
+            <span className="small" style={{ opacity: 0.6 }}>全域 Key</span>
+            <button className="btn" style={{ padding: "3px 8px", fontWeight: 700 }} onClick={() => handleGlobalKeyShift(session.globalKeyShiftSemitones - 1)}>−</button>
+            <input
+              className="input"
+              type="number"
+              min={-12} max={12} step={1}
+              value={session.globalKeyShiftSemitones}
+              aria-label="全域升降 Key 半音"
+              style={{ width: 56, fontWeight: 700, fontSize: 16, textAlign: "center", padding: "4px 6px" }}
+              onChange={(e) => handleGlobalKeyShift(Number(e.target.value))}
+            />
+            <span className="small">半音</span>
+            <button className="btn" style={{ padding: "3px 8px", fontWeight: 700 }} onClick={() => handleGlobalKeyShift(session.globalKeyShiftSemitones + 1)}>+</button>
+            <button className="btn" style={{ padding: "4px 8px", fontSize: 12 }} onClick={resetGlobalKey}>↺ 原始 Key</button>
+          </div>
+
+          <span className="small" style={{ opacity: 0.7, fontVariantNumeric: "tabular-nums" }}>
+            目前：{globalRate.toFixed(3)}× · {session.globalKeyShiftSemitones >= 0 ? "+" : ""}{session.globalKeyShiftSemitones} 半音
+          </span>
         </div>
       </div>
 
@@ -303,6 +420,12 @@ export function BandMixer() {
           ))}
         </div>
       )}
+
+      <StemSeparationDialog
+        open={separatorOpen}
+        onClose={() => setSeparatorOpen(false)}
+        onAddStems={handleAddSeparatedStems}
+      />
     </div>
   );
 }

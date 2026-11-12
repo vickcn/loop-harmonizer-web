@@ -12,7 +12,7 @@
  *   PitchPreservePlaceholderAdapter — 目前 fallback 到 FastRateAdapter
  */
 
-export type AdapterPlaybackMode = "fast-rate" | "pitch-preserve";
+export type AdapterPlaybackMode = "fast-rate" | "pitch-preserve" | "soundtouch";
 
 export interface PlayOptions {
   offsetSec: number;
@@ -46,6 +46,9 @@ export interface TrackPlaybackAdapter {
 
   /** 設定播放速率；rampSec 內線性漸變（預設 0.5 秒）。 */
   setPlaybackRate(rate: number, ctx: AudioContext, rampSec?: number): void;
+
+  /** 設定升降 Key 半音數；不支援的 adapter 維持原音高。 */
+  setPitchSemitones(semitones: number, ctx: AudioContext): void;
 
   /** 即時切換 loop；播放中生效。 */
   setLoop(loop: boolean, onEnded: (() => void) | null): void;

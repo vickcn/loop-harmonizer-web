@@ -4,6 +4,7 @@ export function createDefaultBandSession(): BandSession {
   return {
     id: `session_${Date.now()}`,
     globalBpm: 120,
+    globalKeyShiftSemitones: 0,
     tracks: [],
   };
 }
@@ -53,5 +54,7 @@ export async function createBandTrackFromFile(file: File): Promise<BandTrack> {
     syncMode: "manual-rate",
     loop: false,
     playbackMode: "pitch-preserve",
+    keyShiftSemitones: 0,
+    followsGlobalKey: false,
   };
 }
