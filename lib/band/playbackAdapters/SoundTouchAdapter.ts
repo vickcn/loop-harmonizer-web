@@ -61,6 +61,10 @@ export class SoundTouchAdapter implements TrackPlaybackAdapter {
     this.loop = false;
   }
 
+  async prepare(): Promise<void> {
+    await loadSoundTouchModule();
+  }
+
   play(scheduleTime: number, options: PlayOptions): void {
     if (!this.buffer || !this.gainNode || !this.ctx) return;
     this.disconnectShifter();
@@ -135,6 +139,7 @@ export class SoundTouchAdapter implements TrackPlaybackAdapter {
   private waitUntil(scheduleTime: number): Promise<void> {
     if (!this.ctx) return Promise.resolve();
     const delayMs = Math.max(0, (scheduleTime - this.ctx.currentTime) * 1000);
+    if (delayMs <= 1) return Promise.resolve();
     return new Promise((resolve) => window.setTimeout(resolve, delayMs));
   }
 

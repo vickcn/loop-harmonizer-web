@@ -11,8 +11,8 @@ export default function BandMixerPage() {
       </div>
 
       <header className="col-full">
-        <h1 className="title">Band Mixer M1</h1>
-        <p className="subtitle">多音檔載入、每軌播放線、倍率與 Key 控制。分離音軌可跟隨全域 BPM／Key，並由 SoundTouch 處理同時變速與變調。</p>
+        <h1 className="title">歌曲混音器</h1>
+        <p className="subtitle">每首歌獨立控制 BPM、Key、Loop 與分軌混音；音源分離和播放處理都留在瀏覽器。</p>
       </header>
 
       <div className="col-full">

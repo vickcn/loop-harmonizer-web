@@ -29,6 +29,9 @@ export interface TrackPlaybackAdapter {
    */
   load(buffer: AudioBuffer, gainNode: GainNode, ctx: AudioContext): void;
 
+  /** 可選的延遲模組預載；群組播放會先等所有 adapter 就緒再於同一 tick 啟動。 */
+  prepare?(): Promise<void>;
+
   /**
    * 從 offsetSec 開始，在 scheduleTime（AudioContext 時間）播放。
    * 呼叫前必須先呼叫 load()。

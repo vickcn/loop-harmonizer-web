@@ -9,6 +9,48 @@ export type TrackSyncMode = "free" | "global-bpm" | "manual-rate";
  */
 export type TrackPlaybackMode = "fast-rate" | "pitch-preserve" | "soundtouch";
 
+export type SongTempoMode = "target-bpm" | "manual-rate";
+export type SongPlaybackSource = "original" | "stems";
+export type SeparationStatus = "not_started" | "processing" | "completed" | "failed";
+
+export type StemChannel = {
+  id: string;
+  songId: string;
+  stemType: string;
+  volume: number;
+  muted: boolean;
+  solo: boolean;
+};
+
+export type BandSong = {
+  id: string;
+  settingsKey: string;
+  name: string;
+  fileName: string;
+  originalBpm: number;
+  targetBpm: number;
+  keyShiftSemitones: number;
+  tempoMode: SongTempoMode;
+  manualRate: number;
+  fineRateOffset: number;
+  savedRates: number[];
+  masterVolume: number;
+  playheadSec: number;
+  durationSec: number;
+  status: TrackStatus;
+  loop: boolean;
+  selected: boolean;
+  sourceAudioId: string;
+  stemIds: string[];
+  stemChannels: StemChannel[];
+  separationStatus: SeparationStatus;
+  separationMode: "two_stem" | "four_stem" | null;
+  separationProgress: number;
+  separationMessage: string;
+  playbackSource: SongPlaybackSource;
+  cacheKey: string | null;
+};
+
 export type BandTrack = {
   id: string;
   name: string;
@@ -39,7 +81,5 @@ export type BandTrack = {
 
 export type BandSession = {
   id: string;
-  globalBpm: number;
-  globalKeyShiftSemitones: number;
-  tracks: BandTrack[];
+  songs: BandSong[];
 };

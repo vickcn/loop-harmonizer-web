@@ -48,6 +48,7 @@ function createAdapter(mode: EnginePlaybackMode): TrackPlaybackAdapter {
 export class MultiTrackEngine {
   private ctx: AudioContext | null = null;
   private tracks = new Map<string, InternalTrack>();
+  private loopGroups = new Map<string, string[]>();
   onTrackEnded: ((trackId: string) => void) | null = null;
 
   private ensureCtx(): AudioContext {
@@ -57,12 +58,16 @@ export class MultiTrackEngine {
     return this.ctx;
   }
 
-  async loadTrack(trackId: string, file: File): Promise<number> {
+  async loadTrack(
+    trackId: string,
+    file: File,
+    playbackMode: EnginePlaybackMode = "pitch-preserve",
+  ): Promise<number> {
     const ctx = this.ensureCtx();
     const ab = await file.arrayBuffer();
     const buffer = await ctx.decodeAudioData(ab);
 
-    return this.loadAudioBuffer(trackId, buffer, "pitch-preserve");
+    return this.loadAudioBuffer(trackId, buffer, playbackMode);
   }
 
   /**
@@ -118,6 +123,7 @@ export class MultiTrackEngine {
     track.adapter.dispose();
     try { track.gainNode.disconnect(); } catch { /* already disconnected */ }
     this.tracks.delete(trackId);
+    this.loopGroups.delete(trackId);
   }
 
   async playTrack(trackId: string): Promise<void> {
@@ -125,7 +131,8 @@ export class MultiTrackEngine {
     await ctx.resume();
     const t = this.tracks.get(trackId);
     if (!t) return;
-    this._startAt(t, trackId, ctx.currentTime + 0.01);
+    await t.adapter.prepare?.();
+    this._startAt(t, trackId, ctx.currentTime);
   }
 
   pauseTrack(trackId: string): void {
@@ -158,7 +165,9 @@ export class MultiTrackEngine {
     const offset = Math.max(0, sec);
     for (const { track } of tracks) track.pausedAt = offset;
 
-    const scheduleTime = ctx.currentTime + 0.02;
+    const scheduleTime = tracks.every(({ track }) => track.playbackMode === "soundtouch")
+      ? ctx.currentTime
+      : ctx.currentTime + 0.02;
     for (const { trackId, track } of tracks) {
       if (track.isPlaying) this._startAt(track, trackId, scheduleTime);
     }
@@ -167,13 +176,14 @@ export class MultiTrackEngine {
   async playTracks(trackIds: string[]): Promise<void> {
     const ctx = this.ensureCtx();
     await ctx.resume();
-    const scheduleTime = ctx.currentTime + 0.02;
-    // pitch-preserve 軌道的 scheduleTime 無法精確對齊，多軌同步以 fast-rate 為準
-    for (const id of trackIds) {
-      const t = this.tracks.get(id);
-      if (!t) continue;
-      this._startAt(t, id, scheduleTime);
-    }
+    const entries = trackIds
+      .map((id) => ({ id, track: this.tracks.get(id) }))
+      .filter((entry): entry is { id: string; track: InternalTrack } => Boolean(entry.track));
+    await Promise.all(entries.map(({ track }) => track.adapter.prepare?.()));
+    // SoundTouch 的模組先共同預載，再於同一 JavaScript tick 啟動，避免每軌各自 setTimeout。
+    // ScriptProcessorNode 仍不保證樣本級同步，UI 會保留此限制說明。
+    const scheduleTime = ctx.currentTime;
+    for (const { id, track } of entries) this._startAt(track, id, scheduleTime);
   }
 
   pauseTracks(trackIds: string[]): void {
@@ -224,6 +234,18 @@ export class MultiTrackEngine {
     t.adapter.setLoop(loop, onEnded);
   }
 
+  /** Stem 群組由最先結束的軌道觸發共同歸零重播，避免各 adapter 自行循環累積偏移。 */
+  setLoopGroup(trackIds: string[], loop: boolean): void {
+    for (const trackId of trackIds) {
+      if (loop) this.loopGroups.set(trackId, [...trackIds]);
+      else this.loopGroups.delete(trackId);
+      const track = this.tracks.get(trackId);
+      if (!track) continue;
+      track.loop = false;
+      track.adapter.setLoop(false, () => this._handleTrackEnded(trackId));
+    }
+  }
+
   setVolume(trackId: string, volume: number): void {
     const t = this.tracks.get(trackId);
     if (!t || !this.ctx) return;
@@ -236,6 +258,36 @@ export class MultiTrackEngine {
     if (!t || !this.ctx) return;
     t.muted = muted;
     t.gainNode.gain.setTargetAtTime(muted ? 0 : t.volume, this.ctx.currentTime, 0.02);
+  }
+
+  setGroupVolume(trackIds: string[], volume: number): void {
+    trackIds.forEach((trackId) => this.setVolume(trackId, volume));
+  }
+
+  /** 在同一 AudioContext 時間軸切換原始混音與 stems，短暫重疊後停止舊來源。 */
+  crossfadeTracks(fromIds: string[], toIds: string[], durationSec = 0.06): void {
+    const ctx = this.ensureCtx();
+    const now = ctx.currentTime;
+    for (const id of fromIds) {
+      const track = this.tracks.get(id);
+      if (!track) continue;
+      track.gainNode.gain.cancelScheduledValues(now);
+      track.gainNode.gain.setValueAtTime(track.gainNode.gain.value, now);
+      track.gainNode.gain.linearRampToValueAtTime(0, now + durationSec);
+    }
+    for (const id of toIds) {
+      const track = this.tracks.get(id);
+      if (!track) continue;
+      const target = track.muted ? 0 : track.volume;
+      track.gainNode.gain.cancelScheduledValues(now);
+      track.gainNode.gain.setValueAtTime(0, now);
+      track.gainNode.gain.linearRampToValueAtTime(target, now + durationSec);
+    }
+    window.setTimeout(() => this.pauseTracks(fromIds), Math.ceil(durationSec * 1000) + 10);
+  }
+
+  getTrackOffsets(trackIds: string[]): Record<string, number> {
+    return Object.fromEntries(trackIds.map((trackId) => [trackId, this.getTrackPosition(trackId)]));
   }
 
   setPlaybackRate(trackId: string, rate: number, rampSec = 0.5): void {
@@ -265,6 +317,7 @@ export class MultiTrackEngine {
       try { t.gainNode.disconnect(); } catch { /* ok */ }
     }
     this.tracks.clear();
+    this.loopGroups.clear();
     if (this.ctx && this.ctx.state !== "closed") {
       void this.ctx.close();
     }
@@ -284,6 +337,12 @@ export class MultiTrackEngine {
   }
 
   private _handleTrackEnded(trackId: string): void {
+    const loopGroup = this.loopGroups.get(trackId);
+    if (loopGroup) {
+      this.stopTracks(loopGroup);
+      void this.playTracks(loopGroup);
+      return;
+    }
     const t = this.tracks.get(trackId);
     if (t) {
       t.isPlaying = false;

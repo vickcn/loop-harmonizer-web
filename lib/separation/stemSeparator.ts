@@ -1,6 +1,9 @@
 "use client";
 
 import { buildSeparatedStemSet, type SeparatedStemSet, type StemSeparationMode } from "./stemTypes";
+import { prepareCachedModelUrl } from "@/lib/storage/modelCache";
+import { DEMUCS_MODEL_VERSION } from "@/lib/storage/cacheKeys";
+export { DEMUCS_MODEL_VERSION } from "@/lib/storage/cacheKeys";
 
 type SeparationBackend = "webgpu" | "wasm";
 
@@ -179,7 +182,12 @@ async function getProcessor(
 
   options.onStatus?.("正在下載並載入 Demucs 模型…");
   try {
-    await processor.loadModel(runtime.demucs.CONSTANTS.DEFAULT_MODEL_URL);
+    const modelUrl = await prepareCachedModelUrl(
+      runtime.demucs.CONSTANTS.DEFAULT_MODEL_URL,
+      DEMUCS_MODEL_VERSION,
+      (progress) => options.onDownloadProgress?.(progress),
+    );
+    await processor.loadModel(modelUrl);
   } catch (error) {
     await releaseProcessor(processor);
     throw error;

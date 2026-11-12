@@ -148,6 +148,8 @@ issues*/
 output*/
 sds_studio*/
 storage*/
+!lib/storage/
+!lib/storage/**
 source*/
 
 
