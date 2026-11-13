@@ -22,6 +22,9 @@ type Props = {
   onStemChange: (id: string, patch: Partial<StemChannel>) => void;
   onDownloadStem: (id: string) => void;
   onClearSongCache: () => void;
+  onAbortSeparation?: () => void;
+  onRestoreSnapshot?: () => void;
+  onLoadAudio?: () => void;
   onRemove: (deleteLocalData: boolean) => void;
   onRelinkAudio?: () => void;
   onRetryPersist?: () => void;
@@ -127,6 +130,25 @@ function LoopIcon() {
   );
 }
 
+function OctagonXIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <polygon points="7.86 2 16.14 2 22 7.86 22 16.14 16.14 22 7.86 22 2 16.14 2 7.86 7.86 2" />
+      <line x1="15" y1="9" x2="9" y2="15" />
+      <line x1="9" y1="9" x2="15" y2="15" />
+    </svg>
+  );
+}
+
+function UndoSnapshotIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M9 14L4 9l5-5" />
+      <path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11" />
+    </svg>
+  );
+}
+
 const STATUS_COLOR = { stopped: "var(--muted)", playing: "#22c55e", paused: "#f59e0b" };
 const STATUS_LABEL = { stopped: "停止", playing: "播放中", paused: "暫停" };
 const PERSISTENCE_BADGE = {
@@ -160,7 +182,22 @@ export const SongCard = memo(function SongCard(props: Props) {
     }
     prevSeparationStatusRef.current = song.separationStatus;
   }, [song.separationStatus, song.stemIds.length]);
-  const audioUnavailable = song.persistenceStatus === "restoring" || song.persistenceStatus === "missing_audio";
+  const isSeparating = song.separationStatus === "processing" || song.separationStatus === "cancelling";
+  const isDecodingAudio = song.audioLoadState === "decoding";
+  const audioUnavailable =
+    song.persistenceStatus === "restoring"
+    || song.persistenceStatus === "missing_audio"
+    || isDecodingAudio;
+  const separateActionLabel =
+    song.separationStatus === "cancelling"
+      ? "正在停…"
+      : song.separationStatus === "processing"
+        ? "分離中…"
+        : song.separationStatus === "cancelled" || song.separationStatus === "completed"
+          ? "重新分離音源"
+          : song.separationStatus === "failed"
+            ? "重試分離音源"
+            : "分離音源";
   const persistenceInfo = song.persistenceStatus ? PERSISTENCE_BADGE[song.persistenceStatus] : null;
   const rate = getEffectivePlaybackRate(song);
   const coarseRate = song.tempoMode === "target-bpm"
@@ -225,32 +262,44 @@ export const SongCard = memo(function SongCard(props: Props) {
             <span className="small" style={{ opacity: 0.5 }}>{song.fileName}</span>
           </div>
         </div>
-        <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
-          {props.isActive && <span className="song-focus-pill">焦點中</span>}
-          {song.muted && <span className="song-muted-pill">已靜音</span>}
-          {persistenceInfo && (
-            <span
-              className={`song-storage-pill ${persistenceInfo.tone}`}
-              title={song.persistenceMessage || persistenceInfo.label}
-            >
-              {persistenceInfo.label}
-            </span>
-          )}
-          <span className="small" style={{ color: STATUS_COLOR[song.status] }}>● {STATUS_LABEL[song.status]}</span>
-          <IconActionButton
-            icon={<ChevronIcon expanded={!props.collapsed} />}
-            label={props.collapsed ? "展開歌曲" : "收合歌曲"}
-            className="song-card-action is-compact"
-            onClick={props.onToggleCollapse}
-          />
-          <IconActionButton
-            icon="🗑"
-            label="移除歌曲"
-            danger
-            expanded={confirmingRemove}
-            className="song-card-action is-compact"
-            onClick={() => setConfirmingRemove((value) => !value)}
-          />
+        <div className="row" style={{ gap: 8, flexWrap: "wrap", alignItems: "center", justifyContent: "flex-end" }}>
+          <div className="row" style={{ gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+            {props.isActive && <span className="song-focus-pill">焦點中</span>}
+            {song.muted && <span className="song-muted-pill">已靜音</span>}
+            {song.audioLoadState === "unloaded" && (
+              <span className="song-storage-pill is-warn" title="為節省記憶體採延遲解碼，按播放或載入時才解碼">
+                待按需解碼
+              </span>
+            )}
+            {song.audioLoadState === "decoding" && (
+              <span className="song-storage-pill is-saving">音訊解碼中…</span>
+            )}
+            {persistenceInfo && (
+              <span
+                className={`song-storage-pill ${persistenceInfo.tone}`}
+                title={song.persistenceMessage || persistenceInfo.label}
+              >
+                {persistenceInfo.label}
+              </span>
+            )}
+            <span className="small" style={{ color: STATUS_COLOR[song.status], whiteSpace: "nowrap" }}>● {STATUS_LABEL[song.status]}</span>
+          </div>
+          <div className="row" style={{ gap: 6, flexWrap: "nowrap", flex: "0 0 auto" }}>
+            <IconActionButton
+              icon={<ChevronIcon expanded={!props.collapsed} />}
+              label={props.collapsed ? "展開歌曲" : "收合歌曲"}
+              className="song-card-action is-compact"
+              onClick={props.onToggleCollapse}
+            />
+            <IconActionButton
+              icon="🗑"
+              label="移除歌曲"
+              danger
+              expanded={confirmingRemove}
+              className="song-card-action is-compact"
+              onClick={() => setConfirmingRemove((value) => !value)}
+            />
+          </div>
         </div>
       </div>
 
@@ -514,41 +563,44 @@ export const SongCard = memo(function SongCard(props: Props) {
 
           <div className="song-tempo-sliders">
             <div className="grid manual-rate-control" style={{ gap: 6 }}>
-              <div className="row" style={{ justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
-                <span className="small">播放倍率{song.tempoMode === "manual-rate" ? "（目前使用）" : ""}</span>
-                <datalist id={`song-rates-${song.id}`}>
-                  {song.savedRates.map((savedRate) => <option key={savedRate} value={savedRate.toFixed(3)} />)}
-                </datalist>
-                <div className="row manual-rate-input" style={{ gap: 6, flexWrap: "nowrap", alignItems: "center" }}>
-                  <button type="button" aria-label={`降低倍率 ${MANUAL_RATE_STEP.toFixed(2)} 倍`} className="btn mixer-button rate-stepper" onClick={() => setManualRate(song.manualRate - MANUAL_RATE_STEP)}>−</button>
-                  <input aria-label="指定播放倍率" className="input" type="number" list={`song-rates-${song.id}`} min={MANUAL_RATE_MIN} max={MANUAL_RATE_MAX} step={0.01} value={song.manualRate.toFixed(3)} onChange={(event) => setManualRate(Number(event.target.value) || 1)} />
-                  <button type="button" aria-label={`提高倍率 ${MANUAL_RATE_STEP.toFixed(2)} 倍`} className="btn mixer-button rate-stepper" onClick={() => setManualRate(song.manualRate + MANUAL_RATE_STEP)}>+</button>
-                  <IconActionButton
-                    icon={song.savedRates.some((value) => Math.abs(value - rate) < 0.0001) ? "★" : "☆"}
-                    label={song.savedRates.some((value) => Math.abs(value - rate) < 0.0001) ? "移除已儲存倍率" : "儲存目前倍率"}
-                    pressed={song.savedRates.some((value) => Math.abs(value - rate) < 0.0001)}
-                    primary={song.savedRates.some((value) => Math.abs(value - rate) < 0.0001)}
-                    className="is-compact"
-                    onClick={() => {
-                      const savedRate = Math.round(rate * 1000) / 1000;
-                      const exists = song.savedRates.some((value) => Math.abs(value - savedRate) < 0.0001);
-                      props.onChange({
-                        savedRates: exists
-                          ? song.savedRates.filter((value) => value === 1 || Math.abs(value - savedRate) >= 0.0001)
-                          : [...song.savedRates, savedRate].sort((a, b) => a - b),
-                      });
-                    }}
-                  />
-                  <IconActionButton
-                    icon="↺"
-                    label="恢復原始速度 (1.000×)"
-                    shortcut="Alt+Z"
-                    disabled={isDefaultSpeed}
-                    disabledReason={isDefaultSpeed ? "目前已是原始速度 (1.000×)" : undefined}
-                    className="is-compact"
-                    onClick={() => props.onChange({ targetBpm: song.originalBpm, tempoMode: "target-bpm", manualRate: 1, fineRateOffset: 0 })}
-                  />
-                </div>
+              <div className="row" style={{ justifyContent: "space-between", gap: 8, flexWrap: "nowrap" }}>
+                <span className="small">播放倍率</span>
+                <span className="small" style={{ color: song.tempoMode === "manual-rate" ? "var(--accent-2)" : "var(--muted)", whiteSpace: "nowrap" }}>
+                  {song.tempoMode === "manual-rate" ? "手動倍率中" : "跟隨 BPM"}
+                </span>
+              </div>
+              <datalist id={`song-rates-${song.id}`}>
+                {song.savedRates.map((savedRate) => <option key={savedRate} value={savedRate.toFixed(3)} />)}
+              </datalist>
+              <div className="row manual-rate-input" style={{ gap: 6, flexWrap: "nowrap", alignItems: "center" }}>
+                <button type="button" aria-label={`降低倍率 ${MANUAL_RATE_STEP.toFixed(2)} 倍`} className="btn mixer-button rate-stepper" onClick={() => setManualRate(song.manualRate - MANUAL_RATE_STEP)}>−</button>
+                <input aria-label="指定播放倍率" className="input" type="number" list={`song-rates-${song.id}`} min={MANUAL_RATE_MIN} max={MANUAL_RATE_MAX} step={0.01} value={song.manualRate.toFixed(3)} onChange={(event) => setManualRate(Number(event.target.value) || 1)} />
+                <button type="button" aria-label={`提高倍率 ${MANUAL_RATE_STEP.toFixed(2)} 倍`} className="btn mixer-button rate-stepper" onClick={() => setManualRate(song.manualRate + MANUAL_RATE_STEP)}>+</button>
+                <IconActionButton
+                  icon={song.savedRates.some((value) => Math.abs(value - rate) < 0.0001) ? "★" : "☆"}
+                  label={song.savedRates.some((value) => Math.abs(value - rate) < 0.0001) ? "移除已儲存倍率" : "儲存目前倍率"}
+                  pressed={song.savedRates.some((value) => Math.abs(value - rate) < 0.0001)}
+                  primary={song.savedRates.some((value) => Math.abs(value - rate) < 0.0001)}
+                  className="is-compact"
+                  onClick={() => {
+                    const savedRate = Math.round(rate * 1000) / 1000;
+                    const exists = song.savedRates.some((value) => Math.abs(value - savedRate) < 0.0001);
+                    props.onChange({
+                      savedRates: exists
+                        ? song.savedRates.filter((value) => value === 1 || Math.abs(value - savedRate) >= 0.0001)
+                        : [...song.savedRates, savedRate].sort((a, b) => a - b),
+                    });
+                  }}
+                />
+                <IconActionButton
+                  icon="↺"
+                  label="恢復原始速度 (1.000×)"
+                  shortcut="Alt+Z"
+                  disabled={isDefaultSpeed}
+                  disabledReason={isDefaultSpeed ? "目前已是原始速度 (1.000×)" : undefined}
+                  className="is-compact"
+                  onClick={() => props.onChange({ targetBpm: song.originalBpm, tempoMode: "target-bpm", manualRate: 1, fineRateOffset: 0 })}
+                />
               </div>
               <input
                 aria-label="倍率粗調拉桿"
@@ -609,7 +661,7 @@ export const SongCard = memo(function SongCard(props: Props) {
         <section className="grid" style={{ gap: 10, paddingTop: 12, borderTop: "1px solid var(--line)" }}>
           <div className="row" style={{ gap: 8, flexWrap: "nowrap", minWidth: 0 }}>
             <strong style={{ flex: "0 0 auto" }}>音源</strong>
-            <select className="input" aria-label="分離軌數模式" value={mode} disabled={song.separationStatus === "processing"} style={{ flex: "0 0 auto" }} onChange={(event) => setSelectedMode(event.target.value as StemSeparationMode)}>
+            <select className="input" aria-label="分離軌數模式" value={mode} disabled={isSeparating} style={{ flex: "0 0 auto" }} onChange={(event) => setSelectedMode(event.target.value as StemSeparationMode)}>
               <option value="two_stem">2 Stem</option>
               <option value="four_stem">4 Stem</option>
             </select>
@@ -617,30 +669,30 @@ export const SongCard = memo(function SongCard(props: Props) {
               items={[
                 {
                   key: "separate",
-                  label: song.separationStatus === "processing" ? "分離中…" : song.separationStatus === "completed" ? "重新分離音源" : "分離音源",
-                  disabled: song.separationStatus === "processing" || audioUnavailable,
-                  disabledReason: song.separationStatus === "processing"
-                    ? "正在進行音源分離，請勿重複送出"
+                  label: separateActionLabel,
+                  disabled: isSeparating || audioUnavailable,
+                  disabledReason: isSeparating
+                    ? "正在進行或停止音源分離，請稍候"
                     : audioUnavailable
-                      ? "請先等待恢復或重新選取原始音檔"
+                      ? "請先等待恢復、解碼或重新選取原始音檔"
                       : undefined,
                   onSelect: () => props.onSeparate(mode),
                   renderInline: () => (
                     <IconActionButton
                       icon={
-                        song.separationStatus === "processing"
+                        isSeparating
                           ? <span className="mixer-spinner" aria-hidden="true" />
-                          : <SplitStemsIcon refresh={song.separationStatus === "completed"} />
+                          : <SplitStemsIcon refresh={song.separationStatus === "completed" || song.separationStatus === "cancelled"} />
                       }
-                      label={song.separationStatus === "processing" ? "分離中…" : song.separationStatus === "completed" ? "重新分離音源" : "分離音源"}
+                      label={separateActionLabel}
                       primary
-                      busy={song.separationStatus === "processing"}
-                      disabled={song.separationStatus === "processing" || audioUnavailable}
+                      busy={isSeparating}
+                      disabled={isSeparating || audioUnavailable}
                       disabledReason={
-                        song.separationStatus === "processing"
-                          ? "正在進行音源分離，請勿重複送出"
+                        isSeparating
+                          ? "正在進行或停止音源分離，請稍候"
                           : audioUnavailable
-                            ? "請先等待恢復或重新選取原始音檔"
+                            ? "請先等待恢復、解碼或重新選取原始音檔"
                             : undefined
                       }
                       className="is-compact"
@@ -648,12 +700,30 @@ export const SongCard = memo(function SongCard(props: Props) {
                     />
                   ),
                 },
+                ...(song.activeSnapshot && !isSeparating && props.onRestoreSnapshot
+                  ? ([
+                      {
+                        key: "restore-snapshot",
+                        label: "回復上一動",
+                        onSelect: props.onRestoreSnapshot,
+                        renderInline: () => (
+                          <IconActionButton
+                            icon={<UndoSnapshotIcon />}
+                            label="回復上一動（還原最近一次重操作前設定與來源）"
+                            className="is-compact"
+                            onClick={() => props.onRestoreSnapshot?.()}
+                          />
+                        ),
+                      },
+                    ] satisfies AdaptiveActionItem[])
+                  : []),
                 ...(song.stemIds.length > 0
                   ? ([
                       {
                         key: "source-toggle",
                         label: song.playbackSource === "stems" ? "切換為原始混音" : "切換為分軌混音",
                         pressed: song.playbackSource === "stems",
+                        disabled: isSeparating,
                         onSelect: () => props.onSwitchSource(song.playbackSource === "stems" ? "original" : "stems"),
                         renderInline: () => (
                           <IconActionButton
@@ -661,6 +731,7 @@ export const SongCard = memo(function SongCard(props: Props) {
                             label={song.playbackSource === "stems" ? "目前：分軌混音（點擊切換原始混音）" : "目前：原始混音（點擊切換分軌混音）"}
                             pressed={song.playbackSource === "stems"}
                             primary={song.playbackSource === "stems"}
+                            disabled={isSeparating}
                             className="is-compact"
                             onClick={() => props.onSwitchSource(song.playbackSource === "stems" ? "original" : "stems")}
                           />
@@ -669,15 +740,15 @@ export const SongCard = memo(function SongCard(props: Props) {
                       {
                         key: "clear-cache",
                         label: song.cacheKey ? "清除此歌分離快取" : "目前已無本機快取",
-                        disabled: !song.cacheKey,
-                        disabledReason: !song.cacheKey ? "目前已無本機快取" : undefined,
+                        disabled: !song.cacheKey || isSeparating,
+                        disabledReason: !song.cacheKey ? "目前已無本機快取" : isSeparating ? "分離執行中暫無法清除" : undefined,
                         onSelect: props.onClearSongCache,
                         renderInline: () => (
                           <IconActionButton
                             icon="🧹"
                             label={song.cacheKey ? "清除此歌分離快取" : "目前已無本機快取"}
-                            disabled={!song.cacheKey}
-                            disabledReason={!song.cacheKey ? "目前已無本機快取" : undefined}
+                            disabled={!song.cacheKey || isSeparating}
+                            disabledReason={!song.cacheKey ? "目前已無本機快取" : isSeparating ? "分離執行中暫無法清除" : undefined}
                             className="is-compact"
                             onClick={props.onClearSongCache}
                           />
@@ -703,39 +774,79 @@ export const SongCard = memo(function SongCard(props: Props) {
               ]}
             />
           </div>
-          {song.separationStatus === "processing" && (() => {
-            const hasDeterminate = Number.isFinite(song.separationProgress) && song.separationProgress > 0 && song.separationProgress < 1;
+          {(song.separationStatus === "processing" || song.separationStatus === "cancelling") && (() => {
+            const isCancelling = song.separationStatus === "cancelling";
+            const hasDeterminate = !isCancelling && Number.isFinite(song.separationProgress) && song.separationProgress > 0 && song.separationProgress < 1;
             return (
-              <div className="grid" style={{ gap: 6 }}>
-                <div
-                  role="progressbar"
-                  aria-label="音源分離進度"
-                  aria-valuemin={0}
-                  aria-valuemax={100}
-                  aria-valuenow={hasDeterminate ? Math.round(song.separationProgress * 100) : undefined}
-                  className={`mixer-progress-track${hasDeterminate ? "" : " is-indeterminate"}`}
-                >
-                  <div
-                    className="mixer-progress-fill"
-                    style={hasDeterminate ? { width: `${Math.round(song.separationProgress * 100)}%` } : undefined}
-                  />
+              <div className="grid mixer-separation-active-panel" style={{ gap: 8 }}>
+                <div className="row" style={{ gap: 10, alignItems: "center", justifyContent: "space-between", flexWrap: "wrap" }}>
+                  <div className="grid" style={{ gap: 4, flex: "1 1 180px", minWidth: 0 }}>
+                    <div
+                      role="progressbar"
+                      aria-label="音源分離進度"
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={hasDeterminate ? Math.round(song.separationProgress * 100) : undefined}
+                      className={`mixer-progress-track${hasDeterminate ? "" : " is-indeterminate"}`}
+                    >
+                      <div
+                        className="mixer-progress-fill"
+                        style={hasDeterminate ? { width: `${Math.round(song.separationProgress * 100)}%` } : undefined}
+                      />
+                    </div>
+                    <span className="small">
+                      {isCancelling ? "正在停…" : (song.separationMessage || "處理中…")}
+                      {hasDeterminate ? ` (${Math.round(song.separationProgress * 100)}%)` : ""}
+                    </span>
+                  </div>
+                  {props.onAbortSeparation && (
+                    <button
+                      type="button"
+                      className="btn mixer-abort-button"
+                      disabled={isCancelling}
+                      aria-label={isCancelling ? "正在停止音源分離" : `中止「${song.name}」音源分離`}
+                      title="中止音源分離並清理暫存資源"
+                      onClick={props.onAbortSeparation}
+                    >
+                      <OctagonXIcon />
+                      <span>{isCancelling ? "正在停…" : "中止分離"}</span>
+                    </button>
+                  )}
                 </div>
-                <span className="small">
-                  {song.separationMessage || "處理中…"}
-                  {hasDeterminate ? ` (${Math.round(song.separationProgress * 100)}%)` : ""}
-                </span>
               </div>
             );
           })()}
+          {song.separationStatus === "cancelled" && (
+            <div role="status" className="card-warning-banner">
+              <span>{song.separationMessage || "已中止音源分離，保留原本音訊設定。"}</span>
+              <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
+                {song.activeSnapshot && props.onRestoreSnapshot && (
+                  <button type="button" className="btn mixer-button" style={{ padding: "4px 10px", fontSize: 12 }} onClick={props.onRestoreSnapshot}>
+                    ↩ 回復上一動
+                  </button>
+                )}
+                <button type="button" className="btn mixer-button" style={{ padding: "4px 10px", fontSize: 12 }} disabled={audioUnavailable} onClick={() => props.onSeparate(mode)}>
+                  重新分離
+                </button>
+              </div>
+            </div>
+          )}
           {song.separationStatus === "completed" && song.separationMessage && (
             <span className="small" style={{ color: "#34d399" }}>✓ {song.separationMessage}</span>
           )}
           {song.separationStatus === "failed" && (
             <div role="alert" className="card-error-banner">
               <span>{song.separationMessage}</span>
-              <button type="button" className="btn mixer-button" style={{ padding: "4px 10px", fontSize: 12 }} onClick={() => props.onSeparate(mode)}>
-                ↻ 重試分離
-              </button>
+              <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
+                {song.activeSnapshot && props.onRestoreSnapshot && (
+                  <button type="button" className="btn mixer-button" style={{ padding: "4px 10px", fontSize: 12 }} onClick={props.onRestoreSnapshot}>
+                    ↩ 回復上一動
+                  </button>
+                )}
+                <button type="button" className="btn mixer-button" style={{ padding: "4px 10px", fontSize: 12 }} disabled={audioUnavailable} onClick={() => props.onSeparate(mode)}>
+                  ↻ 重試
+                </button>
+              </div>
             </div>
           )}
           {song.stemIds.length > 0 && stemsOpen && (

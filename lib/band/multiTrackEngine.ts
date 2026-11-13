@@ -244,6 +244,61 @@ export class MultiTrackEngine {
     this.stemMixBuses.set(groupId, bus);
   }
 
+  hasTrack(trackId: string): boolean {
+    return this.tracks.has(trackId);
+  }
+
+  isTrackPlaying(trackId: string): boolean {
+    const groupId = this.trackToMixGroup.get(trackId);
+    if (groupId) {
+      const bus = this.stemMixBuses.get(groupId);
+      if (bus?.isPlaying) return true;
+    }
+    return this.tracks.get(trackId)?.isPlaying ?? false;
+  }
+
+  getTrackMemoryEstimateBytes(): number {
+    let total = 0;
+    for (const track of this.tracks.values()) {
+      total += track.buffer.length * track.buffer.numberOfChannels * 4;
+    }
+    return total;
+  }
+
+  getActiveSoundTouchCount(): number {
+    let count = 0;
+    for (const bus of this.stemMixBuses.values()) {
+      if (bus.isPlaying) count += 1;
+    }
+    for (const track of this.tracks.values()) {
+      if (track.isPlaying && track.playbackMode === "soundtouch") {
+        const groupId = [...this.trackToMixGroup.entries()].find(([, gid]) => this.stemMixBuses.get(gid)?.trackIds.some((id) => this.tracks.get(id) === track));
+        if (!groupId) count += 1;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * 僅釋放未處於播放中的指定音軌（解除 AudioBuffer 與音訊節點參照，不會強制中斷正在播放之音軌）。
+   */
+  releaseIdleTracks(trackIds: readonly string[]): {
+    releasedTrackIds: string[];
+    estimatedFreedBytes: number;
+  } {
+    const releasedTrackIds: string[] = [];
+    let estimatedFreedBytes = 0;
+    for (const trackId of trackIds) {
+      if (this.isTrackPlaying(trackId)) continue;
+      const track = this.tracks.get(trackId);
+      if (!track) continue;
+      estimatedFreedBytes += track.buffer.length * track.buffer.numberOfChannels * 4;
+      this.removeTrack(trackId);
+      releasedTrackIds.push(trackId);
+    }
+    return { releasedTrackIds, estimatedFreedBytes };
+  }
+
   removeTrack(trackId: string): void {
     const groupId = this.trackToMixGroup.get(trackId);
     if (groupId) {

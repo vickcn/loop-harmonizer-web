@@ -207,6 +207,16 @@ export async function loadPersistedBandSession(): Promise<{
   });
 }
 
+export async function getPersistedAudioBlobByKey(audioKey: string): Promise<PersistedAudioFileRecord | null> {
+  if (!audioKey) return null;
+  return withIdbTransaction(["audioFiles"], "readonly", async (tx) => {
+    const record = await idbRequestPromise<PersistedAudioFileRecord | undefined>(
+      tx.objectStore("audioFiles").get(audioKey),
+    );
+    return record ?? null;
+  });
+}
+
 export async function getPersistedSongWithAudio(songId: string): Promise<{
   song: PersistedSongRecord | null;
   audio: PersistedAudioFileRecord | null;
@@ -574,6 +584,7 @@ export async function clearUnusedSeparationCaches(
         ...inMemorySongs.map((item) => ({
           sourceAudioHash: item.sourceAudioHash ?? null,
           cacheKey: item.cacheKey ?? null,
+          activeSnapshot: item.activeSnapshot ?? null,
         })),
       ];
       const unusedKeys = new Set(findUnusedSeparationRecordKeys(allSeparations, activeRefs));

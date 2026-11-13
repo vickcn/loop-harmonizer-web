@@ -126,6 +126,7 @@ export class SoundTouchAdapter implements TrackPlaybackAdapter {
   dispose(): void {
     this.playToken += 1;
     this.disconnectShifter();
+    this.onEnded = null;
     this.buffer = null;
     this.gainNode = null;
     this.ctx = null;
@@ -168,7 +169,23 @@ export class SoundTouchAdapter implements TrackPlaybackAdapter {
 
   private disconnectShifter(): void {
     if (!this.shifter) return;
-    try { this.shifter.disconnect(); } catch { /* already disconnected */ }
+    const shifterRef = this.shifter as SoundTouchShifter & {
+      node?: { onaudioprocess?: unknown; disconnect?: () => void };
+      _node?: { onaudioprocess?: unknown; disconnect?: () => void };
+    };
     this.shifter = null;
+    try {
+      if (shifterRef.node) {
+        shifterRef.node.onaudioprocess = null;
+        shifterRef.node.disconnect?.();
+      }
+      if (shifterRef._node) {
+        shifterRef._node.onaudioprocess = null;
+        shifterRef._node.disconnect?.();
+      }
+      shifterRef.disconnect();
+    } catch {
+      // already disconnected
+    }
   }
 }

@@ -4,8 +4,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { BandSession, BandSong, SongPlaybackSource, StemChannel } from "@/lib/band/bandTypes";
 import { createDefaultBandSession } from "@/lib/band/bandSession";
 import {
+  applySongOperationSnapshot,
   clampBpmValue,
   createBandSong,
+  createSongOperationSnapshot,
   getEffectivePlaybackRate,
   getSongPlaybackTrackIds,
   getStemAudibility,
@@ -15,7 +17,28 @@ import {
   type PersistedSongRecord,
 } from "@/lib/band/songModel";
 import { MultiTrackEngine } from "@/lib/band/multiTrackEngine";
-import { DEMUCS_MODEL_VERSION, disposeStemSeparator, separateAudio } from "@/lib/separation/stemSeparator";
+import {
+  DEMUCS_MODEL_VERSION,
+  disposeStemSeparator,
+  preflightSeparationNetworkBudget,
+  separateAudio,
+} from "@/lib/separation/stemSeparator";
+import {
+  isAbortError,
+  sharedSeparationCoordinator,
+} from "@/lib/separation/separationTaskController";
+import {
+  assessResourceRisk,
+  collectDeviceCapabilities,
+  formatEstimatedMiB,
+  sharedPerfTelemetry,
+  type LowLoadActionId,
+  type ResourceRiskAssessment,
+} from "@/lib/band/resourceGuard";
+import {
+  sharedNetworkBudgetLedger,
+  type NetworkBatchEvaluation,
+} from "@/lib/band/networkBudgetGuard";
 import type { SeparatedStemSet, StemSeparationMode } from "@/lib/separation/stemTypes";
 import { encodeStereoWav } from "@/lib/separation/wavEncoder";
 import { createSeparationCacheKey, SEPARATION_PROCESSING_VERSION } from "@/lib/storage/cacheKeys";
@@ -26,6 +49,7 @@ import {
   cancelPendingSongPersist,
   clearUnusedSeparationCaches,
   flushPendingSongPersists,
+  getPersistedAudioBlobByKey,
   getPersistedSongWithAudio,
   getStorageStatsSummary,
   hasPendingSongPersist,
@@ -44,6 +68,7 @@ import {
 } from "@/lib/storage/songSessionStore";
 import { SongCard } from "./SongCard";
 import { IconActionButton } from "./IconActionButton";
+import { ResourceGuardModal, type ResourceGuardConfirmSelection } from "./ResourceGuardModal";
 import {
   EMPTY_MIXER_SELECTION,
   applyResetKey,
@@ -84,6 +109,16 @@ export function BandMixer() {
   const [uploadError, setUploadError] = useState("");
   const [restoringSession, setRestoringSession] = useState(true);
   const [restoringMessage, setRestoringMessage] = useState("正在檢查本機保存的歌曲工作階段…");
+  const [restoreError, setRestoreError] = useState("");
+  const [restoreAttempt, setRestoreAttempt] = useState(0);
+  const [guardDialog, setGuardDialog] = useState<{
+    title: string;
+    subtitle?: string;
+    assessment: ResourceRiskAssessment | null;
+    networkEvaluation?: NetworkBatchEvaluation | null;
+    resolve: (selection: ResourceGuardConfirmSelection | null) => void;
+  } | null>(null);
+  const [idleCleanupReport, setIdleCleanupReport] = useState<string>("");
   const [collapsedIds, setCollapsedIds] = useState<Set<string>>(new Set());
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [selection, setSelection] = useState<MixerSelection>(EMPTY_MIXER_SELECTION);
@@ -107,6 +142,7 @@ export function BandMixer() {
   const engineRef = useRef<MultiTrackEngine | null>(null);
   const sourceFilesRef = useRef(new Map<string, File>());
   const stemResultsRef = useRef(new Map<string, SeparatedStemSet>());
+  const persistedMetaBySongIdRef = useRef(new Map<string, PersistedSongRecord>());
   const separationTokensRef = useRef(new Map<string, symbol>());
   const savedSettingsRef = useRef(new Map<string, SavedSongSettings>());
   const restorePromiseRef = useRef<Promise<void>>(Promise.resolve());
@@ -340,14 +376,236 @@ export function BandMixer() {
     }
   }, [installStemSet, refreshCacheStats]);
 
+  const requestGuardConfirmation = useCallback(
+    (params: {
+      title: string;
+      subtitle?: string;
+      assessment: ResourceRiskAssessment | null;
+      networkEvaluation?: NetworkBatchEvaluation | null;
+    }): Promise<ResourceGuardConfirmSelection | null> =>
+      new Promise((resolve) => {
+        setGuardDialog({
+          title: params.title,
+          subtitle: params.subtitle,
+          assessment: params.assessment,
+          networkEvaluation: params.networkEvaluation,
+          resolve,
+        });
+      }),
+    [],
+  );
+
+  const releaseIdleResources = useCallback(async (options?: {
+    excludeSongIds?: readonly string[];
+    quiet?: boolean;
+  }): Promise<{ releasedSongs: number; estimatedFreedBytes: number; revokedModelUrl: boolean }> => {
+    const engine = getEngine();
+    const excludeSet = new Set(options?.excludeSongIds ?? []);
+    const activeProtectedIds = new Set<string>(excludeSet);
+
+    for (const song of sessionRef.current.songs) {
+      if (song.status === "playing" || song.separationStatus === "processing" || song.separationStatus === "cancelling") {
+        activeProtectedIds.add(song.id);
+      }
+      if (sharedSeparationCoordinator.getActiveController(song.id)) {
+        activeProtectedIds.add(song.id);
+      }
+    }
+
+    const idleSongIds: string[] = [];
+    const idleTrackIds: string[] = [];
+    for (const song of sessionRef.current.songs) {
+      if (activeProtectedIds.has(song.id)) continue;
+      const trackIds = [song.sourceAudioId, ...song.stemIds];
+      const hasLoadedTrack = trackIds.some((id) => engine.hasTrack(id));
+      const hasStemPcm = stemResultsRef.current.has(song.id);
+      if (hasLoadedTrack || hasStemPcm) {
+        idleSongIds.push(song.id);
+        idleTrackIds.push(...trackIds);
+      }
+    }
+
+    const { estimatedFreedBytes } = engine.releaseIdleTracks(idleTrackIds);
+    for (const songId of idleSongIds) {
+      stemResultsRef.current.delete(songId);
+    }
+
+    if (idleSongIds.length > 0) {
+      const idleIdSet = new Set(idleSongIds);
+      setSession((previous) => ({
+        ...previous,
+        songs: previous.songs.map((song) => (
+          idleIdSet.has(song.id)
+            ? {
+                ...song,
+                status: song.status === "playing" ? song.status : "stopped",
+                audioLoadState: "unloaded",
+                stemIds: [],
+                playbackSource: song.playbackSource === "stems" ? "original" : song.playbackSource,
+              }
+            : song
+        )),
+      }));
+    }
+
+    let revokedModelUrl = false;
+    if (!sharedSeparationCoordinator.hasRunningHeavyTask() && !sharedSeparationCoordinator.isBusyWaitingCleanup()) {
+      await disposeStemSeparator({ revokeModelUrl: true });
+      revokedModelUrl = true;
+    }
+
+    const reportText = idleSongIds.length > 0 || revokedModelUrl
+      ? `已釋放 ${idleSongIds.length} 首閒置歌曲的解碼音訊緩衝（估計減少約 ${formatEstimatedMiB(estimatedFreedBytes)}）${revokedModelUrl ? "、已關閉閒置 AI 分離模型/Worker" : ""}。已解除記憶體參照與斷開音訊節點，實際作業系統 RAM 回收由瀏覽器決定（不會刪除原始音檔與已存快取）。`
+      : "目前沒有可安全釋放的閒置音訊資源（播放中／分離中歌曲及快照參照已保留）。";
+
+    if (!options?.quiet) {
+      setIdleCleanupReport(reportText);
+      showShortcutHint(reportText);
+    }
+
+    return {
+      releasedSongs: idleSongIds.length,
+      estimatedFreedBytes,
+      revokedModelUrl,
+    };
+  }, [getEngine, showShortcutHint]);
+
+  const ensureSongAudioReady = useCallback(async (
+    song: BandSong,
+    options?: { skipGuard?: boolean },
+  ): Promise<boolean> => {
+    const engine = getEngine();
+    if (engine.hasTrack(song.sourceAudioId) && song.audioLoadState !== "unloaded") {
+      return true;
+    }
+
+    let file = sourceFilesRef.current.get(song.id);
+    if (!file && song.sourceAudioHash) {
+      const audioRecord = await getPersistedAudioBlobByKey(song.sourceAudioHash).catch(() => null);
+      if (audioRecord && audioRecord.blob instanceof Blob) {
+        file = new File([audioRecord.blob], song.fileName, {
+          type: song.mimeType || audioRecord.mimeType || audioRecord.blob.type || "audio/*",
+          lastModified: song.fileLastModified || audioRecord.lastModified || Date.now(),
+        });
+        sourceFilesRef.current.set(song.id, file);
+      }
+    }
+
+    if (!file) {
+      patchSongMetadataOnly(song.id, {
+        audioLoadState: "error",
+        persistenceStatus: "missing_audio",
+        persistenceMessage: "找不到本機原始音檔，請重新選取音檔。",
+      });
+      return false;
+    }
+
+    if (!options?.skipGuard) {
+      const cap = await collectDeviceCapabilities();
+      const assessment = assessResourceRisk({
+        operation: "decode",
+        songName: song.name,
+        fileSizeBytes: file.size,
+        durationSec: song.durationSec,
+        mimeType: file.type,
+        activeSongCount: sessionRef.current.songs.length,
+        playingSongCount: sessionRef.current.songs.filter((s) => s.status === "playing").length,
+        estimatedInMemoryAudioBytes: engine.getTrackMemoryEstimateBytes(),
+        hasOtherIdleDecodedSongs: sessionRef.current.songs.some((s) => s.id !== song.id && s.status !== "playing" && engine.hasTrack(s.sourceAudioId)),
+        capabilities: cap,
+        performanceSignals: sharedPerfTelemetry.getSignals(),
+      });
+      if (assessment.requiresConfirmation) {
+        const decision = await requestGuardConfirmation({
+          title: `確認解碼載入「${song.name}」`,
+          subtitle: "大型或高負載音檔解碼前風險檢查",
+          assessment,
+        });
+        if (!decision) return false;
+        if (decision.applyLowLoadActions.includes("pause-other-songs")) {
+          for (const other of sessionRef.current.songs) {
+            if (other.id !== song.id && other.status === "playing") {
+              engine.pauseTracks(getSongPlaybackTrackIds(other));
+              patchSongMetadataOnly(other.id, { status: "paused" });
+            }
+          }
+        }
+        if (decision.applyLowLoadActions.includes("release-idle-buffers")) {
+          await releaseIdleResources({ excludeSongIds: [song.id], quiet: true });
+        }
+      }
+    }
+
+    patchSongMetadataOnly(song.id, {
+      audioLoadState: "decoding",
+      persistenceMessage: "正在按需解碼音訊…",
+    });
+
+    const startedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+    try {
+      const durationSec = await engine.loadTrack(song.sourceAudioId, file, "soundtouch");
+      const elapsed = (typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt;
+      sharedPerfTelemetry.recordDecodeDuration(elapsed);
+
+      if (removedSongIdsRef.current.has(song.id)) {
+        engine.removeTrack(song.sourceAudioId);
+        return false;
+      }
+
+      const persistedRecord = persistedMetaBySongIdRef.current.get(song.id);
+      const restoredSnapshot = sessionRef.current.songs.find((item) => item.id === song.id) ?? song;
+      const nextDuration = durationSec || restoredSnapshot.durationSec;
+      const nextPlayhead = Math.min(nextDuration, restoredSnapshot.playheadSec);
+
+      engine.seekTracks([song.sourceAudioId], nextPlayhead);
+      const readySong: BandSong = {
+        ...restoredSnapshot,
+        durationSec: nextDuration,
+        playheadSec: nextPlayhead,
+        audioLoadState: "ready",
+        persistenceStatus: "saved",
+        persistenceMessage: "已保存在此裝置",
+      };
+      applySongToEngine(readySong);
+      setSession((previous) => ({
+        ...previous,
+        songs: previous.songs.map((item) => (item.id === song.id ? readySong : item)),
+      }));
+
+      if (readySong.cacheKey) {
+        const cached = await getCachedStemSet(readySong.cacheKey).catch(() => null);
+        if (cached && !removedSongIdsRef.current.has(song.id)) {
+          const preferred = persistedRecord?.playbackSource ?? readySong.playbackSource;
+          installStemSet(readySong, cached, readySong.cacheKey, "已從本機快取載入分離結果。", {
+            preferredSource: preferred,
+            skipPersist: true,
+          });
+        }
+      }
+      return true;
+    } catch {
+      engine.removeTrack(song.sourceAudioId);
+      patchSongMetadataOnly(song.id, {
+        audioLoadState: "error",
+        persistenceStatus: "missing_audio",
+        persistenceMessage: "本機音檔毀損或格式無法解碼，請重新選取音檔。",
+      });
+      return false;
+    }
+  }, [applySongToEngine, getEngine, installStemSet, patchSongMetadataOnly, releaseIdleResources, requestGuardConfirmation]);
+
   const hydrateOnePersistedSong = useCallback(async (
     record: PersistedSongRecord,
     audioRecord: PersistedAudioFileRecord | null | undefined,
     isCancelled: () => boolean,
+    options?: { deferDecode?: boolean },
   ) => {
     if (isCancelled() || removedSongIdsRef.current.has(record.songId)) return;
+    persistedMetaBySongIdRef.current.set(record.songId, record);
+
     if (!audioRecord || !(audioRecord.blob instanceof Blob)) {
       patchSongMetadataOnly(record.songId, {
+        audioLoadState: "error",
         persistenceStatus: "missing_audio",
         persistenceMessage: "找不到本機原始音檔，請重新選取音檔以恢復播放。",
       });
@@ -359,15 +617,39 @@ export function BandMixer() {
       lastModified: record.lastModified || audioRecord.lastModified || Date.now(),
     });
     const sourceAudioId = `${record.songId}_original`;
-    const engine = getEngine();
+    sourceFilesRef.current.set(record.songId, restoredFile);
 
+    if (options?.deferDecode) {
+      const lazySong = restoreBandSongFromRecord(record, {
+        sourceAudioId,
+        durationSec: record.durationSec,
+        persistenceStatus: "saved",
+        persistenceMessage: "已保存在此裝置（點擊播放再按需解碼，節省手機記憶體）",
+        audioLoadState: "unloaded",
+      });
+      setSession((previous) => {
+        const exists = previous.songs.some((item) => item.id === lazySong.id);
+        return {
+          ...previous,
+          songs: exists
+            ? previous.songs.map((item) => (item.id === lazySong.id ? lazySong : item))
+            : [...previous.songs, lazySong],
+        };
+      });
+      return;
+    }
+
+    const engine = getEngine();
     let durationSec = record.durationSec;
+    const decodeStartedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
     try {
       durationSec = await engine.loadTrack(sourceAudioId, restoredFile, "soundtouch");
+      sharedPerfTelemetry.recordDecodeDuration((typeof performance !== "undefined" ? performance.now() : Date.now()) - decodeStartedAt);
     } catch {
       engine.removeTrack(sourceAudioId);
       if (!isCancelled() && !removedSongIdsRef.current.has(record.songId)) {
         patchSongMetadataOnly(record.songId, {
+          audioLoadState: "error",
           persistenceStatus: "missing_audio",
           persistenceMessage: "本機保存的音檔毀損或格式無法解碼，請重新選取音檔。",
         });
@@ -385,9 +667,9 @@ export function BandMixer() {
       durationSec,
       persistenceStatus: "saved",
       persistenceMessage: "已保存在此裝置",
+      audioLoadState: "ready",
     });
 
-    sourceFilesRef.current.set(record.songId, restoredFile);
     engine.seekTracks([sourceAudioId], restoredSong.playheadSec);
     applySongToEngine(restoredSong);
 
@@ -401,7 +683,6 @@ export function BandMixer() {
       };
     });
 
-    // 若資料庫紀錄存有有效版本與分離模式，只讀取現有分離快取，不自動執行 Demucs
     const hasCompatibleCacheRecord = Boolean(
       record.cacheKey
       && record.modelVersion === DEMUCS_MODEL_VERSION
@@ -432,9 +713,11 @@ export function BandMixer() {
 
   useEffect(() => {
     let cancelled = false;
+    sharedPerfTelemetry.startObservingLongTasks();
 
     const runRestore = async () => {
       setRestoringSession(true);
+      setRestoreError("");
       setRestoringMessage("正在從本機資料庫恢復歌曲與設定…");
       try {
         const persisted = await loadPersistedBandSession();
@@ -445,10 +728,11 @@ export function BandMixer() {
           return;
         }
 
-        const placeholders = persisted.songs.map((record) =>
+        const placeholders = persisted.songs.map((record, index) =>
           restoreBandSongFromRecord(record, {
-            persistenceStatus: "restoring",
-            persistenceMessage: "正在恢復音檔與設定…",
+            persistenceStatus: index === 0 ? "restoring" : "saved",
+            persistenceMessage: index === 0 ? "正在恢復音檔與設定…" : "待按需解碼",
+            audioLoadState: index === 0 ? "decoding" : "unloaded",
           }),
         );
         setSession((previous) => ({ ...previous, songs: placeholders }));
@@ -457,11 +741,21 @@ export function BandMixer() {
         for (let i = 0; i < persisted.songs.length; i += 1) {
           if (cancelled) return;
           const record = persisted.songs[i];
-          setRestoringMessage(`正在恢復歌曲 (${i + 1}/${persisted.songs.length})：${record.name}`);
-          await hydrateOnePersistedSong(record, persisted.audioFilesByKey.get(record.audioKey), () => cancelled);
+          const shouldDeferDecode = i > 0;
+          setRestoringMessage(
+            shouldDeferDecode
+              ? `正在建立清單（${i + 1}/${persisted.songs.length}，延遲解碼省記憶體）：${record.name}`
+              : `正在恢復歌曲 (${i + 1}/${persisted.songs.length})：${record.name}`,
+          );
+          await hydrateOnePersistedSong(record, persisted.audioFilesByKey.get(record.audioKey), () => cancelled, {
+            deferDecode: shouldDeferDecode,
+          });
         }
-      } catch {
-        // IndexedDB 無法存取時保留空工作階段，不影響手動上傳使用
+      } catch (error) {
+        if (!cancelled) {
+          const reason = error instanceof Error && error.message ? error.message : "無法開啟或讀取本機 IndexedDB";
+          setRestoreError(`工作階段恢復失敗：${reason}。你可以立即重試，或先手動匯入音檔使用。`);
+        }
       } finally {
         if (!cancelled) {
           setRestoringSession(false);
@@ -602,11 +896,12 @@ export function BandMixer() {
       }
       feedbackTimers.forEach((timer) => window.clearTimeout(timer));
       feedbackTimers.clear();
+      sharedPerfTelemetry.stopObserving();
       engineRef.current?.dispose();
       engineRef.current = null;
-      void disposeStemSeparator();
+      void disposeStemSeparator({ revokeModelUrl: true });
     };
-  }, [applySongToEngine, getEngine, hydrateOnePersistedSong, patchSongMetadataOnly, refreshCacheStats, showCardFeedback, showShortcutHint]);
+  }, [applySongToEngine, getEngine, hydrateOnePersistedSong, patchSongMetadataOnly, refreshCacheStats, restoreAttempt, showCardFeedback, showShortcutHint]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -670,23 +965,63 @@ export function BandMixer() {
     if (!selectedFiles.length) return;
     setLoading(true);
     setUploadError("");
-    setUploadStatus(`正在準備載入 ${selectedFiles.length} 個音檔…`);
+    setUploadStatus("正在等候工作階段同步完成…");
     try {
-      await Promise.race([
-        restorePromiseRef.current.catch(() => undefined),
-        new Promise<void>((resolve) => window.setTimeout(resolve, 1500)),
-      ]);
+      await restorePromiseRef.current.catch(() => undefined);
+
+      const engine = getEngine();
+      const totalSelectedBytes = selectedFiles.reduce((sum, item) => sum + item.size, 0);
+      const largestFile = selectedFiles.reduce((prev, curr) => (curr.size > prev.size ? curr : prev), selectedFiles[0]);
+      const cap = await collectDeviceCapabilities();
+      const uploadAssessment = assessResourceRisk({
+        operation: "upload",
+        songName: selectedFiles.length === 1 ? largestFile.name : `${selectedFiles.length} 個音訊檔`,
+        fileSizeBytes: totalSelectedBytes,
+        mimeType: largestFile.type,
+        activeSongCount: sessionRef.current.songs.length,
+        playingSongCount: sessionRef.current.songs.filter((s) => s.status === "playing").length,
+        estimatedInMemoryAudioBytes: engine.getTrackMemoryEstimateBytes(),
+        hasOtherIdleDecodedSongs: sessionRef.current.songs.some((s) => s.status !== "playing" && engine.hasTrack(s.sourceAudioId)),
+        capabilities: cap,
+        performanceSignals: sharedPerfTelemetry.getSignals(),
+      });
+
+      if (uploadAssessment.requiresConfirmation) {
+        const decision = await requestGuardConfirmation({
+          title: `確認載入 ${selectedFiles.length} 個大型音檔`,
+          subtitle: `總容量約 ${(totalSelectedBytes / (1024 * 1024)).toFixed(1)} MiB`,
+          assessment: uploadAssessment,
+        });
+        if (!decision) {
+          setUploadStatus("");
+          return;
+        }
+        if (decision.applyLowLoadActions.includes("pause-other-songs")) {
+          for (const other of sessionRef.current.songs) {
+            if (other.status === "playing") {
+              engine.pauseTracks(getSongPlaybackTrackIds(other));
+              patchSongMetadataOnly(other.id, { status: "paused" });
+            }
+          }
+        }
+        if (decision.applyLowLoadActions.includes("release-idle-buffers")) {
+          await releaseIdleResources({ quiet: true });
+        }
+      }
+
+      setUploadStatus(`正在準備載入 ${selectedFiles.length} 個音檔…`);
       if (!persistRequestedRef.current) {
         persistRequestedRef.current = true;
         void requestPersistentStorage().then(() => refreshCacheStats());
       }
-      const engine = getEngine();
       for (const file of selectedFiles) {
         const songId = `song_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         const sourceAudioId = `${songId}_original`;
         setUploadStatus(`正在解碼音檔：${file.name}`);
         try {
+          const startedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
           const durationSec = await engine.loadTrack(sourceAudioId, file, "soundtouch");
+          sharedPerfTelemetry.recordDecodeDuration((typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt);
           const sourceAudioHash = await hashSourceAudio(file);
           const settingsKey = `${file.name}:${file.size}:${file.lastModified}`;
           const saved = await loadSongSettings(settingsKey).catch(() => null);
@@ -704,6 +1039,7 @@ export function BandMixer() {
             fileLastModified: file.lastModified,
             persistenceStatus: "saving",
             persistenceMessage: "儲存中…",
+            audioLoadState: "ready",
           });
           const restoredRates = saved ? sanitizeSongSavedRates(saved.savedRates) : [1];
           const song: BandSong = saved ? {
@@ -871,9 +1207,12 @@ export function BandMixer() {
       return next;
     });
     try {
-      applySongToEngine(song);
-      await getEngine().playTracks(getSongPlaybackTrackIds(song));
-      updateSong(song.id, { status: "playing" });
+      const ready = await ensureSongAudioReady(song);
+      if (!ready) return;
+      const latestSong = sessionRef.current.songs.find((item) => item.id === song.id) ?? song;
+      applySongToEngine(latestSong);
+      await getEngine().playTracks(getSongPlaybackTrackIds(latestSong));
+      updateSong(latestSong.id, { status: "playing" });
     } catch (error) {
       const errorMsg = describePlaybackError(error);
       setPlaybackErrors((previous) => ({ ...previous, [song.id]: errorMsg }));
@@ -965,61 +1304,239 @@ export function BandMixer() {
     persistSongDebounced(song.id, 150);
   };
 
+  const abortSongSeparation = async (song: BandSong) => {
+    patchSongMetadataOnly(song.id, {
+      separationStatus: "cancelling",
+      separationStage: "cancelling",
+      separationMessage: "正在停止並釋放 Worker / Tensor 資源…",
+    });
+    await sharedSeparationCoordinator.cancelTask(song.id, "已中止音源分離，未改動既有設定與快取。", 80);
+  };
+
+  const restoreSongSnapshot = (song: BandSong) => {
+    const snapshot = song.activeSnapshot;
+    if (!snapshot) return;
+    const restored = applySongOperationSnapshot(song, snapshot);
+    applySongToEngine(restored);
+    getEngine().seekTracks([restored.sourceAudioId, ...restored.stemIds], restored.playheadSec);
+    setSession((previous) => ({
+      ...previous,
+      songs: previous.songs.map((item) => (
+        item.id === song.id
+          ? {
+              ...restored,
+              activeSnapshot: null,
+              separationMessage: "已回復上一個穩定狀態與設定。",
+            }
+          : item
+      )),
+    }));
+    showCardFeedback(song.id, "已回復上一個穩定狀態。");
+    persistSongDebounced(song.id, 150);
+  };
+
   const separateSong = async (song: BandSong, mode: StemSeparationMode) => {
-    if (song.separationStatus === "processing" || separationTokensRef.current.has(song.id)) {
+    if (song.separationStatus === "processing" || song.separationStatus === "cancelling") {
       return;
     }
-    if (separationTokensRef.current.size > 0) {
-      showCardFeedback(song.id, "另一首歌曲正在分離中，請待該任務完成後再試。");
-      showShortcutHint("目前一次只能執行一個 Demucs 分離任務，請稍候。");
+    if (sharedSeparationCoordinator.isBusyWaitingCleanup()) {
+      showCardFeedback(song.id, "上一個分離任務仍在停止並釋放資源，請稍候片刻再試。");
       return;
     }
+    if (sharedSeparationCoordinator.hasRunningHeavyTask(song.id)) {
+      showCardFeedback(song.id, "目前已有其他歌曲正在分離，請先完成或中止後再試。");
+      showShortcutHint("一次僅執行一個 Demucs AI 分離任務，以保護行動裝置記憶體。");
+      return;
+    }
+
+    const ready = await ensureSongAudioReady(song, { skipGuard: true });
+    if (!ready) return;
+    const latestReadySong = sessionRef.current.songs.find((item) => item.id === song.id) ?? song;
     const file = sourceFilesRef.current.get(song.id);
     if (!file) {
       updateSong(song.id, { separationStatus: "failed", separationMessage: "原始音訊已不在記憶體，請重新載入歌曲。" });
       return;
     }
+
+    const sourceAudioHash = latestReadySong.sourceAudioHash || await hashSourceAudio(file);
+    const cacheKey = createSeparationCacheKey({
+      sourceAudioHash,
+      modelVersion: DEMUCS_MODEL_VERSION,
+      separationMode: mode,
+      processingVersion: SEPARATION_PROCESSING_VERSION,
+    });
+    const preCached = await getCachedStemSet(cacheKey).catch(() => null);
+
+    let allowOverBudgetNetwork = false;
+    let maxThreads = 4;
+
+    if (!preCached) {
+      const [cap, networkEval] = await Promise.all([
+        collectDeviceCapabilities(),
+        preflightSeparationNetworkBudget(),
+      ]);
+      const assessment = assessResourceRisk({
+        operation: "separate",
+        songName: latestReadySong.name,
+        fileSizeBytes: file.size,
+        durationSec: latestReadySong.durationSec,
+        mimeType: file.type,
+        separationMode: mode,
+        activeSongCount: sessionRef.current.songs.length,
+        playingSongCount: sessionRef.current.songs.filter((s) => s.status === "playing").length,
+        activeSoundTouchTracks: getEngine().getActiveSoundTouchCount(),
+        estimatedInMemoryAudioBytes: getEngine().getTrackMemoryEstimateBytes(),
+        hasOtherIdleDecodedSongs: sessionRef.current.songs.some((s) => s.id !== song.id && s.status !== "playing" && getEngine().hasTrack(s.sourceAudioId)),
+        capabilities: cap,
+        performanceSignals: sharedPerfTelemetry.getSignals(),
+      });
+
+      if (assessment.requiresConfirmation || !networkEval.allowed) {
+        const decision = await requestGuardConfirmation({
+          title: `音源分離風險與傳輸確認：「${latestReadySong.name}」`,
+          subtitle: `目前選擇：${mode === "four_stem" ? "4 Stem（人聲／鼓／貝斯／其他）" : "2 Stem（人聲／伴奏）"}`,
+          assessment,
+          networkEvaluation: networkEval,
+        });
+        if (!decision) return;
+        allowOverBudgetNetwork = decision.allowOverBudgetNetwork;
+        if (decision.applyLowLoadActions.includes("pause-other-songs")) {
+          for (const other of sessionRef.current.songs) {
+            if (other.id !== song.id && other.status === "playing") {
+              getEngine().pauseTracks(getSongPlaybackTrackIds(other));
+              patchSongMetadataOnly(other.id, { status: "paused" });
+            }
+          }
+        }
+        if (decision.applyLowLoadActions.includes("release-idle-buffers")) {
+          await releaseIdleResources({ excludeSongIds: [song.id], quiet: true });
+        }
+        if (decision.applyLowLoadActions.includes("limit-inference-threads")) {
+          maxThreads = 2;
+        }
+      } else if (assessment.riskLevel === "medium") {
+        showCardFeedback(song.id, `提示：本裝置估計達中等負載（${assessment.estimatedDurationLabel}），背景執行中可繼續操作其他卡片。`);
+      }
+    }
+
+    const stableSnapshot = createSongOperationSnapshot(latestReadySong, "音源分離前穩定狀態");
+    patchSongMetadataOnly(song.id, {
+      activeSnapshot: stableSnapshot,
+      separationStatus: "processing",
+      separationMode: mode,
+      separationStage: "preparing",
+      separationProgress: 0.02,
+      separationMessage: "正在準備分離任務…",
+    });
+
+    let controller;
+    try {
+      controller = sharedSeparationCoordinator.startTask({
+        songId: song.id,
+        throttleMs: 180,
+        cooldownMs: 80,
+        onProgress: (event) => {
+          if (event.stage === "cancelling") {
+            patchSongMetadataOnly(song.id, {
+              separationStatus: "cancelling",
+              separationStage: "cancelling",
+              separationMessage: event.message,
+            });
+            return;
+          }
+          if (event.stage === "cancelled") {
+            const restoredSource =
+              stableSnapshot.playbackSource === "stems" && (sessionRef.current.songs.find((s) => s.id === song.id)?.stemIds.length ?? 0) > 0
+                ? "stems"
+                : "original";
+            patchSongMetadataOnly(song.id, {
+              separationStatus: "cancelled",
+              separationStage: "cancelled",
+              separationProgress: 0,
+              playbackSource: restoredSource,
+              separationMessage: event.message,
+            });
+            return;
+          }
+          if (event.stage === "preparing" || event.stage === "downloading" || event.stage === "processing") {
+            patchSongMetadataOnly(song.id, {
+              separationStatus: "processing",
+              separationStage: event.stage,
+              separationProgress: event.progress,
+              separationMessage: event.message,
+            });
+          }
+        },
+      });
+    } catch (error) {
+      patchSongMetadataOnly(song.id, {
+        separationStatus: stableSnapshot.separationStatus,
+        separationMessage: error instanceof Error ? error.message : "目前無法啟動分離任務。",
+      });
+      return;
+    }
+
     const token = Symbol(song.id);
     separationTokensRef.current.set(song.id, token);
-    updateSong(song.id, { separationStatus: "processing", separationMode: mode, separationProgress: 0, separationMessage: "正在計算歌曲指紋…" });
+
     try {
-      const sourceAudioHash = await hashSourceAudio(file);
-      const cacheKey = createSeparationCacheKey({ sourceAudioHash, modelVersion: DEMUCS_MODEL_VERSION, separationMode: mode, processingVersion: SEPARATION_PROCESSING_VERSION });
-      let stems = await getCachedStemSet(cacheKey).catch(() => null);
+      let stems = preCached;
       let message = "已從本機快取載入分離結果。";
       if (!stems) {
         const result = await separateAudio(file, {
           mode,
-          onStatus: (separationMessage) => updateSong(song.id, { separationMessage }),
-          onDownloadProgress: (progress) => updateSong(song.id, {
-            separationProgress: progress > 0 && progress < 1 ? progress : 0,
-            separationMessage: progress > 0 ? `模型下載 ${Math.round(progress * 100)}%` : "模型下載與準備中…",
-          }),
-          onProgress: (progress, current, total) => updateSong(song.id, {
-            separationProgress: progress,
-            separationMessage: `分離片段 ${current}/${total}`,
-          }),
+          controller,
+          allowOverBudgetNetwork,
+          maxThreads,
         });
+        sharedPerfTelemetry.recordSeparationDuration(result.durationMs);
+        controller.throwIfAborted();
         stems = result.stems;
-        updateSong(song.id, { separationProgress: 0, separationMessage: "正在寫入本機快取…" });
-        message = `分離完成（${result.backend === "webgpu" ? "WebGPU" : "WASM"}）。`;
+        controller.updateProgress("processing", 0.98, "正在驗證並寫入本機分離快取…");
+        message = `分離完成（${result.backend === "webgpu" ? "WebGPU" : "WASM"}${result.usedWorker ? " · Worker" : ""}）。`;
         try {
-          await putCachedStemSet(createStemCacheRecord({ key: cacheKey, sourceAudioHash, modelVersion: DEMUCS_MODEL_VERSION, processingVersion: SEPARATION_PROCESSING_VERSION, stems }));
+          controller.throwIfAborted();
+          await putCachedStemSet(createStemCacheRecord({
+            key: cacheKey,
+            sourceAudioHash,
+            modelVersion: DEMUCS_MODEL_VERSION,
+            processingVersion: SEPARATION_PROCESSING_VERSION,
+            stems,
+          }));
         } catch (cacheError) {
+          if (isAbortError(cacheError)) throw cacheError;
           message += ` ${cacheError instanceof Error ? cacheError.message : "結果無法持久快取。"}`;
         }
       }
-      if (separationTokensRef.current.get(song.id) !== token) return;
+
+      controller.throwIfAborted();
+      if (!controller.isCurrent() || removedSongIdsRef.current.has(song.id)) return;
       const latestSong = sessionRef.current.songs.find((candidate) => candidate.id === song.id);
       if (!latestSong) return;
+
+      controller.markCompleted(message);
       installStemSet(latestSong, stems, cacheKey, message);
       showCardFeedback(song.id, message);
       void refreshCacheStats();
     } catch (error) {
-      if (separationTokensRef.current.get(song.id) !== token) return;
-      updateSong(song.id, { separationStatus: "failed", separationMessage: error instanceof Error ? error.message : "音源分離失敗。" });
+      if (isAbortError(error) || controller.isCancellingOrCancelled()) {
+        await controller.cancel("已中止音源分離，已恢復操作前穩定狀態。");
+        return;
+      }
+      if (!controller.isCurrent()) return;
+      const errMsg = error instanceof Error ? error.message : "音源分離失敗。";
+      controller.markFailed(errMsg);
+      patchSongMetadataOnly(song.id, {
+        separationStatus: "failed",
+        separationStage: "failed",
+        separationProgress: 0,
+        playbackSource: stableSnapshot.playbackSource === "stems" && song.stemIds.length > 0 ? "stems" : "original",
+        separationMessage: errMsg,
+      });
     } finally {
-      if (separationTokensRef.current.get(song.id) === token) separationTokensRef.current.delete(song.id);
+      if (separationTokensRef.current.get(song.id) === token) {
+        separationTokensRef.current.delete(song.id);
+      }
     }
   };
 
@@ -1070,7 +1587,10 @@ export function BandMixer() {
   const removeSong = async (song: BandSong, deleteLocalData: boolean) => {
     removedSongIdsRef.current.add(song.id);
     separationTokensRef.current.delete(song.id);
+    sharedSeparationCoordinator.invalidateSongGeneration(song.id);
+    void sharedSeparationCoordinator.cancelTask(song.id, "歌曲已移除，中止進行中的分離任務。", 0);
     cancelPendingSongPersist(song.id);
+    persistedMetaBySongIdRef.current.delete(song.id);
     const ids = [song.sourceAudioId, ...song.stemIds];
     getEngine().stopTracks(ids);
     ids.forEach((id) => getEngine().removeTrack(id));
@@ -1283,6 +1803,11 @@ export function BandMixer() {
         />
         <div className="mixer-toolbar-actions">
           <IconActionButton
+            icon="🧹"
+            label="釋放閒置資源（卸載未播放歌曲緩衝與閒置 Worker）"
+            onClick={() => void releaseIdleResources()}
+          />
+          <IconActionButton
             icon="?"
             label="快捷鍵說明"
             pressed={showShortcuts}
@@ -1316,6 +1841,29 @@ export function BandMixer() {
         <div role="status" aria-live="polite" className="card mixer-restore-banner">
           <span className="mixer-spinner" aria-hidden="true" />
           <span>{restoringMessage || "正在恢復先前保存的歌曲…"}</span>
+        </div>
+      )}
+
+      {restoreError && (
+        <div role="alert" className="card card-error-banner">
+          <span>{restoreError}</span>
+          <button
+            type="button"
+            className="btn mixer-button"
+            style={{ padding: "4px 10px", fontSize: 12 }}
+            onClick={() => setRestoreAttempt((n) => n + 1)}
+          >
+            ↻ 重試恢復工作階段
+          </button>
+        </div>
+      )}
+
+      {idleCleanupReport && (
+        <div role="status" aria-live="polite" className="card card-warning-banner" style={{ borderColor: "rgba(56, 189, 248, 0.35)", background: "rgba(56, 189, 248, 0.08)", color: "#e0f2fe" }}>
+          <span>{idleCleanupReport}</span>
+          <button type="button" className="btn mixer-button" style={{ padding: "4px 10px", fontSize: 12 }} onClick={() => setIdleCleanupReport("")}>
+            關閉
+          </button>
         </div>
       )}
 
@@ -1364,10 +1912,15 @@ export function BandMixer() {
                 啟用持久儲存保護
               </button>
             )}
+            <button type="button" className="btn mixer-button" onClick={() => void releaseIdleResources()}>🧹 釋放閒置資源</button>
             <button type="button" className="btn mixer-button" onClick={() => void handleClearUnusedSeparationCaches()}>清除未使用快取</button>
             <button type="button" className="btn mixer-button" onClick={() => void clearAllSeparationCache()}>清理分離結果</button>
             <button type="button" className="btn mixer-button" onClick={() => void clearModelCache().then(refreshCacheStats)}>清理模型快取</button>
             <button type="button" className="btn mixer-button" onClick={() => void refreshCacheStats()}>重新整理</button>
+          </div>
+          <div className="small" style={{ opacity: 0.78, marginTop: 8 }}>
+            網路預算監測（工作階段上限 {(sharedNetworkBudgetLedger.getSnapshot().budgetBytes / (1024 * 1024)).toFixed(1)} MiB）：
+            Vercel 靜態 {(sharedNetworkBudgetLedger.getSnapshot().vercelStaticBytes / (1024 * 1024)).toFixed(1)} MiB ｜ 外部 CDN {(sharedNetworkBudgetLedger.getSnapshot().externalCdnBytes / (1024 * 1024)).toFixed(1)} MiB
           </div>
           {storageActionMsg && (
             <p role="status" className="small" style={{ color: "#38bdf8", marginTop: 8, marginBottom: 0 }}>
@@ -1478,6 +2031,9 @@ export function BandMixer() {
                 onStemChange={(id, patch) => updateStem(song, id, patch)}
                 onDownloadStem={(id) => downloadStem(song, id)}
                 onClearSongCache={() => void clearSongCache(song)}
+                onAbortSeparation={() => void abortSongSeparation(song)}
+                onRestoreSnapshot={() => restoreSongSnapshot(song)}
+                onLoadAudio={() => void ensureSongAudioReady(song)}
                 onRemove={(deleteLocalData) => void removeSong(song, deleteLocalData)}
                 onRelinkAudio={() => {
                   relinkingSongIdRef.current = song.id;
@@ -1490,6 +2046,24 @@ export function BandMixer() {
             </div>
           ))}
         </div>
+      )}
+      {guardDialog && (
+        <ResourceGuardModal
+          title={guardDialog.title}
+          subtitle={guardDialog.subtitle}
+          assessment={guardDialog.assessment}
+          networkEvaluation={guardDialog.networkEvaluation}
+          onConfirm={(choice) => {
+            const finish = guardDialog.resolve;
+            setGuardDialog(null);
+            finish(choice);
+          }}
+          onCancel={() => {
+            const finish = guardDialog.resolve;
+            setGuardDialog(null);
+            finish(null);
+          }}
+        />
       )}
     </div>
   );

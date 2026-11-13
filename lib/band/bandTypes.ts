@@ -11,7 +11,34 @@ export type TrackPlaybackMode = "fast-rate" | "pitch-preserve" | "soundtouch";
 
 export type SongTempoMode = "target-bpm" | "manual-rate";
 export type SongPlaybackSource = "original" | "stems";
-export type SeparationStatus = "not_started" | "processing" | "completed" | "failed";
+export type SeparationStatus =
+  | "not_started"
+  | "processing"
+  | "cancelling"
+  | "cancelled"
+  | "completed"
+  | "failed";
+export type SongAudioLoadState = "ready" | "unloaded" | "decoding" | "error";
+
+export type SongOperationSnapshot = {
+  snapshotId: string;
+  createdAt: number;
+  reason: string;
+  songId: string;
+  playbackSource: SongPlaybackSource;
+  separationStatus: SeparationStatus;
+  separationMode: "two_stem" | "four_stem" | null;
+  cacheKey: string | null;
+  targetBpm: number;
+  tempoMode: SongTempoMode;
+  manualRate: number;
+  fineRateOffset: number;
+  keyShiftSemitones: number;
+  masterVolume: number;
+  playheadSec: number;
+  stemChannels: StemChannel[];
+};
+
 export type SongPersistenceStatus =
   | "unsaved"
   | "saving"
@@ -66,6 +93,9 @@ export type BandSong = {
   persistenceMessage?: string;
   revision?: number;
   hasConflict?: boolean;
+  audioLoadState?: SongAudioLoadState;
+  separationStage?: string;
+  activeSnapshot?: SongOperationSnapshot | null;
 };
 
 export type BandTrack = {

@@ -1,5 +1,7 @@
 import type {
   BandSong,
+  SongAudioLoadState,
+  SongOperationSnapshot,
   SongPlaybackSource,
   SongPersistenceStatus,
   SongTempoMode,
@@ -71,6 +73,7 @@ type CreateBandSongInput = {
   persistenceStatus?: SongPersistenceStatus;
   persistenceMessage?: string;
   revision?: number;
+  audioLoadState?: SongAudioLoadState;
 };
 
 export function createBandSong(input: CreateBandSongInput): BandSong {
@@ -110,6 +113,8 @@ export function createBandSong(input: CreateBandSongInput): BandSong {
     persistenceMessage: input.persistenceMessage ?? "",
     revision: input.revision ?? 0,
     hasConflict: false,
+    audioLoadState: input.audioLoadState ?? "ready",
+    activeSnapshot: null,
   };
 }
 
@@ -238,6 +243,7 @@ export function restoreBandSongFromRecord(
     durationSec?: number;
     persistenceStatus?: SongPersistenceStatus;
     persistenceMessage?: string;
+    audioLoadState?: SongAudioLoadState;
   },
 ): BandSong {
   const duration = options?.durationSec ?? record.durationSec ?? 0;
@@ -258,6 +264,7 @@ export function restoreBandSongFromRecord(
     persistenceStatus: options?.persistenceStatus ?? "saved",
     persistenceMessage: options?.persistenceMessage ?? "",
     revision: record.revision,
+    audioLoadState: options?.audioLoadState ?? "ready",
   });
 
   const restoredChannels: StemChannel[] = Array.isArray(record.stemChannels)
@@ -321,15 +328,72 @@ export function findUnreferencedAudioKeys(
   return audioKeys.filter((key) => !referenced.has(key));
 }
 
+export function createSongOperationSnapshot(
+  song: BandSong,
+  reason = "執行高負載操作前快照",
+): SongOperationSnapshot {
+  return {
+    snapshotId: `snap_${song.id}_${Date.now()}`,
+    createdAt: Date.now(),
+    reason,
+    songId: song.id,
+    playbackSource: song.playbackSource,
+    separationStatus: song.separationStatus === "processing" || song.separationStatus === "cancelling"
+      ? (song.cacheKey ? "completed" : "not_started")
+      : song.separationStatus,
+    separationMode: song.separationMode,
+    cacheKey: song.cacheKey,
+    targetBpm: song.targetBpm,
+    tempoMode: song.tempoMode,
+    manualRate: song.manualRate,
+    fineRateOffset: song.fineRateOffset,
+    keyShiftSemitones: song.keyShiftSemitones,
+    masterVolume: song.masterVolume,
+    playheadSec: song.playheadSec,
+    stemChannels: song.stemChannels.map((ch) => ({ ...ch })),
+  };
+}
+
+export function applySongOperationSnapshot(
+  song: BandSong,
+  snapshot: SongOperationSnapshot,
+): BandSong {
+  if (snapshot.songId !== song.id) return song;
+  const restoredSource: SongPlaybackSource =
+    snapshot.playbackSource === "stems" && song.stemIds.length > 0 ? "stems" : "original";
+  return {
+    ...song,
+    playbackSource: restoredSource,
+    separationStatus: snapshot.separationStatus,
+    separationMode: snapshot.separationMode,
+    cacheKey: snapshot.cacheKey,
+    targetBpm: snapshot.targetBpm,
+    tempoMode: snapshot.tempoMode,
+    manualRate: snapshot.manualRate,
+    fineRateOffset: snapshot.fineRateOffset,
+    keyShiftSemitones: snapshot.keyShiftSemitones,
+    masterVolume: snapshot.masterVolume,
+    playheadSec: snapshot.playheadSec,
+    stemChannels: snapshot.stemChannels.map((ch) => ({ ...ch })),
+    separationProgress: 0,
+    separationStage: "idle",
+  };
+}
+
 export function findUnusedSeparationRecordKeys(
   separations: ReadonlyArray<{ key: string; sourceAudioHash: string }>,
-  activeSongs: ReadonlyArray<{ sourceAudioHash?: string | null; cacheKey?: string | null }>,
+  activeSongs: ReadonlyArray<{
+    sourceAudioHash?: string | null;
+    cacheKey?: string | null;
+    activeSnapshot?: { cacheKey?: string | null } | null;
+  }>,
 ): string[] {
   const activeHashes = new Set<string>();
   const activeCacheKeys = new Set<string>();
   for (const song of activeSongs) {
     if (song.sourceAudioHash) activeHashes.add(song.sourceAudioHash);
     if (song.cacheKey) activeCacheKeys.add(song.cacheKey);
+    if (song.activeSnapshot?.cacheKey) activeCacheKeys.add(song.activeSnapshot.cacheKey);
   }
   return separations
     .filter((record) => !activeHashes.has(record.sourceAudioHash) && !activeCacheKeys.has(record.key))

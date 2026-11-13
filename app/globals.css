@@ -500,6 +500,12 @@ hr { border: none; border-top: 1px solid var(--line); margin: 16px 0; }
 }
 
 .song-storage-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 102px;
+  white-space: nowrap;
+  text-align: center;
   font-size: 11px;
   font-weight: 600;
   padding: 2px 8px;
@@ -707,8 +713,131 @@ hr { border: none; border-top: 1px solid var(--line); margin: 16px 0; }
   font-family: inherit;
 }
 
+.mixer-separation-active-panel {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(56, 189, 248, 0.25);
+  background: rgba(15, 23, 42, 0.65);
+}
+
+.mixer-abort-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 40px;
+  min-width: 104px;
+  padding: 8px 14px;
+  border-radius: 10px;
+  border: 1px solid rgba(248, 113, 113, 0.6);
+  background: rgba(239, 68, 68, 0.18);
+  color: #fecaca;
+  font-weight: 600;
+  font-size: 13px;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: transform 110ms ease, background-color 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.mixer-abort-button:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.3);
+  border-color: rgba(248, 113, 113, 0.9);
+}
+
+.mixer-abort-button:active:not(:disabled) {
+  transform: scale(0.97);
+  background: rgba(239, 68, 68, 0.38);
+}
+
+.mixer-abort-button:focus-visible {
+  outline: 2px solid #fca5a5;
+  outline-offset: 2px;
+}
+
+.mixer-abort-button:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+.mixer-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  background: rgba(2, 6, 23, 0.78);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+
+.mixer-modal-panel {
+  width: min(560px, 100%);
+  max-height: 88dvh;
+  overflow-y: auto;
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.65);
+}
+
+.mixer-modal-section {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.65);
+  border: 1px solid rgba(148, 163, 184, 0.16);
+}
+
+.mixer-modal-section.is-network {
+  border-color: rgba(56, 189, 248, 0.32);
+}
+
+.mixer-modal-list {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 4px;
+}
+
+.mixer-cap-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 4px 12px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(148, 163, 184, 0.14);
+  opacity: 0.78;
+}
+
+.mixer-modal-option {
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(30, 41, 59, 0.45);
+  cursor: pointer;
+}
+
+.mixer-modal-option input[type="checkbox"] {
+  margin-top: 2px;
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+}
+
+.mixer-modal-actions {
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mixer-modal-actions .btn {
+  min-height: 40px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .mixer-button,
+  .mixer-abort-button,
   .action-tooltip,
   .mixer-range::-webkit-slider-thumb,
   .mixer-range::-moz-range-thumb,

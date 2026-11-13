@@ -134,6 +134,32 @@ export function prepareModelInput(leftChannel, rightChannel) {
   return { waveform, magSpec, numBins, numFrames, originalLength: leftChannel.length };
 }
 
+function createAbortError(message = 'Operation aborted') {
+  const err = new Error(message);
+  err.name = 'AbortError';
+  return err;
+}
+
+function throwIfAborted(signal) {
+  if (signal && signal.aborted) {
+    throw createAbortError('音源分離已取消');
+  }
+}
+
+function yieldToEventLoop() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function safeDisposeTensor(tensor) {
+  try {
+    if (tensor && typeof tensor.dispose === 'function') {
+      tensor.dispose();
+    }
+  } catch {
+    // ignore tensor dispose errors during cleanup
+  }
+}
+
 /**
  * Main Demucs processor class
  */
@@ -148,18 +174,23 @@ export class DemucsProcessor {
     this.onDownloadProgress = options.onDownloadProgress || (() => {});
   }
 
-  async loadModel(modelPathOrBuffer) {
+  async loadModel(modelPathOrBuffer, options = {}) {
     if (!this.ort) {
       throw new Error('ONNX Runtime not provided. Pass ort in constructor options.');
     }
 
+    const signal = options?.signal;
+    throwIfAborted(signal);
     this.onLog('model', 'Loading model...');
 
     let modelBuffer;
     if (modelPathOrBuffer instanceof ArrayBuffer) {
       modelBuffer = modelPathOrBuffer;
     } else {
-      const response = await fetch(modelPathOrBuffer || this.modelPath);
+      const response = await fetch(modelPathOrBuffer || this.modelPath, { signal });
+      if (!response.ok) {
+        throw new Error(`模型載入失敗 (${response.status})`);
+      }
 
       // Check if we can track progress
       const contentLength = response.headers.get('Content-Length');
@@ -169,12 +200,25 @@ export class DemucsProcessor {
         const chunks = [];
         let loadedSize = 0;
 
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          chunks.push(value);
-          loadedSize += value.length;
-          this.onDownloadProgress(loadedSize, totalSize);
+        try {
+          while (true) {
+            if (signal?.aborted) {
+              try { await reader.cancel(); } catch {}
+              chunks.length = 0;
+              throw createAbortError('模型下載已取消');
+            }
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value) {
+              chunks.push(value);
+              loadedSize += value.length;
+              this.onDownloadProgress(loadedSize, totalSize);
+            }
+          }
+        } finally {
+          if (signal?.aborted) {
+            chunks.length = 0;
+          }
         }
 
         // Combine chunks into single ArrayBuffer
@@ -184,6 +228,7 @@ export class DemucsProcessor {
           combined.set(chunk, offset);
           offset += chunk.length;
         }
+        chunks.length = 0;
         modelBuffer = combined.buffer;
       } else {
         // Fallback: no progress tracking
@@ -191,162 +236,218 @@ export class DemucsProcessor {
       }
     }
 
+    throwIfAborted(signal);
+
     const defaultSessionOptions = {
       executionProviders: ['webgpu', 'wasm'],
       graphOptimizationLevel: 'basic'
     };
 
-    this.session = await this.ort.InferenceSession.create(modelBuffer, {
+    const session = await this.ort.InferenceSession.create(modelBuffer, {
       ...defaultSessionOptions,
       ...this.sessionOptions
     });
+    modelBuffer = null;
 
+    if (signal?.aborted) {
+      try {
+        if (session && typeof session.release === 'function') {
+          await session.release();
+        }
+      } catch {}
+      throw createAbortError('模型初始化已取消');
+    }
+
+    this.session = session;
     this.onLog('model', 'Model loaded successfully');
     return this.session;
   }
 
-  async separate(leftChannel, rightChannel) {
+  async disposeSession() {
+    const current = this.session;
+    this.session = null;
+    if (current && typeof current.release === 'function') {
+      try {
+        await current.release();
+      } catch {}
+    }
+  }
+
+  async separate(leftChannel, rightChannel, options = {}) {
     if (!this.session) {
       throw new Error('Model not loaded. Call loadModel() first.');
     }
 
+    const signal = options?.signal;
+    throwIfAborted(signal);
+
     const totalSamples = leftChannel.length;
     const stride = Math.floor(TRAINING_SAMPLES * (1 - SEGMENT_OVERLAP));
-    const numSegments = Math.ceil((totalSamples - TRAINING_SAMPLES) / stride) + 1;
+    const numSegments = Math.max(1, Math.ceil((totalSamples - TRAINING_SAMPLES) / stride) + 1);
 
-    const outputs = TRACKS.map(() => ({
+    let outputs = TRACKS.map(() => ({
       left: new Float32Array(totalSamples),
       right: new Float32Array(totalSamples)
     }));
-    const weights = new Float32Array(totalSamples);
+    let weights = new Float32Array(totalSamples);
 
     let segmentIdx = 0;
 
-    for (let start = 0; start < totalSamples; start += stride) {
-      const end = Math.min(start + TRAINING_SAMPLES, totalSamples);
-      const segmentLength = end - start;
+    try {
+      for (let start = 0; start < totalSamples; start += stride) {
+        throwIfAborted(signal);
 
-      const segLeft = new Float32Array(TRAINING_SAMPLES);
-      const segRight = new Float32Array(TRAINING_SAMPLES);
+        const end = Math.min(start + TRAINING_SAMPLES, totalSamples);
+        const segmentLength = end - start;
 
-      for (let i = 0; i < segmentLength; i++) {
-        segLeft[i] = leftChannel[start + i];
-        segRight[i] = rightChannel[start + i];
-      }
+        const segLeft = new Float32Array(TRAINING_SAMPLES);
+        const segRight = new Float32Array(TRAINING_SAMPLES);
 
-      const input = prepareModelInput(segLeft, segRight);
-
-      const waveformTensor = new this.ort.Tensor('float32', input.waveform, [1, 2, TRAINING_SAMPLES]);
-      const magSpecTensor = new this.ort.Tensor('float32', input.magSpec, [1, 4, MODEL_SPEC_BINS, MODEL_SPEC_FRAMES]);
-
-      const feeds = {};
-      feeds[this.session.inputNames[0]] = waveformTensor;
-      if (this.session.inputNames.length > 1) {
-        feeds[this.session.inputNames[1]] = magSpecTensor;
-      }
-
-      const inferResults = await this.session.run(feeds);
-
-      let timeData = null, timeShape = null;
-      let freqData = null;
-
-      for (const name of this.session.outputNames) {
-        const tensor = inferResults[name];
-        if (tensor.dims.length === 4 && tensor.dims[2] === 2) {
-          timeData = tensor.data;
-          timeShape = tensor.dims;
-        } else if (tensor.dims.length === 5 && tensor.dims[2] === 4) {
-          freqData = tensor.data;
+        for (let i = 0; i < segmentLength; i++) {
+          segLeft[i] = leftChannel[start + i];
+          segRight[i] = rightChannel[start + i];
         }
-      }
 
-      if (!timeData) {
-        throw new Error('Could not find time-domain output tensor');
-      }
+        const input = prepareModelInput(segLeft, segRight);
+        throwIfAborted(signal);
 
-      let combinedOutputs = null;
-      if (freqData) {
-        const trackSpecs = standaloneMask(freqData);
-        combinedOutputs = [];
+        const waveformTensor = new this.ort.Tensor('float32', input.waveform, [1, 2, TRAINING_SAMPLES]);
+        const magSpecTensor = new this.ort.Tensor('float32', input.magSpec, [1, 4, MODEL_SPEC_BINS, MODEL_SPEC_FRAMES]);
 
-        for (let t = 0; t < 4; t++) {
-          const freqOutput = standaloneIspec(trackSpecs[t], TRAINING_SAMPLES);
+        const feeds = {};
+        feeds[this.session.inputNames[0]] = waveformTensor;
+        if (this.session.inputNames.length > 1) {
+          feeds[this.session.inputNames[1]] = magSpecTensor;
+        }
+
+        let inferResults = null;
+        try {
+          inferResults = await this.session.run(feeds);
+          throwIfAborted(signal);
+
+          let timeData = null, timeShape = null;
+          let freqData = null;
+
+          for (const name of this.session.outputNames) {
+            const tensor = inferResults[name];
+            if (tensor.dims.length === 4 && tensor.dims[2] === 2) {
+              timeData = tensor.data;
+              timeShape = tensor.dims;
+            } else if (tensor.dims.length === 5 && tensor.dims[2] === 4) {
+              freqData = tensor.data;
+            }
+          }
+
+          if (!timeData) {
+            throw new Error('Could not find time-domain output tensor');
+          }
+
+          let combinedOutputs = null;
+          if (freqData) {
+            const trackSpecs = standaloneMask(freqData);
+            combinedOutputs = [];
+
+            for (let t = 0; t < 4; t++) {
+              throwIfAborted(signal);
+              const freqOutput = standaloneIspec(trackSpecs[t], TRAINING_SAMPLES);
+              const numChannels = timeShape[2];
+              const samples = timeShape[3];
+              const timeLeft = new Float32Array(samples);
+              const timeRight = new Float32Array(samples);
+
+              for (let i = 0; i < samples; i++) {
+                timeLeft[i] = timeData[t * numChannels * samples + 0 * samples + i];
+                timeRight[i] = timeData[t * numChannels * samples + 1 * samples + i];
+              }
+
+              const combined = {
+                left: new Float32Array(samples),
+                right: new Float32Array(samples)
+              };
+              for (let i = 0; i < samples; i++) {
+                combined.left[i] = timeLeft[i] + (freqOutput.left[i] || 0);
+                combined.right[i] = timeRight[i] + (freqOutput.right[i] || 0);
+              }
+              combinedOutputs.push(combined);
+            }
+          }
+
+          const numTracks = timeShape[1];
           const numChannels = timeShape[2];
           const samples = timeShape[3];
-          const timeLeft = new Float32Array(samples);
-          const timeRight = new Float32Array(samples);
 
-          for (let i = 0; i < samples; i++) {
-            timeLeft[i] = timeData[t * numChannels * samples + 0 * samples + i];
-            timeRight[i] = timeData[t * numChannels * samples + 1 * samples + i];
+          const overlapWindow = new Float32Array(segmentLength);
+          for (let i = 0; i < segmentLength; i++) {
+            const fadeIn = Math.min(i / (stride * 0.5), 1);
+            const fadeOut = Math.min((segmentLength - i) / (stride * 0.5), 1);
+            overlapWindow[i] = Math.min(fadeIn, fadeOut);
           }
 
-          const combined = {
-            left: new Float32Array(samples),
-            right: new Float32Array(samples)
-          };
-          for (let i = 0; i < samples; i++) {
-            combined.left[i] = timeLeft[i] + (freqOutput.left[i] || 0);
-            combined.right[i] = timeRight[i] + (freqOutput.right[i] || 0);
+          for (let t = 0; t < numTracks; t++) {
+            for (let i = 0; i < segmentLength && start + i < totalSamples; i++) {
+              let leftVal, rightVal;
+              if (combinedOutputs) {
+                leftVal = combinedOutputs[t].left[i];
+                rightVal = combinedOutputs[t].right[i];
+              } else {
+                const leftIdx = t * numChannels * samples + 0 * samples + i;
+                const rightIdx = t * numChannels * samples + 1 * samples + i;
+                leftVal = timeData[leftIdx];
+                rightVal = timeData[rightIdx];
+              }
+              outputs[t].left[start + i] += leftVal * overlapWindow[i];
+              outputs[t].right[start + i] += rightVal * overlapWindow[i];
+            }
           }
-          combinedOutputs.push(combined);
+
+          for (let i = 0; i < segmentLength && start + i < totalSamples; i++) {
+            weights[start + i] += overlapWindow[i];
+          }
+          combinedOutputs = null;
+        } finally {
+          safeDisposeTensor(waveformTensor);
+          safeDisposeTensor(magSpecTensor);
+          if (inferResults) {
+            for (const tensor of Object.values(inferResults)) {
+              safeDisposeTensor(tensor);
+            }
+            inferResults = null;
+          }
         }
+
+        segmentIdx++;
+        this.onProgress({
+          progress: segmentIdx / numSegments,
+          currentSegment: segmentIdx,
+          totalSegments: numSegments
+        });
+
+        await yieldToEventLoop();
       }
 
-      const numTracks = timeShape[1];
-      const numChannels = timeShape[2];
-      const samples = timeShape[3];
+      throwIfAborted(signal);
 
-      const overlapWindow = new Float32Array(segmentLength);
-      for (let i = 0; i < segmentLength; i++) {
-        const fadeIn = Math.min(i / (stride * 0.5), 1);
-        const fadeOut = Math.min((segmentLength - i) / (stride * 0.5), 1);
-        overlapWindow[i] = Math.min(fadeIn, fadeOut);
-      }
-
-      for (let t = 0; t < numTracks; t++) {
-        for (let i = 0; i < segmentLength && start + i < totalSamples; i++) {
-          let leftVal, rightVal;
-          if (combinedOutputs) {
-            leftVal = combinedOutputs[t].left[i];
-            rightVal = combinedOutputs[t].right[i];
-          } else {
-            const leftIdx = t * numChannels * samples + 0 * samples + i;
-            const rightIdx = t * numChannels * samples + 1 * samples + i;
-            leftVal = timeData[leftIdx];
-            rightVal = timeData[rightIdx];
+      for (let t = 0; t < TRACKS.length; t++) {
+        for (let i = 0; i < totalSamples; i++) {
+          if (weights[i] > 0) {
+            outputs[t].left[i] /= weights[i];
+            outputs[t].right[i] /= weights[i];
           }
-          outputs[t].left[start + i] += leftVal * overlapWindow[i];
-          outputs[t].right[start + i] += rightVal * overlapWindow[i];
         }
+        await yieldToEventLoop();
+        throwIfAborted(signal);
       }
 
-      for (let i = 0; i < segmentLength && start + i < totalSamples; i++) {
-        weights[start + i] += overlapWindow[i];
-      }
-
-      segmentIdx++;
-      this.onProgress({
-        progress: segmentIdx / numSegments,
-        currentSegment: segmentIdx,
-        totalSegments: numSegments
-      });
+      return {
+        drums: outputs[0],
+        bass: outputs[1],
+        other: outputs[2],
+        vocals: outputs[3]
+      };
+    } catch (error) {
+      outputs = null;
+      weights = null;
+      throw error;
     }
-
-    for (let t = 0; t < TRACKS.length; t++) {
-      for (let i = 0; i < totalSamples; i++) {
-        if (weights[i] > 0) {
-          outputs[t].left[i] /= weights[i];
-          outputs[t].right[i] /= weights[i];
-        }
-      }
-    }
-
-    return {
-      drums: outputs[0],
-      bass: outputs[1],
-      other: outputs[2],
-      vocals: outputs[3]
-    };
   }
 }
