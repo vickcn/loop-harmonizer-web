@@ -13,7 +13,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "test": "node --experimental-strip-types --test spec/demucs-separation.spec.mjs spec/stem-sync.spec.mjs spec/global-playback-controls.spec.mjs spec/soundtouch-processing.spec.mjs spec/song-mixer.spec.mjs",
+    "test": "node --experimental-strip-types --test spec/demucs-separation.spec.mjs spec/stem-sync.spec.mjs spec/global-playback-controls.spec.mjs spec/soundtouch-processing.spec.mjs spec/song-mixer.spec.mjs spec/mixer-shortcuts.spec.mjs spec/song-persistence.spec.mjs",
     "click:test": "node scripts/render-metronome-click.mjs"
   },
   "dependencies": {

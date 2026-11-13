@@ -6,6 +6,7 @@ import {
   getEffectivePlaybackRate,
   getSongPlaybackTrackIds,
   getStemAudibility,
+  reorderSongList,
   serializeSongSettings,
 } from "../lib/band/songModel.ts";
 import {
@@ -165,4 +166,22 @@ test("separation cache record round-trips PCM without sharing mutable arrays", (
   assert.ok(Math.abs(restored.tracks[0].left[0] - 0.1) < 0.000001);
   assert.ok(Math.abs(restored.tracks[0].left[1] - 0.2) < 0.000001);
   assert.notEqual(restored.tracks[0].left.buffer, stems.tracks[0].left.buffer);
+});
+
+test("reorderSongList moves targeted song to expected position safely", () => {
+  const songs = [{ id: "s1" }, { id: "s2" }, { id: "s3" }, { id: "s4" }];
+  // 從第 0 位移動到第 2 位
+  assert.deepEqual(
+    reorderSongList(songs, "s1", "s3").map((s) => s.id),
+    ["s2", "s3", "s1", "s4"],
+  );
+  // 從第 3 位移動到第 1 位
+  assert.deepEqual(
+    reorderSongList(songs, "s4", "s2").map((s) => s.id),
+    ["s1", "s4", "s2", "s3"],
+  );
+  // 相同 ID 不變
+  assert.deepEqual(reorderSongList(songs, "s2", "s2"), songs);
+  // 不存在的 ID 不變
+  assert.deepEqual(reorderSongList(songs, "not_exist", "s2"), songs);
 });

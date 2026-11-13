@@ -4,9 +4,20 @@ import { restoreStemSet, type StemCacheRecord } from "./separationCacheRecord";
 export { createStemCacheRecord, restoreStemSet } from "./separationCacheRecord";
 export type { StemCacheRecord } from "./separationCacheRecord";
 
-export async function hashSourceAudio(file: File): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
-  return [...new Uint8Array(digest)].map((value) => value.toString(16).padStart(2, "0")).join("");
+export async function hashSourceAudio(file: Blob): Promise<string> {
+  const buf = await file.arrayBuffer();
+  if (typeof crypto !== "undefined" && crypto.subtle?.digest) {
+    const digest = await crypto.subtle.digest("SHA-256", buf);
+    return [...new Uint8Array(digest)].map((value) => value.toString(16).padStart(2, "0")).join("");
+  }
+  const bytes = new Uint8Array(buf);
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b9;
+  for (let i = 0; i < bytes.length; i += 1) {
+    h1 = Math.imul(h1 ^ bytes[i], 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ bytes[i], 0x85ebca6b) >>> 0;
+  }
+  return `fallback-${bytes.length}-${h1.toString(16).padStart(8, "0")}${h2.toString(16).padStart(8, "0")}`;
 }
 
 export async function getCachedStemSet(key: string): Promise<SeparatedStemSet | null> {

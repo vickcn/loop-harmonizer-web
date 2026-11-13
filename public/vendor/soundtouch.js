@@ -639,6 +639,19 @@ class SoundTouch {
     }
   }
   process() {
+    if (Math.abs(this._tempo - 1.0) < 1e-6 && Math.abs(this._rate - 1.0) < 1e-6) {
+      const frames = this._inputBuffer.frameCount;
+      if (frames > 0) {
+        this._outputBuffer.putBuffer(this._inputBuffer, 0, frames);
+        this._inputBuffer.receive(frames);
+      }
+      if (this._intermediateBuffer.frameCount > 0) {
+        this._intermediateBuffer.clear();
+      }
+      this.stretch.clearMidBuffer();
+      this.transposer.reset();
+      return;
+    }
     if (this._rate > 1.0) {
       this.stretch.process();
       this.transposer.process();
@@ -665,14 +678,22 @@ class WebAudioBufferSource {
   }
   extract(target, numFrames = 0, position = 0) {
     this.position = position;
+    if (typeof this.buffer.extract === 'function') {
+      return this.buffer.extract(target, numFrames, position);
+    }
     let left = this.buffer.getChannelData(0);
     let right = this.dualChannel ? this.buffer.getChannelData(1) : this.buffer.getChannelData(0);
+    const available = Math.max(0, Math.min(numFrames, left.length - position));
     let i = 0;
-    for (; i < numFrames; i++) {
+    for (; i < available; i++) {
       target[i * 2] = left[i + position];
       target[i * 2 + 1] = right[i + position];
     }
-    return Math.min(numFrames, left.length - position);
+    for (; i < numFrames; i++) {
+      target[i * 2] = 0;
+      target[i * 2 + 1] = 0;
+    }
+    return available;
   }
 }
 
@@ -691,6 +712,10 @@ const getWebAudioNode = function (context, filter, sourcePositionCallback = noop
     for (; i < framesExtracted; i++) {
       left[i] = samples[i * 2];
       right[i] = samples[i * 2 + 1];
+    }
+    for (; i < bufferSize; i++) {
+      left[i] = 0;
+      right[i] = 0;
     }
   };
   return node;
@@ -711,8 +736,8 @@ const onUpdate = function (sourcePosition) {
   const currentTimePlayed = this.timePlayed;
   const sampleRate = this.sampleRate;
   this.sourcePosition = sourcePosition;
-  this.timePlayed = sourcePosition / sampleRate;
-  if (currentTimePlayed !== this.timePlayed) {
+  this.timePlayed = sampleRate > 0 ? sourcePosition / sampleRate : 0;
+  if (this.listeners.length > 0 && currentTimePlayed !== this.timePlayed) {
     const timePlayed = new CustomEvent('play', {
       detail: {
         timePlayed: this.timePlayed,
@@ -726,16 +751,20 @@ const onUpdate = function (sourcePosition) {
 class PitchShifter {
   constructor(context, buffer, bufferSize, onEnd = noop) {
     this._soundtouch = new SoundTouch();
+    this._bufferLength = buffer.length || Math.round((buffer.duration || 0) * context.sampleRate);
+    this._bufferSampleRate = buffer.sampleRate || context.sampleRate;
+    this._sampleRateRatio = context.sampleRate > 0 ? this._bufferSampleRate / context.sampleRate : 1;
+    this._soundtouch.stretch.setParameters(context.sampleRate, 0, 0, 8);
     const source = new WebAudioBufferSource(buffer);
     this.timePlayed = 0;
     this.sourcePosition = 0;
     this._filter = new SimpleFilter(source, this._soundtouch, onEnd);
+    this.duration = buffer.duration;
+    this.sampleRate = this._bufferSampleRate;
+    this.listeners = [];
     this._node = getWebAudioNode(context, this._filter, sourcePostion => onUpdate.call(this, sourcePostion), bufferSize);
     this.tempo = 1;
     this.rate = 1;
-    this.duration = buffer.duration;
-    this.sampleRate = context.sampleRate;
-    this.listeners = [];
   }
   get formattedDuration() {
     return minsSecs(this.duration);
@@ -744,12 +773,12 @@ class PitchShifter {
     return minsSecs(this.timePlayed);
   }
   get percentagePlayed() {
-    return 100 * this._filter.sourcePosition / (this.duration * this.sampleRate);
+    return this._bufferLength > 0 ? 100 * this._filter.sourcePosition / this._bufferLength : 0;
   }
   set percentagePlayed(perc) {
-    this._filter.sourcePosition = parseInt(perc * this.duration * this.sampleRate);
+    this._filter.sourcePosition = Math.round(perc * this._bufferLength);
     this.sourcePosition = this._filter.sourcePosition;
-    this.timePlayed = this.sourcePosition / this.sampleRate;
+    this.timePlayed = this.sampleRate > 0 ? this.sourcePosition / this.sampleRate : 0;
   }
   get node() {
     return this._node;
@@ -761,7 +790,7 @@ class PitchShifter {
     this._soundtouch.pitchSemitones = semitone;
   }
   set rate(rate) {
-    this._soundtouch.rate = rate;
+    this._soundtouch.rate = rate * this._sampleRateRatio;
   }
   set tempo(tempo) {
     this._soundtouch.tempo = tempo;

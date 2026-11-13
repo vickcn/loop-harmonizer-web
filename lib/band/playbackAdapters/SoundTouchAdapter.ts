@@ -9,10 +9,19 @@ type SoundTouchShifter = {
   disconnect: () => void;
 };
 
+export type SoundTouchBufferLike = {
+  numberOfChannels: number;
+  length: number;
+  sampleRate: number;
+  duration: number;
+  getChannelData: (channel: number) => Float32Array;
+  extract?: (target: Float32Array, numFrames: number, position: number) => number;
+};
+
 type SoundTouchModule = {
   PitchShifter: new (
     context: AudioContext,
-    buffer: AudioBuffer,
+    buffer: SoundTouchBufferLike,
     bufferSize: number,
     onEnd: () => void,
   ) => SoundTouchShifter;
@@ -39,7 +48,7 @@ export class SoundTouchAdapter implements TrackPlaybackAdapter {
   readonly playbackMode: AdapterPlaybackMode = "soundtouch";
   onEnded: (() => void) | null = null;
 
-  private buffer: AudioBuffer | null = null;
+  private buffer: SoundTouchBufferLike | null = null;
   private gainNode: GainNode | null = null;
   private ctx: AudioContext | null = null;
   private shifter: SoundTouchShifter | null = null;
@@ -50,7 +59,7 @@ export class SoundTouchAdapter implements TrackPlaybackAdapter {
   private playing = false;
   private playToken = 0;
 
-  load(buffer: AudioBuffer, gainNode: GainNode, ctx: AudioContext): void {
+  load(buffer: SoundTouchBufferLike, gainNode: GainNode, ctx: AudioContext): void {
     this.dispose();
     this.buffer = buffer;
     this.gainNode = gainNode;

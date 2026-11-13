@@ -1,6 +1,6 @@
 export const DEMUCS_MODEL_ID = "demucs-htdemucs";
 export const DEMUCS_MODEL_VERSION = "browser-demucs-v1";
-export const SEPARATION_PROCESSING_VERSION = "loop-harmonizer-stems-v1";
+export const SEPARATION_PROCESSING_VERSION = "loop-harmonizer-stems-v2";
 
 export function createSeparationCacheKey(input: {
   sourceAudioHash: string;

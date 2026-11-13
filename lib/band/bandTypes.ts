@@ -12,6 +12,14 @@ export type TrackPlaybackMode = "fast-rate" | "pitch-preserve" | "soundtouch";
 export type SongTempoMode = "target-bpm" | "manual-rate";
 export type SongPlaybackSource = "original" | "stems";
 export type SeparationStatus = "not_started" | "processing" | "completed" | "failed";
+export type SongPersistenceStatus =
+  | "unsaved"
+  | "saving"
+  | "saved"
+  | "error"
+  | "restoring"
+  | "missing_audio"
+  | "conflict";
 
 export type StemChannel = {
   id: string;
@@ -39,6 +47,7 @@ export type BandSong = {
   durationSec: number;
   status: TrackStatus;
   loop: boolean;
+  muted?: boolean;
   selected: boolean;
   sourceAudioId: string;
   stemIds: string[];
@@ -49,6 +58,14 @@ export type BandSong = {
   separationMessage: string;
   playbackSource: SongPlaybackSource;
   cacheKey: string | null;
+  sourceAudioHash?: string | null;
+  fileSizeBytes?: number;
+  mimeType?: string;
+  fileLastModified?: number;
+  persistenceStatus?: SongPersistenceStatus;
+  persistenceMessage?: string;
+  revision?: number;
+  hasConflict?: boolean;
 };
 
 export type BandTrack = {

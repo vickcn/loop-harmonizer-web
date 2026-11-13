@@ -102,7 +102,58 @@ async function loadRuntime(): Promise<Runtime> {
   return runtimePromise;
 }
 
+function computeRms(data: Float32Array): number {
+  if (data.length === 0) return 0;
+  let sumSq = 0;
+  for (let i = 0; i < data.length; i += 1) {
+    const v = data[i];
+    sumSq += v * v;
+  }
+  return Math.sqrt(sumSq / data.length);
+}
+
+function validateSeparatedResult(
+  result: Awaited<ReturnType<DemucsProcessorLike["separate"]>>,
+  inputLeft: Float32Array,
+  inputRight: Float32Array,
+): void {
+  const stems = [
+    ["vocals", result.vocals],
+    ["drums", result.drums],
+    ["bass", result.bass],
+    ["other", result.other],
+  ] as const;
+
+  let combinedEnergy = 0;
+  for (const [name, stem] of stems) {
+    for (const ch of [stem.left, stem.right]) {
+      let chSumSq = 0;
+      for (let i = 0; i < ch.length; i += 1) {
+        const v = ch[i];
+        if (!Number.isFinite(v)) {
+          throw new Error(`分離輸出（${name}）包含無效數值 (NaN/Infinity)。`);
+        }
+        if (Math.abs(v) > 4.0) {
+          throw new Error(`分離輸出（${name}）峰值異常 (${Math.abs(v).toFixed(2)})。`);
+        }
+        chSumSq += v * v;
+      }
+      combinedEnergy += ch.length > 0 ? chSumSq / ch.length : 0;
+    }
+  }
+
+  const inputRms = Math.max(computeRms(inputLeft), computeRms(inputRight));
+  const combinedRms = Math.sqrt(combinedEnergy);
+  if (inputRms > 1e-4 && combinedRms < 1e-5) {
+    throw new Error("分離輸出幾乎為靜音，推論結果無效。");
+  }
+}
+
 async function pickBackend(): Promise<SeparationBackend> {
+  // Android 行動端 WebGPU 驅動差異大且可能有隱性數值問題，預設改用經實測穩定的 WASM 後端
+  if (typeof navigator !== "undefined" && /Android/i.test(navigator.userAgent)) {
+    return "wasm";
+  }
   const gpu = (navigator as Navigator & {
     gpu?: { requestAdapter?: () => Promise<unknown> };
   }).gpu;
@@ -222,6 +273,7 @@ export async function separateAudio(
         const processor = await getProcessor(runtime, backend, options);
         options.onStatus?.(`正在以 ${backend === "webgpu" ? "WebGPU" : "WASM"} 分離音源…`);
         const result = await processor.separate(decoded.left, decoded.right);
+        validateSeparatedResult(result, decoded.left, decoded.right);
         options.onStatus?.("音源分離完成。");
         return {
           backend,
