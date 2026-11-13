@@ -3,8 +3,7 @@ import { BandSession, BandTrack } from "./bandTypes";
 export function createDefaultBandSession(): BandSession {
   return {
     id: `session_${Date.now()}`,
-    globalBpm: 120,
-    tracks: [],
+    songs: [],
   };
 }
 
@@ -53,5 +52,7 @@ export async function createBandTrackFromFile(file: File): Promise<BandTrack> {
     syncMode: "manual-rate",
     loop: false,
     playbackMode: "pitch-preserve",
+    keyShiftSemitones: 0,
+    followsGlobalKey: false,
   };
 }

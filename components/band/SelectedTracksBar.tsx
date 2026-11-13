@@ -18,6 +18,7 @@ export function SelectedTracksBar({ tracks, onPlaySelected, onPauseSelected, onS
       className="card row"
       style={{ flexWrap: "wrap", gap: 12, background: disabled ? undefined : "#1a2035" }}
     >
+      <span style={{ fontWeight: 700 }}>下方音訊總播放控制</span>
       <span className="small" style={{ opacity: disabled ? 0.4 : 0.8 }}>
         已選 <strong>{count}</strong> 軌
       </span>

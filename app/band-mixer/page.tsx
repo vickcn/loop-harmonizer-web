@@ -11,8 +11,8 @@ export default function BandMixerPage() {
       </div>
 
       <header className="col-full">
-        <h1 className="title">Band Mixer M1</h1>
-        <p className="subtitle">多音檔載入、每軌播放線、倍率基準設定。M1 使用 AudioBufferSourceNode 真實播放，保音高變速留到 M2。</p>
+        <h1 className="title">歌曲混音器</h1>
+        <p className="subtitle">每首歌獨立控制 BPM、Key、Loop 與分軌混音；音源分離和播放處理都留在瀏覽器。</p>
       </header>
 
       <div className="col-full">

@@ -88,6 +88,11 @@ export function TrackCard({ track, onChange, collapsed = false, onToggleCollapse
           <div>
             <div style={{ fontWeight: 700, fontSize: 14 }}>{track.name}</div>
             {!collapsed && <div className="small" style={{ opacity: 0.45 }}>{track.fileName}</div>}
+            {!collapsed && track.stemMetadata && (
+              <div className="small" style={{ marginTop: 2, color: "var(--accent)", opacity: 0.8 }}>
+                分離音源組 · {track.stemMetadata.sourceFileName}
+              </div>
+            )}
           </div>
         </div>
         <div className="row" style={{ gap: 8 }}>
@@ -252,6 +257,7 @@ export function TrackCard({ track, onChange, collapsed = false, onToggleCollapse
           >
             <option value="fast-rate">快速變速</option>
             <option value="pitch-preserve">保音高（實驗）</option>
+            <option value="soundtouch">變速＋變調（SoundTouch）</option>
           </select>
         </label>
 
@@ -265,6 +271,16 @@ export function TrackCard({ track, onChange, collapsed = false, onToggleCollapse
         {track.playbackMode === "pitch-preserve" && (
           <span className="small" style={{ color: "#f59e0b", opacity: 0.9 }}>
             ⚠ 實驗功能：保音高變速（WSOLA），倍率限 0.5–1.8×；多軌不保證同步
+          </span>
+        )}
+        {track.playbackMode === "soundtouch" && (
+          <span className="small" style={{ color: "#f59e0b", opacity: 0.9 }}>
+            ⚠ SoundTouch 使用舊式 ScriptProcessorNode；可同時變速與變調，但多軌無法保證樣本級同步
+          </span>
+        )}
+        {track.followsGlobalKey && (
+          <span className="small" style={{ color: "var(--accent)", opacity: 0.85 }}>
+            跟隨全域 BPM／Key：{track.baseRate.toFixed(3)}× · {track.keyShiftSemitones >= 0 ? "+" : ""}{track.keyShiftSemitones} 半音
           </span>
         )}
 

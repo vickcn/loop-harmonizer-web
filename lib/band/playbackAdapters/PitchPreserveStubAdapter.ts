@@ -54,6 +54,10 @@ export class PitchPreserveStubAdapter implements TrackPlaybackAdapter {
     this.inner.setPlaybackRate(rate, ctx);
   }
 
+  setPitchSemitones(semitones: number, ctx: AudioContext): void {
+    this.inner.setPitchSemitones(semitones, ctx);
+  }
+
   setLoop(loop: boolean, onEnded: (() => void) | null): void {
     // M2C: postMessage({ type: "setLoop", loop }) 給 worklet
     this.inner.setLoop(loop, onEnded);
