@@ -32,6 +32,13 @@ button { cursor: pointer; }
 .small { font-size: 13px; color: var(--muted); }
 .title { font-size: 28px; margin: 0 0 6px; }
 .subtitle { margin: 0; color: var(--muted); }
+.selected-song-count { font-weight: 650; font-variant-numeric: tabular-nums; }
+.song-card-action { min-width: 52px; min-height: 36px; }
+.key-stepper { min-width: 36px; min-height: 36px; }
+.song-select { inline-size: 18px; block-size: 18px; accent-color: var(--accent); }
+.playback-note { color: var(--muted); font-size: 13px; }
+.playback-note summary { cursor: pointer; }
+.playback-note span { display: block; margin-top: 8px; color: #f59e0b; opacity: .9; }
 @media (max-width: 640px) {
   .title { font-size: 22px; }
   .subtitle { font-size: 13px; line-height: 1.55; }
@@ -88,5 +95,53 @@ hr { border: none; border-top: 1px solid var(--line); margin: 16px 0; }
 /* ── 手機把 row 內 input 寬度收一下，避免擠 ── */
 @media (max-width: 640px) {
   .input { min-width: 64px; padding: 9px 10px; }
-  .btn { padding: 9px 12px; }
+  .btn { min-height: 44px; padding: 9px 12px; }
+  .mixer-shell > .mixer-songs { order: 2; }
+  .mixer-shell > .mixer-bulk-controls { order: 3; }
+  .mixer-shell > .mixer-cache { order: 4; }
+  .song-card-action { min-width: 54px; min-height: 40px; }
+  .key-stepper { min-width: 44px; min-height: 44px; }
+  .song-select { inline-size: 22px; block-size: 22px; }
+  .song-transport { align-items: stretch; }
+  .song-transport > .btn { flex: 1 1 auto; }
+  .song-volume { flex: 1 0 100%; margin-left: 0 !important; justify-content: space-between; }
+  .song-volume input { flex: 1; }
+  .song-speed-controls { gap: 10px !important; }
+}
+
+@media (max-width: 900px) and (max-height: 540px) {
+  .container { padding: 12px; }
+  .mixer-shell { gap: 10px !important; }
+  .btn { min-height: 44px; }
+  .song-card-action { min-width: 54px; min-height: 40px; }
+  .key-stepper { min-width: 44px; min-height: 44px; }
+  .song-select { inline-size: 22px; block-size: 22px; }
+  .mixer-shell > .mixer-songs { order: 2; }
+  .mixer-shell > .mixer-bulk-controls { order: 3; }
+  .mixer-shell > .mixer-cache { order: 4; }
+  .mixer-upload { padding-block: 12px; }
+}
+
+@media (max-width: 900px) {
+  .mixer-shell.has-selected { padding-bottom: 92px; }
+  .mixer-bulk-controls.is-selected {
+    position: fixed;
+    z-index: 10;
+    inset-inline: 12px;
+    bottom: max(12px, env(safe-area-inset-bottom));
+    justify-content: center;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, .45);
+    flex-wrap: nowrap !important;
+    gap: 8px !important;
+    padding: 8px;
+  }
+  .mixer-bulk-controls.is-selected > strong,
+  .mixer-bulk-controls.is-selected > .selected-song-count { display: none; }
+  .mixer-bulk-controls.is-selected > .btn {
+    flex: 1 1 0;
+    min-width: 0;
+    padding-inline: 4px;
+    font-size: 12px;
+    white-space: nowrap;
+  }
 }

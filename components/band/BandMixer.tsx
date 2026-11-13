@@ -383,24 +383,25 @@ export function BandMixer() {
   };
 
   const selectedSongs = session.songs.filter((song) => song.selected);
+  const hasMultipleSelectedSongs = selectedSongs.length > 1;
 
   return (
-    <div className="grid" style={{ gap: 16 }}>
-      <div className="card row" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+    <div className={`grid mixer-shell${hasMultipleSelectedSongs ? " has-selected" : ""}`} style={{ gap: 16 }}>
+      <div className="card row mixer-upload" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
         <button className="btn primary" disabled={loading} onClick={() => fileInputRef.current?.click()}>{loading ? "載入中…" : "＋ 載入歌曲"}</button>
         <input ref={fileInputRef} type="file" accept="audio/*" multiple hidden onChange={(event) => { void handleFiles(event.target.files); event.target.value = ""; }} />
         <span className="small" style={{ opacity: 0.65 }}>音訊、分離、變速與變 Key 全部在瀏覽器執行，不經 Vercel 音訊 API。</span>
       </div>
 
-      <div className="card row" style={{ gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+      <div className={`card row mixer-bulk-controls${hasMultipleSelectedSongs ? " is-selected" : ""}`} style={{ gap: 10, flexWrap: "wrap", alignItems: "center" }}>
         <strong>歌曲多選播放控制</strong>
-        <span className="small" style={{ opacity: selectedSongs.length ? 0.8 : 0.4 }}>已選 {selectedSongs.length} 首</span>
+        <span className="small selected-song-count" style={{ opacity: selectedSongs.length ? 0.9 : 0.65 }}>已選 {selectedSongs.length} 首</span>
         <button className="btn primary" disabled={!selectedSongs.length} onClick={() => void Promise.all(selectedSongs.map(playSong))}>▶ 播放所選</button>
         <button className="btn" disabled={!selectedSongs.length} onClick={() => selectedSongs.forEach(pauseSong)}>⏸ 暫停所選</button>
         <button className="btn" disabled={!selectedSongs.length} onClick={() => selectedSongs.forEach(stopSong)}>■ 停止所選</button>
       </div>
 
-      <details className="card">
+      <details className="card mixer-cache">
         <summary style={{ cursor: "pointer", fontWeight: 700 }}>本機音訊快取管理</summary>
         <div className="row" style={{ gap: 12, flexWrap: "wrap", marginTop: 12 }}>
           <span className="small">分離結果：{formatBytes(cacheStats.stemBytes)}</span>
@@ -419,7 +420,7 @@ export function BandMixer() {
           <p className="small" style={{ opacity: 0.35, marginTop: 6 }}>載入後可直接在歌曲卡片內分離音源</p>
         </div>
       ) : (
-        <div className="grid" style={{ gap: 12 }}>
+        <div className="grid mixer-songs" style={{ gap: 12 }}>
           {session.songs.map((song) => (
             <div key={song.id} draggable onDragStart={() => setDraggingId(song.id)} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); if (draggingId) moveSong(draggingId, song.id); setDraggingId(null); }} onDragEnd={() => setDraggingId(null)} style={{ opacity: draggingId === song.id ? 0.45 : 1 }}>
               <SongCard

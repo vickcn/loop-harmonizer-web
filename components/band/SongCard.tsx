@@ -35,10 +35,11 @@ export function SongCard(props: Props) {
     : song.manualRate;
 
   return (
-    <article className="card grid" style={{ gap: 14, border: song.selected ? "1.5px solid var(--accent)" : undefined }}>
+    <article className="card grid song-card" style={{ gap: 14, border: song.selected ? "1.5px solid var(--accent)" : undefined }}>
       <div className="row" style={{ justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
         <div className="row" style={{ gap: 10 }}>
           <input
+            className="song-select"
             type="checkbox"
             aria-label={`選取 ${song.name}`}
             checked={song.selected}
@@ -51,17 +52,17 @@ export function SongCard(props: Props) {
         </div>
         <div className="row" style={{ gap: 8 }}>
           <span className="small" style={{ color: STATUS_COLOR[song.status] }}>● {STATUS_LABEL[song.status]}</span>
-          <button className="btn" style={{ padding: "4px 8px", fontSize: 12 }} onClick={props.onToggleCollapse}>
+          <button className="btn song-card-action" style={{ padding: "4px 8px", fontSize: 12 }} onClick={props.onToggleCollapse}>
             {props.collapsed ? "展開" : "收合"}
           </button>
-          <button className="btn" style={{ padding: "4px 8px", fontSize: 12, color: "#f87171" }} onClick={props.onRemove}>移除</button>
+          <button className="btn song-card-action" style={{ padding: "4px 8px", fontSize: 12, color: "#f87171" }} onClick={props.onRemove}>移除</button>
         </div>
       </div>
 
       {!props.collapsed && <>
         <TrackPlayhead playheadSec={song.playheadSec} durationSec={song.durationSec} onChange={props.onSeek} />
 
-        <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+        <div className="row song-transport" style={{ gap: 8, flexWrap: "wrap" }}>
           <button className={`btn${song.status === "playing" ? " primary" : ""}`} onClick={props.onPlayPause}>
             {song.status === "playing" ? "⏸ 暫停" : "▶ 播放"}
           </button>
@@ -69,36 +70,36 @@ export function SongCard(props: Props) {
           <button className={`btn${song.loop ? " primary" : ""}`} onClick={() => props.onChange({ loop: !song.loop })}>
             {song.loop ? "⟳ 循環" : "⟳ 單次"}
           </button>
-          <label className="row" style={{ gap: 6, marginLeft: "auto" }}>
+          <label className="row song-volume" style={{ gap: 6, marginLeft: "auto" }}>
             <span className="small">主音量</span>
             <input type="range" min={0} max={1} step={0.01} value={song.masterVolume} onChange={(event) => props.onChange({ masterVolume: Number(event.target.value) })} />
             <span className="small">{Math.round(song.masterVolume * 100)}%</span>
           </label>
         </div>
 
-        <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "end" }}>
+        <div className="row song-speed-controls" style={{ gap: 12, flexWrap: "wrap", alignItems: "end" }}>
           <label className="grid" style={{ gap: 4 }}>
             <span className="small">原始 BPM</span>
-            <input className="input" type="number" min={20} max={300} value={song.originalBpm} style={{ width: 82 }} onChange={(event) => props.onChange({ originalBpm: Math.max(20, Math.min(300, Number(event.target.value) || 120)) })} />
+            <input aria-label="原始 BPM" className="input" type="number" min={20} max={300} value={song.originalBpm} style={{ width: 82 }} onChange={(event) => props.onChange({ originalBpm: Math.max(20, Math.min(300, Number(event.target.value) || 120)) })} />
           </label>
           <label className="grid" style={{ gap: 4 }}>
-            <span className="small">目標 BPM</span>
-            <input className="input" type="number" min={20} max={300} value={song.targetBpm} style={{ width: 82 }} onChange={(event) => props.onChange({ targetBpm: Math.max(20, Math.min(300, Number(event.target.value) || song.originalBpm)), tempoMode: "target-bpm", fineRateOffset: 0 })} />
+            <span className="small">目標 BPM{song.tempoMode === "target-bpm" ? "（目前使用）" : ""}</span>
+            <input aria-label="目標 BPM" className="input" type="number" min={20} max={300} value={song.targetBpm} style={{ width: 82 }} onChange={(event) => props.onChange({ targetBpm: Math.max(20, Math.min(300, Number(event.target.value) || song.originalBpm)), tempoMode: "target-bpm", fineRateOffset: 0 })} />
           </label>
           <label className="grid" style={{ gap: 4 }}>
             <span className="small">升降 Key</span>
             <div className="row" style={{ gap: 4 }}>
-              <button className="btn" style={{ padding: "6px 9px" }} onClick={() => props.onChange({ keyShiftSemitones: Math.max(-12, song.keyShiftSemitones - 1) })}>−</button>
-              <input className="input" type="number" min={-12} max={12} value={song.keyShiftSemitones} style={{ width: 58, textAlign: "center" }} onChange={(event) => props.onChange({ keyShiftSemitones: Math.max(-12, Math.min(12, Math.round(Number(event.target.value)))) })} />
-              <button className="btn" style={{ padding: "6px 9px" }} onClick={() => props.onChange({ keyShiftSemitones: Math.min(12, song.keyShiftSemitones + 1) })}>+</button>
+              <button aria-label="降低 Key 一個半音" className="btn key-stepper" style={{ padding: "6px 9px" }} onClick={() => props.onChange({ keyShiftSemitones: Math.max(-12, song.keyShiftSemitones - 1) })}>−</button>
+              <input aria-label="升降 Key 半音數" className="input" type="number" min={-12} max={12} value={song.keyShiftSemitones} style={{ width: 58, textAlign: "center" }} onChange={(event) => props.onChange({ keyShiftSemitones: Math.max(-12, Math.min(12, Math.round(Number(event.target.value)))) })} />
+              <button aria-label="提高 Key 一個半音" className="btn key-stepper" style={{ padding: "6px 9px" }} onClick={() => props.onChange({ keyShiftSemitones: Math.min(12, song.keyShiftSemitones + 1) })}>+</button>
             </div>
           </label>
           <label className="grid" style={{ gap: 4, flex: "1 1 140px" }}>
-            <span className="small">手動倍率（優先於目標 BPM）</span>
+            <span className="small">指定倍率{song.tempoMode === "manual-rate" ? "（目前使用）" : ""}</span>
             <datalist id={`song-rates-${song.id}`}>
               {song.savedRates.map((savedRate) => <option key={savedRate} value={savedRate.toFixed(3)} />)}
             </datalist>
-            <input className="input" type="number" list={`song-rates-${song.id}`} min={0.25} max={4} step={0.01} value={song.manualRate.toFixed(3)} onChange={(event) => props.onChange({ manualRate: Math.max(0.25, Math.min(4, Number(event.target.value) || 1)), tempoMode: "manual-rate" })} />
+            <input aria-label="指定播放倍率" className="input" type="number" list={`song-rates-${song.id}`} min={0.25} max={4} step={0.01} value={song.manualRate.toFixed(3)} onChange={(event) => props.onChange({ manualRate: Math.max(0.25, Math.min(4, Number(event.target.value) || 1)), tempoMode: "manual-rate" })} />
           </label>
           <button
             className="btn"
@@ -112,8 +113,13 @@ export function SongCard(props: Props) {
               });
             }}
           >
-            {song.savedRates.some((value) => Math.abs(value - rate) < 0.0001) ? "✕ 刪除此倍率" : "＋ 記憶此倍率"}
+            {song.savedRates.some((value) => Math.abs(value - rate) < 0.0001) ? "✕ 移除已儲存倍率" : "＋ 儲存目前倍率"}
           </button>
+          {song.tempoMode === "manual-rate" && (
+            <button className="btn" onClick={() => props.onChange({ tempoMode: "target-bpm", fineRateOffset: 0 })}>
+              改用目標 BPM
+            </button>
+          )}
           <button className="btn" onClick={() => props.onChange({ targetBpm: song.originalBpm, keyShiftSemitones: 0, tempoMode: "target-bpm", manualRate: 1, fineRateOffset: 0 })}>↺ 原始速度／Key</button>
         </div>
 
@@ -123,7 +129,7 @@ export function SongCard(props: Props) {
             <strong style={{ color: "var(--accent)", fontVariantNumeric: "tabular-nums" }}>{rate.toFixed(3)}× · {song.keyShiftSemitones >= 0 ? "+" : ""}{song.keyShiftSemitones} 半音</strong>
           </div>
           <input type="range" min={-0.05} max={0.05} step={0.001} value={song.fineRateOffset} onChange={(event) => props.onChange({ fineRateOffset: Number(event.target.value) })} />
-          <div className="small" style={{ opacity: 0.55 }}>粗倍率 {coarseRate.toFixed(3)}× ＋ 微調 {song.fineRateOffset >= 0 ? "+" : ""}{song.fineRateOffset.toFixed(3)}</div>
+          <div className="small" style={{ opacity: 0.65 }}>目前由{song.tempoMode === "target-bpm" ? "目標 BPM" : "指定倍率"}控制 · 基準 {coarseRate.toFixed(3)}× ＋ 微調 {song.fineRateOffset >= 0 ? "+" : ""}{song.fineRateOffset.toFixed(3)}</div>
         </div>
 
         <section className="grid" style={{ gap: 10, paddingTop: 12, borderTop: "1px solid var(--line)" }}>
@@ -148,9 +154,10 @@ export function SongCard(props: Props) {
           </>}
           {song.separationStatus === "failed" && <span role="alert" className="small" style={{ color: "#f87171" }}>{song.separationMessage}</span>}
           {song.stemIds.length > 0 && <StemMixer channels={song.stemChannels} onChange={props.onStemChange} onDownload={props.onDownloadStem} />}
-          <span className="small" style={{ color: "#f59e0b", opacity: 0.9 }}>
-            SoundTouch 仍使用舊式 ScriptProcessorNode；同歌分軌共用 AudioContext、歌曲時間軸與單次排程，但目前不宣稱樣本級同步。
-          </span>
+          <details className="playback-note">
+            <summary>播放同步說明</summary>
+            <span className="small">SoundTouch 仍使用舊式 ScriptProcessorNode；同歌分軌共用 AudioContext、歌曲時間軸與單次排程，但目前不宣稱樣本級同步。</span>
+          </details>
         </section>
       </>}
     </article>
