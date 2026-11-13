@@ -35,6 +35,9 @@ button { cursor: pointer; }
 .selected-song-count { font-weight: 650; font-variant-numeric: tabular-nums; }
 .song-card-action { min-width: 52px; min-height: 36px; }
 .key-stepper { min-width: 36px; min-height: 36px; }
+.rate-stepper { min-width: 40px; min-height: 40px; padding-inline: 10px; }
+.manual-rate-input .input { flex: 1 1 auto; min-width: 0; text-align: center; }
+.manual-rate-slider { width: 100%; }
 .song-select { inline-size: 18px; block-size: 18px; accent-color: var(--accent); }
 .playback-note { color: var(--muted); font-size: 13px; }
 .playback-note summary { cursor: pointer; }
@@ -101,6 +104,8 @@ hr { border: none; border-top: 1px solid var(--line); margin: 16px 0; }
   .mixer-shell > .mixer-cache { order: 4; }
   .song-card-action { min-width: 54px; min-height: 40px; }
   .key-stepper { min-width: 44px; min-height: 44px; }
+  .rate-stepper { min-width: 44px; min-height: 44px; }
+  .manual-rate-control { flex-basis: 100% !important; }
   .song-select { inline-size: 22px; block-size: 22px; }
   .song-transport { align-items: stretch; }
   .song-transport > .btn { flex: 1 1 auto; }
@@ -115,6 +120,7 @@ hr { border: none; border-top: 1px solid var(--line); margin: 16px 0; }
   .btn { min-height: 44px; }
   .song-card-action { min-width: 54px; min-height: 40px; }
   .key-stepper { min-width: 44px; min-height: 44px; }
+  .rate-stepper { min-width: 44px; min-height: 44px; }
   .song-select { inline-size: 22px; block-size: 22px; }
   .mixer-shell > .mixer-songs { order: 2; }
   .mixer-shell > .mixer-bulk-controls { order: 3; }
@@ -143,5 +149,18 @@ hr { border: none; border-top: 1px solid var(--line); margin: 16px 0; }
     padding-inline: 4px;
     font-size: 12px;
     white-space: nowrap;
+  }
+}
+
+@media (min-width: 1024px) {
+  .song-speed-controls {
+    display: grid;
+    grid-template-columns: 170px 170px 170px minmax(360px, 560px);
+    align-items: end;
+    justify-content: start;
+  }
+  .song-speed-controls > .manual-rate-control {
+    grid-column: 4;
+    grid-row: 1 / span 2;
   }
 }

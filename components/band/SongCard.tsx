@@ -25,6 +25,13 @@ type Props = {
 
 const STATUS_COLOR = { stopped: "var(--muted)", playing: "#22c55e", paused: "#f59e0b" };
 const STATUS_LABEL = { stopped: "停止", playing: "播放中", paused: "暫停" };
+const MANUAL_RATE_MIN = 0.25;
+const MANUAL_RATE_MAX = 4;
+const MANUAL_RATE_STEP = 0.05;
+
+function clampManualRate(value: number) {
+  return Math.max(MANUAL_RATE_MIN, Math.min(MANUAL_RATE_MAX, value));
+}
 
 export function SongCard(props: Props) {
   const { song } = props;
@@ -33,6 +40,10 @@ export function SongCard(props: Props) {
   const coarseRate = song.tempoMode === "target-bpm"
     ? song.targetBpm / Math.max(1, song.originalBpm)
     : song.manualRate;
+  const setManualRate = (value: number) => props.onChange({
+    manualRate: clampManualRate(value),
+    tempoMode: "manual-rate",
+  });
 
   return (
     <article className="card grid song-card" style={{ gap: 14, border: song.selected ? "1.5px solid var(--accent)" : undefined }}>
@@ -94,13 +105,19 @@ export function SongCard(props: Props) {
               <button aria-label="提高 Key 一個半音" className="btn key-stepper" style={{ padding: "6px 9px" }} onClick={() => props.onChange({ keyShiftSemitones: Math.min(12, song.keyShiftSemitones + 1) })}>+</button>
             </div>
           </label>
-          <label className="grid" style={{ gap: 4, flex: "1 1 140px" }}>
+          <div className="grid manual-rate-control" style={{ gap: 6, flex: "1 1 240px" }}>
             <span className="small">指定倍率{song.tempoMode === "manual-rate" ? "（目前使用）" : ""}</span>
             <datalist id={`song-rates-${song.id}`}>
               {song.savedRates.map((savedRate) => <option key={savedRate} value={savedRate.toFixed(3)} />)}
             </datalist>
-            <input aria-label="指定播放倍率" className="input" type="number" list={`song-rates-${song.id}`} min={0.25} max={4} step={0.01} value={song.manualRate.toFixed(3)} onChange={(event) => props.onChange({ manualRate: Math.max(0.25, Math.min(4, Number(event.target.value) || 1)), tempoMode: "manual-rate" })} />
-          </label>
+            <div className="row manual-rate-input" style={{ gap: 6, flexWrap: "nowrap" }}>
+              <button aria-label={`降低倍率 ${MANUAL_RATE_STEP.toFixed(2)} 倍`} className="btn rate-stepper" onClick={() => setManualRate(song.manualRate - MANUAL_RATE_STEP)}>−</button>
+              <input aria-label="指定播放倍率" className="input" type="number" list={`song-rates-${song.id}`} min={MANUAL_RATE_MIN} max={MANUAL_RATE_MAX} step={0.01} value={song.manualRate.toFixed(3)} onChange={(event) => setManualRate(Number(event.target.value) || 1)} />
+              <button aria-label={`提高倍率 ${MANUAL_RATE_STEP.toFixed(2)} 倍`} className="btn rate-stepper" onClick={() => setManualRate(song.manualRate + MANUAL_RATE_STEP)}>+</button>
+            </div>
+            <input aria-label="倍率粗調拉桿" className="manual-rate-slider" type="range" min={MANUAL_RATE_MIN} max={MANUAL_RATE_MAX} step={MANUAL_RATE_STEP} value={song.manualRate} onChange={(event) => setManualRate(Number(event.target.value))} />
+            <span className="small" style={{ opacity: 0.65 }}>粗調範圍 {MANUAL_RATE_MIN.toFixed(2)}×–{MANUAL_RATE_MAX.toFixed(2)}× · 每次 {MANUAL_RATE_STEP.toFixed(2)}×</span>
+          </div>
           <button
             className="btn"
             onClick={() => {
