@@ -152,12 +152,17 @@ export function SongCard(props: Props) {
         <section className="grid" style={{ gap: 10, paddingTop: 12, borderTop: "1px solid var(--line)" }}>
           <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
             <strong>歌曲音源</strong>
-            <select className="input" value={mode} disabled={song.separationStatus === "processing"} onChange={(event) => setMode(event.target.value as StemSeparationMode)}>
+            <select className="input" value={mode} disabled onChange={(event) => setMode(event.target.value as StemSeparationMode)}>
               <option value="two_stem">2 Stem</option>
               <option value="four_stem">4 Stem</option>
             </select>
-            <button className="btn primary" disabled={song.separationStatus === "processing"} onClick={() => props.onSeparate(mode)}>
-              {song.separationStatus === "processing" ? "分離中…" : song.separationStatus === "completed" ? "重新分離音源" : "✦ 分離音源"}
+            <button
+              className="btn primary"
+              disabled
+              title="音源分離功能維護中，暫時停用"
+              onClick={() => props.onSeparate(mode)}
+            >
+              ✦ 分離音源（暫停使用）
             </button>
             {song.stemIds.length > 0 && <>
               <button className={`btn${song.playbackSource === "original" ? " primary" : ""}`} onClick={() => props.onSwitchSource("original")}>原始混音</button>
