@@ -17,7 +17,7 @@ type Props = {
   onPlayPause: () => void;
   onStop: () => void;
   onSeek: (seconds: number) => void;
-  onSeparate: (mode: StemSeparationMode) => void;
+  onSeparate: (mode: StemSeparationMode, options?: { forceRecompute?: boolean }) => void;
   onSwitchSource: (source: "original" | "stems") => void;
   onStemChange: (id: string, patch: Partial<StemChannel>) => void;
   onDownloadStem: (id: string) => void;
@@ -737,7 +737,13 @@ export const SongCard = memo(function SongCard(props: Props) {
                       : audioUnavailable
                         ? "請先等待恢復、解碼或重新選取原始音檔"
                         : undefined,
-                  onSelect: () => props.onSeparate(mode),
+                  onSelect: () =>
+                    props.onSeparate(
+                      mode,
+                      song.separationStatus === "completed" && song.separationMode === mode
+                        ? { forceRecompute: true }
+                        : undefined,
+                    ),
                   renderInline: () => (
                     <IconActionButton
                       icon={
@@ -759,7 +765,14 @@ export const SongCard = memo(function SongCard(props: Props) {
                               : undefined
                       }
                       className="is-compact"
-                      onClick={() => props.onSeparate(mode)}
+                      onClick={() =>
+                        props.onSeparate(
+                          mode,
+                          song.separationStatus === "completed" && song.separationMode === mode
+                            ? { forceRecompute: true }
+                            : undefined,
+                        )
+                      }
                     />
                   ),
                 },
@@ -807,15 +820,32 @@ export const SongCard = memo(function SongCard(props: Props) {
                         ),
                       },
                       {
+                        key: "toggle-stems",
+                        label: stemsOpen ? "收合分軌拉桿" : `展開分軌拉桿（${song.stemChannels.length} 軌）`,
+                        pressed: stemsOpen,
+                        onSelect: () => setStemsOpen((value) => !value),
+                        renderInline: () => (
+                          <IconActionButton
+                            icon={<ChevronIcon expanded={stemsOpen} />}
+                            label={stemsOpen ? "收合分軌拉桿" : `展開分軌拉桿（${song.stemChannels.length} 軌）`}
+                            expanded={stemsOpen}
+                            className="is-compact"
+                            onClick={() => setStemsOpen((value) => !value)}
+                          />
+                        ),
+                      },
+                    ] satisfies AdaptiveActionItem[])
+                  : []),
+                ...((song.separationStatus === "completed" || hasSavedChunks || Boolean(song.cacheKey)) && !isSeparating
+                  ? ([
+                      {
                         key: "clear-cache",
                         label:
                           song.separationStatus === "completed"
                             ? "刪除已完成分軌"
-                            : hasSavedChunks
-                              ? "清理暫存進度"
-                              : "目前已無本機快取",
-                        disabled: focusLocked || (!song.cacheKey && !hasSavedChunks && song.separationStatus !== "completed") || isSeparating,
-                        disabledReason: focusLocked ? focusLockReason : (!song.cacheKey && !hasSavedChunks && song.separationStatus !== "completed" ? "目前已無本機快取" : isSeparating ? "分離執行中暫無法清除" : undefined),
+                            : "清理暫存進度",
+                        disabled: focusLocked || isSeparating,
+                        disabledReason: focusLocked ? focusLockReason : undefined,
                         onSelect: () =>
                           props.onClearSeparationData
                             ? props.onClearSeparationData(
@@ -828,12 +858,10 @@ export const SongCard = memo(function SongCard(props: Props) {
                             label={
                               song.separationStatus === "completed"
                                 ? "刪除已完成分軌"
-                                : hasSavedChunks
-                                  ? "清理暫存進度"
-                                  : "目前已無本機快取"
+                                : "清理暫存進度"
                             }
-                            disabled={focusLocked || (!song.cacheKey && !hasSavedChunks && song.separationStatus !== "completed") || isSeparating}
-                            disabledReason={focusLocked ? focusLockReason : (!song.cacheKey && !hasSavedChunks && song.separationStatus !== "completed" ? "目前已無本機快取" : isSeparating ? "分離執行中暫無法清除" : undefined)}
+                            disabled={focusLocked || isSeparating}
+                            disabledReason={focusLocked ? focusLockReason : undefined}
                             className="is-compact"
                             onClick={() =>
                               props.onClearSeparationData
@@ -842,21 +870,6 @@ export const SongCard = memo(function SongCard(props: Props) {
                                   )
                                 : props.onClearSongCache()
                             }
-                          />
-                        ),
-                      },
-                      {
-                        key: "toggle-stems",
-                        label: stemsOpen ? "收合分軌拉桿" : `展開分軌拉桿（${song.stemChannels.length} 軌）`,
-                        pressed: stemsOpen,
-                        onSelect: () => setStemsOpen((value) => !value),
-                        renderInline: () => (
-                          <IconActionButton
-                            icon={<ChevronIcon expanded={stemsOpen} />}
-                            label={stemsOpen ? "收合分軌拉桿" : `展開分軌拉桿（${song.stemChannels.length} 軌）`}
-                            expanded={stemsOpen}
-                            className="is-compact"
-                            onClick={() => setStemsOpen((value) => !value)}
                           />
                         ),
                       },
@@ -1054,7 +1067,7 @@ export const SongCard = memo(function SongCard(props: Props) {
                     ↩ 回復上一動
                   </button>
                 )}
-                <button type="button" className="btn mixer-button" style={{ minHeight: 44, minWidth: 44, padding: "8px 12px" }} disabled={focusLocked || audioUnavailable} onClick={() => props.onSeparate(mode)}>
+                <button type="button" className="btn mixer-button" style={{ minHeight: 44, minWidth: 44, padding: "8px 12px" }} disabled={focusLocked || audioUnavailable} onClick={() => props.onSeparate(mode, { forceRecompute: true })}>
                   重新分離
                 </button>
               </div>
@@ -1066,7 +1079,7 @@ export const SongCard = memo(function SongCard(props: Props) {
                 ✓ {song.separationMessage}
                 {totalChunks > 0 ? `（已完成 ${completedChunks || totalChunks} / ${totalChunks} 段${song.separationCommittedBytes ? `｜${committedMiB} MiB` : ""}）` : ""}
               </span>
-              {props.onClearSeparationData && (song.separationUsesChunkPlayback || hasSavedChunks) && (
+              {props.onClearSeparationData && (song.separationUsesChunkPlayback || hasSavedChunks || Boolean(song.cacheKey)) && (
                 <button
                   type="button"
                   className="btn mixer-button"

@@ -9,15 +9,28 @@ export const SEPARATION_DIAGNOSTIC_STORAGE_KEY =
   "loop-harmonizer:separation-diagnostics:v1";
 export const MAX_SEPARATION_DIAGNOSTIC_ENTRIES = 120;
 
+export type SeparationDiagnosticEvent =
+  | "shared-checkpoint-reference-added"
+  | "shared-checkpoint-reference-removed"
+  | "checkpoint-delete-blocked"
+  | "checkpoint-gc-started"
+  | "checkpoint-gc-completed"
+  | "stale-worker-update-rejected"
+  | (string & {});
+
 export interface SeparationDiagnosticEntry {
   id: string;
   timestamp: number;
+  event?: SeparationDiagnosticEvent | null;
   taskId: string | null;
   songId: string | null;
   generation: number | null;
   checkpointStatus: string | null;
   validChunkCount: number | null;
   totalChunks: number | null;
+  referenceCount?: number | null;
+  leaseState?: string | null;
+  outcome?: string | null;
   workerExitReason: string | null;
   leaseOwner: string | null;
   fromState: string | null;
@@ -28,12 +41,16 @@ export interface SeparationDiagnosticEntry {
 }
 
 export interface RecordSeparationDiagnosticInput {
+  event?: SeparationDiagnosticEvent | null;
   taskId?: string | null;
   songId?: string | null;
   generation?: number | null;
   checkpointStatus?: string | null;
   validChunkCount?: number | null;
   totalChunks?: number | null;
+  referenceCount?: number | null;
+  leaseState?: string | null;
+  outcome?: string | null;
   workerExitReason?: string | null;
   leaseOwner?: string | null;
   fromState?: string | null;
@@ -99,6 +116,7 @@ export function recordSeparationDiagnostic(
   const entry: SeparationDiagnosticEntry = {
     id: `diag-${timestamp}-${++diagnosticSeq}`,
     timestamp,
+    event: input.event ?? null,
     taskId: input.taskId ?? null,
     songId: input.songId ?? null,
     generation:
@@ -115,6 +133,13 @@ export function recordSeparationDiagnostic(
       typeof input.totalChunks === "number" && Number.isFinite(input.totalChunks)
         ? input.totalChunks
         : null,
+    referenceCount:
+      typeof input.referenceCount === "number" &&
+      Number.isFinite(input.referenceCount)
+        ? input.referenceCount
+        : null,
+    leaseState: input.leaseState ?? null,
+    outcome: input.outcome ?? null,
     workerExitReason: input.workerExitReason ?? null,
     leaseOwner: input.leaseOwner ?? null,
     fromState,
@@ -164,14 +189,19 @@ export function formatSeparationDiagnosticLine(
   const parts = [
     iso,
     `[${entry.source}]`,
+    entry.event ? `event=${entry.event}` : null,
     `task=${entry.taskId ?? "-"}`,
+    `song=${entry.songId ?? "-"}`,
     `gen=${entry.generation ?? "-"}`,
     `cp=${entry.checkpointStatus ?? "-"}`,
     `chunks=${chunkStr}`,
+    entry.referenceCount != null ? `refs=${entry.referenceCount}` : null,
+    entry.leaseState ? `leaseState=${entry.leaseState}` : null,
     `exit=${entry.workerExitReason ?? "-"}`,
     `lease=${entry.leaseOwner ?? "-"}`,
     `tx=${entry.stateTransition}`,
-  ];
+    entry.outcome ? `outcome=${entry.outcome}` : null,
+  ].filter((p): p is string => Boolean(p));
   if (entry.note) parts.push(`note=${entry.note}`);
   return parts.join(" | ");
 }
@@ -238,6 +268,7 @@ export function guardSeparationPatch(
     options.generation !== options.activeGeneration
   ) {
     recordSeparationDiagnostic({
+      event: "stale-worker-update-rejected",
       source,
       songId: currentSong.id,
       taskId: patch.separationTaskId ?? currentSong.separationTaskId ?? null,
@@ -253,6 +284,7 @@ export function guardSeparationPatch(
       leaseOwner: options.leaseOwner ?? null,
       fromState: currentSong.separationStatus,
       toState: patch.separationStatus ?? currentSong.separationStatus,
+      outcome: "rejected",
       note: `ignored stale generation=${options.generation}, active=${options.activeGeneration}`,
     });
     return null;
@@ -266,6 +298,7 @@ export function guardSeparationPatch(
     })
   ) {
     recordSeparationDiagnostic({
+      event: "stale-worker-update-rejected",
       source,
       songId: currentSong.id,
       taskId: patch.separationTaskId ?? currentSong.separationTaskId ?? null,
@@ -281,6 +314,7 @@ export function guardSeparationPatch(
       leaseOwner: options?.leaseOwner ?? null,
       fromState: currentSong.separationStatus,
       toState: nextStatus,
+      outcome: "rejected",
       note: "blocked downgrade from completed",
     });
     return null;
@@ -451,6 +485,7 @@ export function reconcileCrossTabSongUpdate(
   options?: {
     verifiedCompletedCheckpoint?: boolean;
     verifiedValidChunkCount?: number;
+    hasAuthoritativeCheckpoint?: boolean;
   },
 ): {
   song: BandSong;
@@ -559,6 +594,7 @@ export function reconcileCrossTabSongUpdate(
     if (remoteStatus && remoteStatus !== "completed") {
       blockedDowngrade = true;
       recordSeparationDiagnostic({
+        event: "stale-worker-update-rejected",
         source: "reconcileCrossTabSongUpdate",
         songId: localSong.id,
         taskId: remote.separationTaskId ?? localSong.separationTaskId ?? null,
@@ -570,6 +606,7 @@ export function reconcileCrossTabSongUpdate(
           remote.separationTotalChunks ?? localSong.separationTotalChunks ?? null,
         fromState: "completed",
         toState: remoteStatus,
+        outcome: "rejected",
         note: "blocked stale cross-tab downgrade from completed",
       });
     }
@@ -581,6 +618,40 @@ export function reconcileCrossTabSongUpdate(
       },
       needsChunkPlaybackRestore: false,
       blockedDowngrade,
+    };
+  }
+
+  // 若本地剛由使用者明確清除為 not_started（無 taskId），禁止舊分頁／過期 Worker
+  // 以無權威 Checkpoint 或 0 分段的 interrupted/paused/failed 事件把歌曲拉回錯誤狀態。
+  if (
+    localSong.separationStatus === "not_started" &&
+    !localSong.separationTaskId &&
+    (remoteStatus === "interrupted" ||
+      remoteStatus === "paused" ||
+      remoteStatus === "failed") &&
+    (options?.hasAuthoritativeCheckpoint === false ||
+      ((remote.separationCompletedChunks ?? 0) <= 0 &&
+        options?.hasAuthoritativeCheckpoint !== true))
+  ) {
+    recordSeparationDiagnostic({
+      event: "stale-worker-update-rejected",
+      source: "reconcileCrossTabSongUpdate",
+      songId: localSong.id,
+      taskId: remote.separationTaskId ?? null,
+      validChunkCount: remote.separationCompletedChunks ?? 0,
+      totalChunks: remote.separationTotalChunks ?? 0,
+      fromState: "not_started",
+      toState: remoteStatus,
+      outcome: "rejected",
+      note: "blocked stale remote error/interrupted revert after explicit clear",
+    });
+    return {
+      song: {
+        ...baseUpdated,
+        playbackSource: "original",
+      },
+      needsChunkPlaybackRestore: false,
+      blockedDowngrade: true,
     };
   }
 

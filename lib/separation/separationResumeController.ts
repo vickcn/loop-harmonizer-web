@@ -16,7 +16,7 @@ import {
   DEMUCS_TRAINING_SAMPLES,
   type SeparationChunkRecord,
   getChunkSampleBounds,
-  getTaskChunkRecords,
+  getTaskChunkRecordsInStore,
   validateChunkRecordIntegrity,
 } from "../storage/separationChunkStore.ts";
 import { recordSeparationDiagnostic } from "./separationStateRecovery.ts";
@@ -143,12 +143,7 @@ export async function validateAndPrepareResume(
       const cp = ((await idbRequestPromise(cpStore.get(taskId))) ?? null) as
         | SeparationCheckpoint
         | null;
-      const allChunks = (await idbRequestPromise(
-        chunkStore.getAll(),
-      )) as SeparationChunkRecord[];
-      const taskRecords = allChunks
-        .filter((rec) => rec.taskId === taskId)
-        .sort((a, b) => a.chunkIndex - b.chunkIndex);
+      const taskRecords = await getTaskChunkRecordsInStore(chunkStore, taskId);
       return { checkpoint: cp, records: taskRecords };
     },
   );
@@ -722,6 +717,7 @@ export class SeparationJobLeaseManager {
         resolvedStatus = "completed";
         if (nextStatus && nextStatus !== "completed") {
           recordSeparationDiagnostic({
+            event: "stale-worker-update-rejected",
             source: "SeparationJobLeaseManager.releaseLease",
             taskId,
             songId: existing.songId,
@@ -730,8 +726,10 @@ export class SeparationJobLeaseManager {
             validChunkCount: existing.nextChunkIndex,
             totalChunks: existing.totalChunks,
             leaseOwner: lease.ownerTabId,
+            leaseState: existing.lease ? "held" : "none",
             fromState: "completed",
             toState: nextStatus,
+            outcome: "rejected",
             note: "blocked downgrade of completed checkpoint on releaseLease",
             timestamp: now,
           });
@@ -748,6 +746,21 @@ export class SeparationJobLeaseManager {
         existing.lease.ownerJobToken !== lease.ownerJobToken ||
         existing.lease.generation !== lease.generation
       ) {
+        recordSeparationDiagnostic({
+          event: "stale-worker-update-rejected",
+          source: "SeparationJobLeaseManager.releaseLease",
+          taskId,
+          songId: existing.songId,
+          generation: lease.generation,
+          checkpointStatus: existing.status,
+          validChunkCount: existing.nextChunkIndex,
+          totalChunks: existing.totalChunks,
+          leaseOwner: existing.lease.ownerTabId,
+          leaseState: existing.lease.leaseExpiresAt > now ? "foreign_active" : "expired",
+          outcome: "rejected",
+          note: `rejected stale releaseLease (expectedGen=${existing.lease.generation}, gotGen=${lease.generation})`,
+          timestamp: now,
+        });
         return false;
       }
 

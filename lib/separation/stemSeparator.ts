@@ -18,13 +18,17 @@ import {
 } from "../storage/modelCache.ts";
 import { DEMUCS_MODEL_VERSION, SEPARATION_PROCESSING_VERSION } from "../storage/cacheKeys.ts";
 import {
+  type CheckpointSongReferenceCandidate,
   type SeparationCheckpoint,
   type SeparationLeaseInfo,
+  addCheckpointReference,
   buildInitialCheckpoint,
   createCheckpointTaskId,
+  createIsolatedRecomputeTaskId,
   deleteCheckpointAndChunks,
   findCompletedCheckpointBySourceAudioHash,
   getCheckpoint,
+  isCheckpointSharedOrLeased,
   saveCheckpoint,
   updateCheckpointStatus,
 } from "../storage/separationCheckpointStore.ts";
@@ -154,6 +158,7 @@ export type StemSeparationOptions = {
   checkpointTaskId?: string;
   userAuthorized?: boolean;
   forceRecompute?: boolean;
+  knownInMemorySongs?: CheckpointSongReferenceCandidate[];
   preferChunkStreaming?: boolean;
   maxThreads?: number;
   preferWorker?: boolean;
@@ -974,7 +979,7 @@ export async function separateAudio(
       options.sourceAudioHash,
   );
   const effectiveSongId = options.songId ?? controller.songId;
-  const checkpointTaskId = streamChunks
+  let checkpointTaskId = streamChunks
     ? options.checkpointTaskId ??
       createCheckpointTaskId(
         effectiveSongId,
@@ -1075,7 +1080,38 @@ export async function separateAudio(
 
     if (streamChunks && checkpointTaskId && options.sourceAudioHash) {
       if (options.forceRecompute) {
-        await deleteCheckpointAndChunks(checkpointTaskId);
+        const shareStatus = await isCheckpointSharedOrLeased({
+          taskId: checkpointTaskId,
+          actingSongId: effectiveSongId,
+          knownInMemorySongs: options.knownInMemorySongs,
+        });
+        const existingForRecompute = shareStatus.exists
+          ? await getCheckpoint(checkpointTaskId)
+          : null;
+        if (
+          shareStatus.sharedWithOtherSongs ||
+          shareStatus.activeLease ||
+          existingForRecompute?.status === "completed"
+        ) {
+          recordSeparationDiagnostic({
+            event: "checkpoint-delete-blocked",
+            source: "stemSeparator.forceRecompute",
+            taskId: checkpointTaskId,
+            songId: effectiveSongId,
+            checkpointStatus: existingForRecompute?.status ?? null,
+            referenceCount: shareStatus.otherReferenceSongIds.length,
+            leaseOwner: existingForRecompute?.lease?.ownerTabId ?? null,
+            leaseState: shareStatus.activeLease ? "active" : "none",
+            outcome: "isolated_recompute_task",
+            note: "isolated forceRecompute into new taskId without destroying existing checkpoint",
+          });
+          checkpointTaskId = createIsolatedRecomputeTaskId(
+            effectiveSongId,
+            options.sourceAudioHash,
+          );
+        } else {
+          await deleteCheckpointAndChunks(checkpointTaskId);
+        }
       }
 
       const tabId = getOrCreateTabId();
@@ -1111,6 +1147,12 @@ export async function separateAudio(
         decodedLeft = null;
         decodedRight = null;
         streamCompleted = true;
+        await addCheckpointReference({
+          taskId: resolvedTaskId,
+          songId: effectiveSongId,
+          mode: options.mode,
+          source: "stemSeparator.alreadyCompleted",
+        });
         if (validation.checkpoint.requestedMode !== options.mode) {
           await updateCheckpointStatus(resolvedTaskId, {
             status: "completed",
@@ -1130,6 +1172,7 @@ export async function separateAudio(
           checkpointStatus: finalCp.status,
           validChunkCount: validation.validChunkCount,
           totalChunks: validation.totalChunks,
+          referenceCount: finalCp.referencedBySongIds?.length ?? null,
           workerExitReason: "skipped-already-completed",
           leaseOwner: finalCp.lease?.ownerTabId ?? null,
           fromState: validation.checkpoint.status,
@@ -1154,7 +1197,33 @@ export async function separateAudio(
 
       if (!validation.checkpoint || validation.action === "recompute_from_scratch") {
         if (validation.checkpoint) {
-          await deleteCheckpointAndChunks(checkpointTaskId);
+          const shareStatus = await isCheckpointSharedOrLeased({
+            taskId: checkpointTaskId,
+            actingSongId: effectiveSongId,
+            knownInMemorySongs: options.knownInMemorySongs,
+          });
+          if (
+            shareStatus.sharedWithOtherSongs ||
+            shareStatus.activeLease ||
+            validation.checkpoint.status === "completed"
+          ) {
+            recordSeparationDiagnostic({
+              event: "checkpoint-delete-blocked",
+              source: "stemSeparator.recomputeFromScratch",
+              taskId: checkpointTaskId,
+              songId: effectiveSongId,
+              checkpointStatus: validation.checkpoint.status,
+              referenceCount: shareStatus.otherReferenceSongIds.length,
+              leaseState: shareStatus.activeLease ? "active" : "none",
+              outcome: "isolated_recompute_task",
+            });
+            checkpointTaskId = createIsolatedRecomputeTaskId(
+              effectiveSongId,
+              options.sourceAudioHash,
+            );
+          } else {
+            await deleteCheckpointAndChunks(checkpointTaskId);
+          }
         }
         const initCp = buildInitialCheckpoint({
           taskId: checkpointTaskId,
@@ -1167,7 +1236,25 @@ export async function separateAudio(
           status: "queued",
         });
         await saveCheckpoint(initCp);
+        recordSeparationDiagnostic({
+          event: "shared-checkpoint-reference-added",
+          source: "stemSeparator.initCheckpoint",
+          taskId: checkpointTaskId,
+          songId: effectiveSongId,
+          checkpointStatus: initCp.status,
+          validChunkCount: 0,
+          totalChunks: initCp.totalChunks,
+          referenceCount: initCp.referencedBySongIds?.length ?? 1,
+          leaseState: "none",
+          outcome: "added",
+        });
       } else {
+        await addCheckpointReference({
+          taskId: checkpointTaskId,
+          songId: effectiveSongId,
+          mode: options.mode,
+          source: "stemSeparator.resumeCheckpoint",
+        });
         await updateCheckpointStatus(checkpointTaskId, {
           status: "running",
           requestedMode: options.mode,
@@ -1417,7 +1504,8 @@ export async function separateAudio(
         options.onStatus?.(`正在以 ${backend === "webgpu" ? "WebGPU" : "WASM"} 分離音源…`);
 
         if (streamChunks && checkpointTaskId && decodedLeft && decodedRight) {
-          const freshCp = await getCheckpoint(checkpointTaskId);
+          const mainThreadTaskId = checkpointTaskId;
+          const freshCp = await getCheckpoint(mainThreadTaskId);
           const resumeFrom = freshCp?.nextChunkIndex ?? startChunkIndex;
           const carry =
             resumeFrom > 0 ? (freshCp?.overlapCarryBuffer ?? initialOverlapCarryBuffer) : null;
@@ -1431,7 +1519,7 @@ export async function separateAudio(
             shouldPause: () => controller.isPausingOrPaused(),
             onChunk: async (chunk) => {
               const committed = await commitChunkAndCheckpointAtomically({
-                taskId: checkpointTaskId,
+                taskId: mainThreadTaskId,
                 chunkIndex: chunk.chunkIndex,
                 startSample: chunk.startSample,
                 endSample: chunk.endSample,

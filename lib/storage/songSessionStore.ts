@@ -13,6 +13,10 @@ import { DEMUCS_MODEL_VERSION, SEPARATION_PROCESSING_VERSION } from "./cacheKeys
 import { idbGetAll, idbRequestPromise, withIdbTransaction } from "./indexedDb";
 import { getModelCacheMetadata } from "./modelCache";
 import type { StemCacheRecord } from "./separationCacheRecord";
+import {
+  releaseCheckpointReferenceAndMaybeGc,
+  runCheckpointGarbageCollection,
+} from "./separationCheckpointStore";
 
 const SESSION_META_KEY = "band-session" as const;
 const SYNC_CHANNEL_NAME = "loop-harmonizer-band-sync";
@@ -484,6 +488,8 @@ export async function removePersistedSong(input: {
           songsStore.get(input.song.id),
         );
         const targetAudioHash = existingRecord?.sourceAudioHash ?? input.song.sourceAudioHash ?? null;
+        const targetTaskId = existingRecord?.separationTaskId ?? input.song.separationTaskId ?? null;
+        const targetCacheKey = existingRecord?.cacheKey ?? input.song.cacheKey ?? null;
 
         await idbRequestPromise(songsStore.delete(input.song.id));
 
@@ -548,9 +554,25 @@ export async function removePersistedSong(input: {
           deletedSeparationCount,
           sharedWithOtherSongs,
           nextOrder,
+          targetTaskId,
+          targetAudioHash,
+          targetCacheKey,
         };
       },
     );
+
+    if (input.deleteLocalData && (res.targetTaskId || res.targetAudioHash)) {
+      await releaseCheckpointReferenceAndMaybeGc({
+        taskId: res.targetTaskId,
+        sourceAudioHash: res.targetAudioHash,
+        songId: input.song.id,
+        cacheKeyToRelease: res.targetCacheKey,
+        knownInMemorySongs: input.inMemoryRemainingSongs
+          ? [...input.inMemoryRemainingSongs]
+          : undefined,
+        source: "removePersistedSong",
+      }).catch(() => undefined);
+    }
 
     postSyncMessage({
       type: "song-removed",
@@ -570,7 +592,7 @@ export async function removePersistedSong(input: {
 export async function clearUnusedSeparationCaches(
   inMemorySongs: readonly BandSong[] = [],
 ): Promise<{ deletedCount: number; freedBytes: number }> {
-  return enqueueDbWrite(() =>
+  const res = await enqueueDbWrite(() =>
     withIdbTransaction(["songs", "separations"], "readwrite", async (tx) => {
       const songsStore = tx.objectStore("songs");
       const separationsStore = tx.objectStore("separations");
@@ -600,6 +622,11 @@ export async function clearUnusedSeparationCaches(
       return { deletedCount, freedBytes };
     }),
   );
+  await runCheckpointGarbageCollection({
+    knownInMemorySongs: [...inMemorySongs],
+    source: "clearUnusedSeparationCaches",
+  }).catch(() => undefined);
+  return res;
 }
 
 // ── Debounced song settings/state queue ──

@@ -4,7 +4,12 @@ import type {
   StereoPcm,
   TwoStemPcm,
 } from "../separation/stemTypes.ts";
-import { idbGet, idbGetAll, idbRequestPromise, withIdbTransaction } from "./indexedDb.ts";
+import {
+  SEPARATION_CHUNK_TASK_INDEX,
+  idbGet,
+  idbRequestPromise,
+  withIdbTransaction,
+} from "./indexedDb.ts";
 
 export const DEMUCS_SAMPLE_RATE = 44100;
 export const DEMUCS_TRAINING_SAMPLES = 343980;
@@ -236,24 +241,105 @@ export async function getChunkRecord(
   return idbGet<SeparationChunkRecord>("separationChunks", createChunkKey(taskId, chunkIndex));
 }
 
+function hasChunkTaskIndex(store: IDBObjectStore): boolean {
+  if (typeof store.index !== "function") return false;
+  if (store.indexNames && typeof store.indexNames.contains === "function") {
+    return store.indexNames.contains(SEPARATION_CHUNK_TASK_INDEX);
+  }
+  return true;
+}
+
+export async function getTaskChunkKeysInStore(
+  store: IDBObjectStore,
+  taskId: string,
+): Promise<IDBValidKey[]> {
+  if (hasChunkTaskIndex(store)) {
+    const idx = store.index(SEPARATION_CHUNK_TASK_INDEX);
+    if (typeof idx.getAllKeys === "function") {
+      return (await idbRequestPromise(idx.getAllKeys(taskId))) as IDBValidKey[];
+    }
+  }
+  const all = (await idbRequestPromise(store.getAll())) as SeparationChunkRecord[];
+  return all.filter((rec) => rec.taskId === taskId).map((rec) => rec.key);
+}
+
+export async function getTaskChunkRecordsInStore(
+  store: IDBObjectStore,
+  taskId: string,
+): Promise<SeparationChunkRecord[]> {
+  const rows = hasChunkTaskIndex(store)
+    ? ((await idbRequestPromise(
+        store.index(SEPARATION_CHUNK_TASK_INDEX).getAll(taskId),
+      )) as SeparationChunkRecord[])
+    : ((await idbRequestPromise(store.getAll())) as SeparationChunkRecord[]).filter(
+        (rec) => rec.taskId === taskId,
+      );
+  return rows.sort((a, b) => a.chunkIndex - b.chunkIndex);
+}
+
+export async function deleteChunksByTaskIdInStore(
+  store: IDBObjectStore,
+  taskId: string,
+): Promise<number> {
+  const keys = await getTaskChunkKeysInStore(store, taskId);
+  let deleted = 0;
+  for (const key of keys) {
+    await idbRequestPromise(store.delete(key));
+    deleted++;
+  }
+  return deleted;
+}
+
+/**
+ * 透過 by_taskId.openKeyCursor() 僅讀取索引鍵與主鍵，不載入任何二進位 PCM payload。
+ */
+export async function collectChunkPrimaryKeysGroupedByTaskIdInStore(
+  store: IDBObjectStore,
+): Promise<Map<string, IDBValidKey[]>> {
+  const grouped = new Map<string, IDBValidKey[]>();
+  if (hasChunkTaskIndex(store)) {
+    const idx = store.index(SEPARATION_CHUNK_TASK_INDEX);
+    if (typeof idx.openKeyCursor === "function") {
+      await new Promise<void>((resolve, reject) => {
+        const req = idx.openKeyCursor();
+        req.onsuccess = () => {
+          const cursor = req.result;
+          if (!cursor) {
+            resolve();
+            return;
+          }
+          const taskId = String(cursor.key ?? "");
+          const list = grouped.get(taskId) ?? [];
+          list.push(cursor.primaryKey);
+          grouped.set(taskId, list);
+          cursor.continue();
+        };
+        req.onerror = () => {
+          reject(req.error ?? new Error("IndexedDB key cursor 讀取失敗"));
+        };
+      });
+      return grouped;
+    }
+  }
+  const all = (await idbRequestPromise(store.getAll())) as SeparationChunkRecord[];
+  for (const rec of all) {
+    const list = grouped.get(rec.taskId) ?? [];
+    list.push(rec.key);
+    grouped.set(rec.taskId, list);
+  }
+  return grouped;
+}
+
 export async function getTaskChunkRecords(taskId: string): Promise<SeparationChunkRecord[]> {
-  const all = await idbGetAll<SeparationChunkRecord>("separationChunks");
-  return all
-    .filter((rec) => rec.taskId === taskId)
-    .sort((a, b) => a.chunkIndex - b.chunkIndex);
+  return withIdbTransaction("separationChunks", "readonly", async (tx) => {
+    const store = tx.objectStore("separationChunks");
+    return getTaskChunkRecordsInStore(store, taskId);
+  });
 }
 
 export async function deleteTaskChunks(taskId: string): Promise<number> {
   return withIdbTransaction("separationChunks", "readwrite", async (tx) => {
     const store = tx.objectStore("separationChunks");
-    const all = (await idbRequestPromise(store.getAll())) as SeparationChunkRecord[];
-    let deleted = 0;
-    for (const rec of all) {
-      if (rec.taskId === taskId) {
-        await idbRequestPromise(store.delete(rec.key));
-        deleted++;
-      }
-    }
-    return deleted;
+    return deleteChunksByTaskIdInStore(store, taskId);
   });
 }
