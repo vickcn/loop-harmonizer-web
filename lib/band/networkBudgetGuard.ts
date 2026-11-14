@@ -100,22 +100,20 @@ export type NetworkTransferEvaluationInput = {
   knownSizeBytes?: number | null;
   budgetBytes?: number;
   sessionTransferredBytes?: number;
-  allowOverBudget?: boolean;
-  allowUnknownAsset?: boolean;
 };
 
 export type NetworkTransferDecision = {
   allowed: boolean;
   fromCache: boolean;
   failClosed: boolean;
-  requiresConfirmation: boolean;
+  hardBlocked: boolean;
   origin: NetworkAssetOrigin;
   assetLabel: string;
   estimatedTransferBytes: number;
   projectedSessionBytes: number;
   budgetBytes: number;
   sizeSource: "cached" | "exact-static-file" | "estimated-upstream" | "caller-supplied" | "unknown";
-  reason: "cached" | "within-budget" | "approved-over-budget" | "exceeds-budget" | "unknown-asset-or-size";
+  reason: "cached" | "within-budget" | "exceeds-budget" | "unknown-asset-or-size" | "server-compute-prohibited";
   message: string;
 };
 
@@ -128,13 +126,13 @@ export type NetworkAssetBatchItem = {
 export type NetworkBatchEvaluation = {
   allowed: boolean;
   failClosed: boolean;
-  requiresConfirmation: boolean;
+  hardBlocked: boolean;
   totalEstimatedTransferBytes: number;
   vercelStaticBytes: number;
   externalCdnBytes: number;
   budgetBytes: number;
   items: NetworkTransferDecision[];
-  blockingReason: "unknown-asset-or-size" | "exceeds-budget" | null;
+  blockingReason: "unknown-asset-or-size" | "exceeds-budget" | "server-compute-prohibited" | null;
   message: string;
 };
 
@@ -200,12 +198,29 @@ export function evaluateNetworkTransfer(
   const priorBytes = Math.max(0, input.sessionTransferredBytes ?? 0);
   const normalized = normalizeAssetUrlPath(input.url);
 
+  if (normalized.startsWith("/api/") || normalized.includes("/api/")) {
+    return {
+      allowed: false,
+      fromCache: false,
+      failClosed: true,
+      hardBlocked: true,
+      origin: "unknown",
+      assetLabel: normalized || "後端 API",
+      estimatedTransferBytes: 0,
+      projectedSessionBytes: priorBytes,
+      budgetBytes,
+      sizeSource: "unknown",
+      reason: "server-compute-prohibited",
+      message: "禁止使用 Vercel Functions 或後端 Worker 代替本機音訊與 AI 運算。",
+    };
+  }
+
   if (normalized.startsWith("blob:") || normalized.startsWith("data:") || input.isCached) {
     return {
       allowed: true,
       fromCache: true,
       failClosed: false,
-      requiresConfirmation: false,
+      hardBlocked: false,
       origin: "local-cache",
       assetLabel: resolveKnownNetworkAsset(input.url)?.label ?? normalized,
       estimatedTransferBytes: 0,
@@ -225,12 +240,11 @@ export function evaluateNetworkTransfer(
       : known?.sizeBytes ?? null;
 
   if (origin === "unknown" || resolvedSize === null) {
-    const allowed = Boolean(input.allowUnknownAsset && input.allowOverBudget);
     return {
-      allowed,
+      allowed: false,
       fromCache: false,
-      failClosed: !allowed,
-      requiresConfirmation: !allowed,
+      failClosed: true,
+      hardBlocked: true,
       origin,
       assetLabel: known?.label ?? (normalized || "未識別資產"),
       estimatedTransferBytes: resolvedSize ?? 0,
@@ -238,7 +252,7 @@ export function evaluateNetworkTransfer(
       budgetBytes,
       sizeSource: "unknown",
       reason: "unknown-asset-or-size",
-      message: `未登記來源或未知檔案大小（${normalized || "空白 URL"}），依安全策略預設拒絕下載（fail-closed）。`,
+      message: `未登記來源或無法確認大小（${normalized || "空白 URL"}），已直接拒絕下載（fail-closed，不提供強制繼續）。`,
     };
   }
 
@@ -251,12 +265,12 @@ export function evaluateNetworkTransfer(
   const label = known?.label ?? normalized;
   const originText = origin === "vercel-static" ? "Vercel 本站靜態資產" : "外部 CDN";
 
-  if (exceeds && !input.allowOverBudget) {
+  if (exceeds) {
     return {
       allowed: false,
       fromCache: false,
       failClosed: false,
-      requiresConfirmation: true,
+      hardBlocked: true,
       origin,
       assetLabel: label,
       estimatedTransferBytes: resolvedSize,
@@ -264,7 +278,7 @@ export function evaluateNetworkTransfer(
       budgetBytes,
       sizeSource,
       reason: "exceeds-budget",
-      message: `${label}（來源：${originText}）預計下載 ${formatMiB(resolvedSize)}，將使本次網路傳輸達 ${formatMiB(projected)}，超過 ${formatMiB(budgetBytes)} 預設上限。`,
+      message: `${label}（來源：${originText}）未快取下載量約 ${formatMiB(resolvedSize)}，超過統一 ${formatMiB(budgetBytes)} 網路預算上限，已直接拒絕（不因裝置等級放行）。`,
     };
   }
 
@@ -272,17 +286,15 @@ export function evaluateNetworkTransfer(
     allowed: true,
     fromCache: false,
     failClosed: false,
-    requiresConfirmation: false,
+    hardBlocked: false,
     origin,
     assetLabel: label,
     estimatedTransferBytes: resolvedSize,
     projectedSessionBytes: projected,
     budgetBytes,
     sizeSource,
-    reason: exceeds ? "approved-over-budget" : "within-budget",
-    message: exceeds
-      ? `使用者已授權超額下載 ${label}（${formatMiB(resolvedSize)}，${originText}）。`
-      : `${label} 預計下載 ${formatMiB(resolvedSize)}（${originText}），位於預算內。`,
+    reason: "within-budget",
+    message: `${label} 預計下載 ${formatMiB(resolvedSize)}（${originText}），位於預算內。`,
   };
 }
 
@@ -290,8 +302,6 @@ export function evaluateNetworkAssetBatch(options: {
   assets: readonly NetworkAssetBatchItem[];
   budgetBytes?: number;
   sessionTransferredBytes?: number;
-  allowOverBudget?: boolean;
-  allowUnknownAsset?: boolean;
 }): NetworkBatchEvaluation {
   const budgetBytes = Math.max(1, options.budgetBytes ?? DEFAULT_NETWORK_BUDGET_BYTES);
   let runningBytes = Math.max(0, options.sessionTransferredBytes ?? 0);
@@ -299,7 +309,8 @@ export function evaluateNetworkAssetBatch(options: {
   let vercelStaticBytes = 0;
   let externalCdnBytes = 0;
   let failClosed = false;
-  let requiresConfirmation = false;
+  let hardBlocked = false;
+  let serverBlocked = false;
 
   const items: NetworkTransferDecision[] = [];
   for (const asset of options.assets) {
@@ -309,8 +320,6 @@ export function evaluateNetworkAssetBatch(options: {
       knownSizeBytes: asset.knownSizeBytes,
       budgetBytes,
       sessionTransferredBytes: runningBytes,
-      allowOverBudget: options.allowOverBudget,
-      allowUnknownAsset: options.allowUnknownAsset,
     });
     items.push(decision);
     runningBytes = decision.projectedSessionBytes;
@@ -318,28 +327,33 @@ export function evaluateNetworkAssetBatch(options: {
     if (decision.origin === "vercel-static") vercelStaticBytes += decision.estimatedTransferBytes;
     if (decision.origin === "external-cdn") externalCdnBytes += decision.estimatedTransferBytes;
     if (decision.failClosed) failClosed = true;
-    if (decision.requiresConfirmation) requiresConfirmation = true;
+    if (decision.hardBlocked) hardBlocked = true;
+    if (decision.reason === "server-compute-prohibited") serverBlocked = true;
   }
 
-  const allowed = !failClosed && !requiresConfirmation;
-  const blockingReason = failClosed
-    ? "unknown-asset-or-size"
-    : requiresConfirmation
-      ? "exceeds-budget"
-      : null;
+  const allowed = !failClosed && !hardBlocked;
+  const blockingReason = serverBlocked
+    ? "server-compute-prohibited"
+    : failClosed
+      ? "unknown-asset-or-size"
+      : hardBlocked
+        ? "exceeds-budget"
+        : null;
 
-  let message = "本次操作不需下載超過預算之大型網路資產。";
-  if (blockingReason === "unknown-asset-or-size") {
+  let message = "本次操作不需新增超過預算之網路下載（可於本機快取執行）。";
+  if (blockingReason === "server-compute-prohibited") {
+    message = "禁止使用後端伺服器／Vercel Functions 執行本機音訊與 AI 運算，已拒絕請求。";
+  } else if (blockingReason === "unknown-asset-or-size") {
     const unknownItem = items.find((item) => item.failClosed);
-    message = unknownItem?.message ?? "偵測到未知來源或無法估算大小的網路下載，已依安全策略停止。";
+    message = unknownItem?.message ?? "偵測到未知來源或無法確認大小的網路下載，已直接拒絕（不提供繞過）。";
   } else if (blockingReason === "exceeds-budget") {
-    message = `預計下載 ${formatMiB(totalEstimatedTransferBytes)}（Vercel 靜態：${formatMiB(vercelStaticBytes)}；外部 CDN：${formatMiB(externalCdnBytes)}），超過 ${formatMiB(budgetBytes)} 預設下載上限，需經確認後才能繼續。`;
+    message = `預計新增下載 ${formatMiB(totalEstimatedTransferBytes)}（Vercel 靜態：${formatMiB(vercelStaticBytes)}；外部 CDN：${formatMiB(externalCdnBytes)}），超過所有裝置統一的 ${formatMiB(budgetBytes)} 下載上限，已直接拒絕（需已在本機完整快取方能執行）。`;
   }
 
   return {
     allowed,
     failClosed,
-    requiresConfirmation,
+    hardBlocked,
     totalEstimatedTransferBytes,
     vercelStaticBytes,
     externalCdnBytes,

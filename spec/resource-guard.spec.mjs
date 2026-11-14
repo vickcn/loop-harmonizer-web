@@ -3,9 +3,12 @@ import test from "node:test";
 
 import {
   assessResourceRisk,
+  evaluateTaskAdmission,
   formatDeviceCapabilitiesSummary,
   formatEstimatedMiB,
   PerformanceTelemetryTracker,
+  ResourceProfileStateManager,
+  selectDeviceResourceProfile,
 } from "../lib/band/resourceGuard.ts";
 import { restoreBandSongFromRecord, serializePersistedSong, createBandSong } from "../lib/band/songModel.ts";
 
@@ -152,8 +155,217 @@ test("telemetry tracker safely records timing durations when PerformanceObserver
   const tracker = new PerformanceTelemetryTracker();
   tracker.recordDecodeDuration(420);
   tracker.recordSeparationDuration(18500);
+  tracker.recordAudioUnderrun();
   const signals = tracker.getSignals();
   assert.equal(signals.lastDecodeDurationMs, 420);
   assert.equal(signals.lastSeparationDurationMs, 18500);
   assert.equal(signals.longTaskCount, 0);
+  assert.equal(signals.audioUnderrunCount, 1);
+  tracker.resetStressCountersAfterCleanup();
+  assert.equal(tracker.getSignals().audioUnderrunCount, 0);
+});
+
+test("selects constrained, balanced, and performance profiles across low-end Android, laptop, and desktop", () => {
+  const lowEndAndroid = selectDeviceResourceProfile({
+    capabilities: makeCap({
+      deviceMemoryGb: 3,
+      hardwareConcurrency: 4,
+      crossOriginIsolated: true,
+      formFactorHint: "mobile",
+    }),
+  });
+  assert.equal(lowEndAndroid.tier, "constrained");
+  assert.equal(lowEndAndroid.demucsConcurrency, 1);
+  assert.equal(lowEndAndroid.allowMainThreadLargeInference, false);
+  assert.ok(lowEndAndroid.maxWasmThreads <= 2);
+
+  const avgLaptop = selectDeviceResourceProfile({
+    capabilities: makeCap({
+      deviceMemoryGb: 8,
+      hardwareConcurrency: 6,
+      crossOriginIsolated: true,
+      formFactorHint: "desktop",
+    }),
+  });
+  assert.equal(avgLaptop.tier, "balanced");
+  assert.equal(avgLaptop.demucsConcurrency, 1);
+
+  const highEndDesktop = selectDeviceResourceProfile({
+    capabilities: makeCap({
+      deviceMemoryGb: 16,
+      hardwareConcurrency: 12,
+      crossOriginIsolated: true,
+      formFactorHint: "desktop",
+    }),
+  });
+  assert.equal(highEndDesktop.tier, "performance");
+  assert.equal(highEndDesktop.demucsConcurrency, 1);
+  assert.ok(highEndDesktop.maxWasmThreads > lowEndAndroid.maxWasmThreads);
+  assert.ok(highEndDesktop.workingMemoryBudgetBytes > avgLaptop.workingMemoryBudgetBytes);
+});
+
+test("missing hardware metrics force conservative constrained tier and non-isolated WASM clamps threads to 1", () => {
+  const unknownDesktop = selectDeviceResourceProfile({
+    capabilities: makeCap({
+      deviceMemoryGb: null,
+      hardwareConcurrency: null,
+      crossOriginIsolated: true,
+      formFactorHint: "desktop",
+    }),
+  });
+  assert.equal(unknownDesktop.tier, "constrained");
+  assert.equal(unknownDesktop.hardwareInfoIncomplete, true);
+
+  const nonIsolatedDesktop = selectDeviceResourceProfile({
+    capabilities: makeCap({
+      deviceMemoryGb: 16,
+      hardwareConcurrency: 12,
+      crossOriginIsolated: false,
+      formFactorHint: "desktop",
+    }),
+  });
+  assert.equal(nonIsolatedDesktop.tier, "performance");
+  assert.equal(nonIsolatedDesktop.maxWasmThreads, 1);
+});
+
+test("enforces worker availability, global Demucs concurrency = 1, memory budget, and SoundTouch pressure", () => {
+  const perfCap = makeCap({
+    deviceMemoryGb: 16,
+    hardwareConcurrency: 12,
+    crossOriginIsolated: true,
+    formFactorHint: "desktop",
+  });
+  const desktopProfile = selectDeviceResourceProfile({ capabilities: perfCap });
+
+  const noWorker = evaluateTaskAdmission({
+    operation: "separate",
+    profile: desktopProfile,
+    capabilities: makeCap({ supportsWorker: false }),
+    estimatedTaskMemoryBytes: 120 * 1024 * 1024,
+  });
+  assert.equal(noWorker.allowed, false);
+  assert.equal(noWorker.hardRejected, true);
+  assert.equal(noWorker.rejectionReason, "worker-unavailable");
+
+  const secondDemucs = evaluateTaskAdmission({
+    operation: "separate",
+    profile: desktopProfile,
+    capabilities: perfCap,
+    estimatedTaskMemoryBytes: 120 * 1024 * 1024,
+    runningDemucsCount: 1,
+  });
+  assert.equal(secondDemucs.allowed, false);
+  assert.equal(secondDemucs.hardRejected, true);
+  assert.equal(secondDemucs.rejectionReason, "demucs-concurrency-limit");
+
+  const overMemDesktop = evaluateTaskAdmission({
+    operation: "separate",
+    profile: desktopProfile,
+    capabilities: perfCap,
+    inMemoryAudioBytes: desktopProfile.workingMemoryBudgetBytes,
+    estimatedTaskMemoryBytes: 128 * 1024 * 1024,
+  });
+  assert.equal(overMemDesktop.requiresWarning, true);
+  assert.equal(overMemDesktop.rejectionReason, "exceeds-working-memory-budget");
+
+  const constrainedProfile = selectDeviceResourceProfile({
+    capabilities: makeCap({ deviceMemoryGb: 3, hardwareConcurrency: 4, formFactorHint: "mobile" }),
+  });
+  const severeOverMemConstrained = evaluateTaskAdmission({
+    operation: "separate",
+    profile: constrainedProfile,
+    capabilities: makeCap({ deviceMemoryGb: 3, hardwareConcurrency: 4, formFactorHint: "mobile" }),
+    inMemoryAudioBytes: constrainedProfile.workingMemoryBudgetBytes,
+    estimatedTaskMemoryBytes: constrainedProfile.workingMemoryBudgetBytes * 0.6,
+  });
+  assert.equal(severeOverMemConstrained.allowed, false);
+  assert.equal(severeOverMemConstrained.hardRejected, true);
+  assert.equal(severeOverMemConstrained.rejectionReason, "exceeds-working-memory-budget");
+
+  const soundtouchOverload = evaluateTaskAdmission({
+    operation: "soundtouch-playback",
+    profile: constrainedProfile,
+    capabilities: makeCap({ deviceMemoryGb: 3, hardwareConcurrency: 4 }),
+    estimatedTaskMemoryBytes: 0,
+    projectedActiveSoundTouchTracks: constrainedProfile.maxActiveSoundTouchTracks + 2,
+  });
+  assert.equal(soundtouchOverload.allowed, true);
+  assert.equal(soundtouchOverload.requiresWarning, true);
+  assert.equal(soundtouchOverload.hardRejected, false);
+  assert.equal(soundtouchOverload.rejectionReason, "soundtouch-track-pressure");
+});
+
+test("profile state manager degrades on stress, blocks unverified auto-upgrade, and reevaluates after cleanup", () => {
+  const manager = new ResourceProfileStateManager();
+  const desktopCap = makeCap({
+    deviceMemoryGb: 16,
+    hardwareConcurrency: 12,
+    crossOriginIsolated: true,
+    formFactorHint: "desktop",
+  });
+
+  const initial = manager.evaluate(desktopCap, {
+    longTaskSupported: true,
+    longTaskCount: 0,
+    maxLongTaskDurationMs: 0,
+    lastSeparationDurationMs: null,
+    lastDecodeDurationMs: null,
+    audioUnderrunCount: 0,
+  });
+  assert.equal(initial.profile.tier, "performance");
+  assert.equal(initial.justDegraded, false);
+
+  const degraded = manager.evaluate(desktopCap, {
+    longTaskSupported: true,
+    longTaskCount: 6,
+    maxLongTaskDurationMs: 420,
+    lastSeparationDurationMs: 250000,
+    lastDecodeDurationMs: 400,
+    audioUnderrunCount: 4,
+  });
+  assert.equal(degraded.profile.tier, "constrained");
+  assert.equal(degraded.justDegraded, true);
+
+  // Even when counters momentarily clear, evaluate() must NOT auto-upgrade without verified cleanup
+  const noAutoUpgrade = manager.evaluate(desktopCap, {
+    longTaskSupported: true,
+    longTaskCount: 0,
+    maxLongTaskDurationMs: 0,
+    lastSeparationDurationMs: null,
+    lastDecodeDurationMs: null,
+    audioUnderrunCount: 0,
+  });
+  assert.equal(noAutoUpgrade.profile.tier, "constrained");
+
+  const unverifiedCleanup = manager.reevaluateAfterCleanup({
+    capabilities: desktopCap,
+    performanceSignals: {
+      longTaskSupported: true,
+      longTaskCount: 0,
+      maxLongTaskDurationMs: 0,
+      lastSeparationDurationMs: null,
+      lastDecodeDurationMs: null,
+      audioUnderrunCount: 0,
+    },
+    cleanupCompleted: true,
+    stabilityVerified: false,
+  });
+  assert.equal(unverifiedCleanup.upgraded, false);
+  assert.equal(unverifiedCleanup.profile.tier, "constrained");
+
+  const verifiedCleanup = manager.reevaluateAfterCleanup({
+    capabilities: desktopCap,
+    performanceSignals: {
+      longTaskSupported: true,
+      longTaskCount: 0,
+      maxLongTaskDurationMs: 0,
+      lastSeparationDurationMs: null,
+      lastDecodeDurationMs: null,
+      audioUnderrunCount: 0,
+    },
+    cleanupCompleted: true,
+    stabilityVerified: true,
+  });
+  assert.equal(verifiedCleanup.upgraded, true);
+  assert.equal(verifiedCleanup.profile.tier, "performance");
 });

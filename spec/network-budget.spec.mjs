@@ -36,7 +36,7 @@ test("blocks uncached 25 MB Vercel static ORT WASM over 10 MiB limit and tracks 
   });
 
   assert.equal(decision.allowed, false);
-  assert.equal(decision.requiresConfirmation, true);
+  assert.equal(decision.hardBlocked, true);
   assert.equal(decision.origin, "vercel-static");
   assert.ok(decision.estimatedTransferBytes > 25_000_000);
   assert.equal(decision.reason, "exceeds-budget");
@@ -95,4 +95,25 @@ test("ledger records approved transfers by origin without double counting the sa
   assert.equal(snapshot.vercelStaticBytes, 26324);
   assert.equal(snapshot.externalCdnBytes, 172000000);
   assert.equal(snapshot.totalBytes, 26324 + 172000000);
+});
+
+test("enforces strict 10 MiB cap with hardBlocked even on high-end desktop and blocks /api/ server compute", () => {
+  const highEndDesktopBatch = evaluateNetworkAssetBatch({
+    assets: [
+      { url: "/vendor/onnxruntime-web/ort-wasm-simd-threaded.asyncify.wasm", isCached: false },
+      { url: "https://huggingface.co/timcsy/demucs-web-onnx/resolve/main/htdemucs_embedded.onnx", isCached: false },
+    ],
+  });
+  assert.equal(highEndDesktopBatch.allowed, false);
+  assert.equal(highEndDesktopBatch.hardBlocked, true);
+  assert.equal(highEndDesktopBatch.blockingReason, "exceeds-budget");
+  assert.equal(highEndDesktopBatch.budgetBytes, 10 * 1024 * 1024);
+
+  const serverCompute = evaluateNetworkTransfer({
+    url: "/api/separate",
+    isCached: false,
+  });
+  assert.equal(serverCompute.allowed, false);
+  assert.equal(serverCompute.hardBlocked, true);
+  assert.equal(serverCompute.reason, "server-compute-prohibited");
 });

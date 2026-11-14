@@ -10,7 +10,6 @@ import type { NetworkBatchEvaluation } from "@/lib/band/networkBudgetGuard";
 
 export type ResourceGuardConfirmSelection = {
   applyLowLoadActions: LowLoadActionId[];
-  allowOverBudgetNetwork: boolean;
 };
 
 type Props = {
@@ -66,9 +65,11 @@ export function ResourceGuardModal({
     return () => window.removeEventListener("keydown", onKey);
   }, [onCancel]);
 
-  const badge = riskBadgeText(assessment?.riskLevel ?? (networkEvaluation?.failClosed ? "critical" : "high"));
+  const badge = riskBadgeText(assessment?.riskLevel ?? (networkEvaluation && !networkEvaluation.allowed ? "critical" : "high"));
   const hasSuggestions = (assessment?.lowLoadSuggestions.length ?? 0) > 0;
-  const failClosedUnknown = Boolean(networkEvaluation?.failClosed);
+  const networkBlocked = Boolean(networkEvaluation && !networkEvaluation.allowed);
+  const admissionHardBlocked = Boolean(assessment?.admission.hardRejected);
+  const hardBlocked = networkBlocked || admissionHardBlocked;
 
   const toggleSuggestion = (id: LowLoadActionId) => {
     setSelectedLowLoad((prev) => {
@@ -110,8 +111,16 @@ export function ResourceGuardModal({
 
         {assessment && (
           <div className="grid mixer-modal-section" style={{ gap: 6 }}>
+            <div className="small" style={{ opacity: 0.92 }}>
+              裝置分級：<strong>{assessment.profile.tier.toUpperCase()}</strong>
+              {assessment.profile.degraded ? `（已保守降級，原 ${assessment.profile.initialTier}）` : ""}
+              {" ｜ "}WASM Threads：{assessment.profile.maxWasmThreads}
+              {" ｜ "}SoundTouch 同時軌道上限：{assessment.profile.maxActiveSoundTouchTracks} 軌
+              {" ｜ "}Demucs 併發上限：{assessment.profile.demucsConcurrency}
+            </div>
             <div className="small" style={{ opacity: 0.9 }}>
               預估記憶體需求：{formatEstimatedMiB(assessment.estimatedMemoryBytes)}
+              {" ｜ "}工作記憶體預算：{formatMiBExact(assessment.profile.workingMemoryBudgetBytes)}
               {assessment.estimatedStorageBytes > 0
                 ? ` ｜ 預估寫入快取：${formatEstimatedMiB(assessment.estimatedStorageBytes)}`
                 : ""}
@@ -119,6 +128,11 @@ export function ResourceGuardModal({
             <div className="small" style={{ opacity: 0.78 }}>
               預估處理時間：{assessment.estimatedDurationLabel}
             </div>
+            {assessment.admission.hardRejected && (
+              <div className="small" style={{ color: "#fecaca", fontWeight: 600 }}>
+                准入拒絕：{assessment.admission.message}
+              </div>
+            )}
             <ul className="mixer-modal-list">
               {assessment.reasons.map((reason, idx) => (
                 <li key={idx} className="small">{reason}</li>
@@ -140,8 +154,8 @@ export function ResourceGuardModal({
 
         {networkEvaluation && !networkEvaluation.allowed && (
           <div className="grid mixer-modal-section is-network" style={{ gap: 6 }}>
-            <strong style={{ fontSize: 13, color: failClosedUnknown ? "#fca5a5" : "#bae6fd" }}>
-              網路傳輸預算保護（預設上限 {formatMiBExact(networkEvaluation.budgetBytes)}）
+            <strong style={{ fontSize: 13, color: "#fca5a5" }}>
+              網路傳輸預算保護（所有裝置統一上限 {formatMiBExact(networkEvaluation.budgetBytes)}，不提供繞過）
             </strong>
             <span className="small">{networkEvaluation.message}</span>
             <div className="small" style={{ opacity: 0.85 }}>
@@ -162,7 +176,7 @@ export function ResourceGuardModal({
           </div>
         )}
 
-        {hasSuggestions && assessment && !failClosedUnknown && (
+        {hasSuggestions && assessment && !hardBlocked && (
           <div className="grid mixer-modal-section" style={{ gap: 8 }}>
             <strong style={{ fontSize: 13 }}>可套用的安全降載策略（維持原始音質）</strong>
             {assessment.lowLoadSuggestions.map((item) => {
@@ -190,9 +204,9 @@ export function ResourceGuardModal({
             className="btn mixer-button"
             onClick={onCancel}
           >
-            取消
+            {hardBlocked ? "關閉" : "取消"}
           </button>
-          {!failClosedUnknown && (
+          {!hardBlocked && (
             <>
               <button
                 type="button"
@@ -200,7 +214,6 @@ export function ResourceGuardModal({
                 onClick={() =>
                   onConfirm({
                     applyLowLoadActions: [],
-                    allowOverBudgetNetwork: Boolean(networkEvaluation && !networkEvaluation.allowed),
                   })
                 }
               >
@@ -213,7 +226,6 @@ export function ResourceGuardModal({
                   onClick={() =>
                     onConfirm({
                       applyLowLoadActions: [...selectedLowLoad],
-                      allowOverBudgetNetwork: Boolean(networkEvaluation && !networkEvaluation.allowed),
                     })
                   }
                 >

@@ -1,5 +1,9 @@
 export type ResourceRiskLevel = "low" | "medium" | "high" | "critical";
 
+export type DeviceResourceTier = "constrained" | "balanced" | "performance";
+
+export type DeviceFormFactorHint = "mobile" | "tablet" | "desktop" | "unknown";
+
 export type ResourceOperationKind =
   | "upload"
   | "decode"
@@ -19,6 +23,8 @@ export type DeviceCapabilitiesSnapshot = {
   jsHeapEstimatedAvailableBytes: number | null;
   supportsWebGpu: boolean;
   supportsWorker: boolean;
+  crossOriginIsolated?: boolean;
+  formFactorHint?: DeviceFormFactorHint;
   collectedAt: number;
 };
 
@@ -28,6 +34,49 @@ export type PerformanceSignals = {
   maxLongTaskDurationMs: number;
   lastSeparationDurationMs: number | null;
   lastDecodeDurationMs: number | null;
+  audioUnderrunCount?: number;
+  lastAudioUnderrunAt?: number | null;
+};
+
+export type DeviceResourceProfile = {
+  tier: DeviceResourceTier;
+  initialTier: DeviceResourceTier;
+  formFactorHint: DeviceFormFactorHint;
+  degraded: boolean;
+  degradationReason: string | null;
+  hardwareInfoIncomplete: boolean;
+  maxWasmThreads: number;
+  workingMemoryBudgetBytes: number;
+  maxActiveSoundTouchTracks: number;
+  demucsConcurrency: 1;
+  allowMainThreadLargeInference: false;
+  reasons: string[];
+};
+
+export type TaskAdmissionInput = {
+  operation: ResourceOperationKind;
+  profile: DeviceResourceProfile;
+  capabilities: DeviceCapabilitiesSnapshot;
+  estimatedTaskMemoryBytes: number;
+  estimatedTaskStorageBytes?: number;
+  inMemoryAudioBytes?: number;
+  runningDemucsCount?: number;
+  projectedActiveSoundTouchTracks?: number;
+  requireWorkerForSeparation?: boolean;
+};
+
+export type TaskAdmissionDecision = {
+  allowed: boolean;
+  requiresWarning: boolean;
+  hardRejected: boolean;
+  rejectionReason:
+    | "worker-unavailable"
+    | "demucs-concurrency-limit"
+    | "exceeds-working-memory-budget"
+    | "insufficient-storage"
+    | "soundtouch-track-pressure"
+    | null;
+  message: string;
 };
 
 export type LowLoadActionId =
@@ -52,8 +101,10 @@ export type ResourceRiskAssessmentInput = {
   activeSongCount?: number;
   playingSongCount?: number;
   activeSoundTouchTracks?: number;
+  runningDemucsCount?: number;
   estimatedInMemoryAudioBytes?: number;
   hasOtherIdleDecodedSongs?: boolean;
+  profile?: DeviceResourceProfile;
   capabilities: DeviceCapabilitiesSnapshot;
   performanceSignals?: PerformanceSignals;
 };
@@ -63,6 +114,8 @@ export type ResourceRiskAssessment = {
   riskLevel: ResourceRiskLevel;
   requiresConfirmation: boolean;
   blockedByDefault: boolean;
+  profile: DeviceResourceProfile;
+  admission: TaskAdmissionDecision;
   estimatedMemoryBytes: number;
   estimatedStorageBytes: number;
   estimatedDurationLabel: string;
@@ -180,6 +233,23 @@ export async function collectDeviceCapabilities(): Promise<DeviceCapabilitiesSna
 
   const supportsWebGpu = Boolean(nav?.gpu && typeof nav.gpu.requestAdapter === "function");
   const supportsWorker = typeof Worker !== "undefined";
+  const crossOriginIsolated =
+    typeof globalThis !== "undefined"
+      ? Boolean((globalThis as { crossOriginIsolated?: boolean }).crossOriginIsolated)
+      : false;
+
+  let formFactorHint: DeviceFormFactorHint = "unknown";
+  if (typeof window !== "undefined") {
+    const coarse = Boolean(window.matchMedia?.("(pointer: coarse)")?.matches);
+    const width = window.innerWidth || 0;
+    if (coarse && width > 0 && width <= 640) {
+      formFactorHint = "mobile";
+    } else if (coarse && width > 640 && width <= 1180) {
+      formFactorHint = "tablet";
+    } else if (!coarse && width >= 1024) {
+      formFactorHint = "desktop";
+    }
+  }
 
   return {
     deviceMemoryGb,
@@ -193,7 +263,305 @@ export async function collectDeviceCapabilities(): Promise<DeviceCapabilitiesSna
     jsHeapEstimatedAvailableBytes,
     supportsWebGpu,
     supportsWorker,
+    crossOriginIsolated,
+    formFactorHint,
     collectedAt: Date.now(),
+  };
+}
+
+const TIER_RANK: Record<DeviceResourceTier, number> = {
+  constrained: 0,
+  balanced: 1,
+  performance: 2,
+};
+
+function stepDownTier(tier: DeviceResourceTier, steps = 1): DeviceResourceTier {
+  const targetRank = Math.max(0, TIER_RANK[tier] - steps);
+  if (targetRank === 2) return "performance";
+  if (targetRank === 1) return "balanced";
+  return "constrained";
+}
+
+function buildProfileForTier(
+  tier: DeviceResourceTier,
+  initialTier: DeviceResourceTier,
+  capabilities: DeviceCapabilitiesSnapshot,
+  reasons: string[],
+  degradationReason: string | null,
+): DeviceResourceProfile {
+  const formFactorHint: DeviceFormFactorHint = capabilities.formFactorHint ?? "unknown";
+  const hardwareInfoIncomplete = capabilities.deviceMemoryGb === null || capabilities.hardwareConcurrency === null;
+  const cores = Math.max(1, capabilities.hardwareConcurrency ?? 1);
+  const isolated = Boolean(capabilities.crossOriginIsolated);
+
+  let maxWasmThreads = 1;
+  if (isolated) {
+    if (tier === "performance") maxWasmThreads = Math.min(4, cores);
+    else if (tier === "balanced") maxWasmThreads = Math.min(2, cores);
+    else maxWasmThreads = 1;
+  } else {
+    maxWasmThreads = 1;
+    reasons.push("瀏覽器未處於 crossOriginIsolated 環境，WASM 執行緒上限鎖定為 1。");
+  }
+
+  let workingMemoryBudgetBytes = 320 * BYTES_PER_MB;
+  if (tier === "balanced") {
+    workingMemoryBudgetBytes = 768 * BYTES_PER_MB;
+  } else if (tier === "performance") {
+    workingMemoryBudgetBytes = 1536 * BYTES_PER_MB;
+  } else if (capabilities.deviceMemoryGb !== null && capabilities.deviceMemoryGb <= 2) {
+    workingMemoryBudgetBytes = 240 * BYTES_PER_MB;
+  }
+
+  const maxActiveSoundTouchTracks = tier === "performance" ? 8 : tier === "balanced" ? 4 : 2;
+
+  return {
+    tier,
+    initialTier,
+    formFactorHint,
+    degraded: TIER_RANK[tier] < TIER_RANK[initialTier] || Boolean(degradationReason),
+    degradationReason,
+    hardwareInfoIncomplete,
+    maxWasmThreads,
+    workingMemoryBudgetBytes,
+    maxActiveSoundTouchTracks,
+    demucsConcurrency: 1,
+    allowMainThreadLargeInference: false,
+    reasons,
+  };
+}
+
+export function selectDeviceResourceProfile(input: {
+  capabilities: DeviceCapabilitiesSnapshot;
+  performanceSignals?: PerformanceSignals;
+  lockedTier?: DeviceResourceTier | null;
+}): DeviceResourceProfile {
+  const { capabilities, performanceSignals, lockedTier } = input;
+  const formFactor: DeviceFormFactorHint = capabilities.formFactorHint ?? "unknown";
+  const reasons: string[] = [];
+
+  const hardwareInfoIncomplete =
+    capabilities.deviceMemoryGb === null || capabilities.hardwareConcurrency === null;
+
+  let initialTier: DeviceResourceTier = "constrained";
+  if (hardwareInfoIncomplete) {
+    initialTier = "constrained";
+    reasons.push("無法取得完整硬體資訊（RAM 或邏輯核心數缺失），採保守 constrained 配置，不推測剩餘實體記憶體。");
+  } else {
+    const memGb = capabilities.deviceMemoryGb!;
+    const cores = capabilities.hardwareConcurrency!;
+    if (memGb <= 4 || cores <= 4) {
+      initialTier = "constrained";
+      reasons.push(`硬體規格偏保守（約 ${memGb} GB / ${cores} 核心），採用 constrained 配置。`);
+    } else if (formFactor === "mobile" || formFactor === "tablet") {
+      initialTier = memGb >= 6 && cores >= 6 ? "balanced" : "constrained";
+      reasons.push(`依裝置型態參考（${formFactor}）與實測規格（${memGb} GB / ${cores} 核心）選擇 ${initialTier} 配置。`);
+    } else if (memGb >= 8 && cores >= 8) {
+      initialTier = "performance";
+      reasons.push(`桌面高規硬體（約 ${memGb} GB / ${cores} 核心），初始配置為 performance。`);
+    } else {
+      initialTier = "balanced";
+      reasons.push(`一般硬體規格（約 ${memGb} GB / ${cores} 核心），初始配置為 balanced。`);
+    }
+  }
+
+  let effectiveTier = initialTier;
+  let degradationReason: string | null = null;
+
+  if (capabilities.storageRemainingBytes !== null && capabilities.storageRemainingBytes < 120 * BYTES_PER_MB) {
+    effectiveTier = "constrained";
+    degradationReason = "瀏覽器剩餘儲存空間低於 120 MiB，調降為 constrained 配置。";
+    reasons.push(degradationReason);
+  }
+
+  const underruns = performanceSignals?.audioUnderrunCount ?? 0;
+  const longTasks = performanceSignals?.longTaskCount ?? 0;
+  const maxLongTaskMs = performanceSignals?.maxLongTaskDurationMs ?? 0;
+  const lastSepMs = performanceSignals?.lastSeparationDurationMs ?? 0;
+  const lastDecMs = performanceSignals?.lastDecodeDurationMs ?? 0;
+
+  const severeDegradation =
+    underruns >= 4 || longTasks >= 6 || maxLongTaskMs >= 350 || lastSepMs >= 240_000;
+  const moderateDegradation =
+    underruns >= 2 || longTasks >= 3 || maxLongTaskMs >= 200 || lastSepMs >= 150_000 || lastDecMs >= 5000;
+
+  if (severeDegradation) {
+    effectiveTier = "constrained";
+    degradationReason = `偵測到明顯效能壓力（Long Tasks: ${longTasks}, Audio Underruns: ${underruns}），自動降級至 constrained。`;
+    reasons.push(degradationReason);
+  } else if (moderateDegradation) {
+    const stepped = stepDownTier(effectiveTier, 1);
+    if (TIER_RANK[stepped] < TIER_RANK[effectiveTier]) {
+      effectiveTier = stepped;
+      degradationReason = `偵測到效能壓力訊號（Long Tasks: ${longTasks}, Audio Underruns: ${underruns}），保守降級至 ${stepped}。`;
+      reasons.push(degradationReason);
+    } else if (effectiveTier === "constrained") {
+      degradationReason = `constrained 模式下仍偵測到效能壓力（Long Tasks: ${longTasks}, Audio Underruns: ${underruns}）。`;
+      reasons.push(degradationReason);
+    }
+  }
+
+  if (lockedTier && TIER_RANK[lockedTier] < TIER_RANK[effectiveTier]) {
+    effectiveTier = lockedTier;
+    if (!degradationReason) {
+      degradationReason = `維持先前降級後之 ${lockedTier} 配置（尚未通過清理與穩定性驗證，禁止自動升級）。`;
+    }
+    reasons.push(degradationReason);
+  }
+
+  return buildProfileForTier(effectiveTier, initialTier, capabilities, reasons, degradationReason);
+}
+
+export class ResourceProfileStateManager {
+  private lockedTier: DeviceResourceTier | null = null;
+  private lastProfile: DeviceResourceProfile | null = null;
+
+  getCurrentProfile(): DeviceResourceProfile | null {
+    return this.lastProfile;
+  }
+
+  /**
+   * 評估並更新資源配置：
+   * - 允許效能惡化時自動降級（鎖定更低 tier）；
+   * - 絕不在未驗證穩定性前自動升級。
+   */
+  evaluate(
+    capabilities: DeviceCapabilitiesSnapshot,
+    performanceSignals?: PerformanceSignals,
+  ): {
+    profile: DeviceResourceProfile;
+    justDegraded: boolean;
+    previousTier: DeviceResourceTier | null;
+  } {
+    const previousTier = this.lastProfile?.tier ?? null;
+    const profile = selectDeviceResourceProfile({
+      capabilities,
+      performanceSignals,
+      lockedTier: this.lockedTier,
+    });
+
+    // 若本次評級比目前更低（包含剛觸發降級或原本已處較低 tier），鎖定為不可自動升回之上限
+    if (this.lockedTier === null || TIER_RANK[profile.tier] < TIER_RANK[this.lockedTier]) {
+      this.lockedTier = profile.tier;
+    }
+
+    const justDegraded = previousTier !== null && TIER_RANK[profile.tier] < TIER_RANK[previousTier];
+    this.lastProfile = profile;
+    return { profile, justDegraded, previousTier };
+  }
+
+  /**
+   * 僅在任務取消與資源釋放完成，且經穩定性驗證確認無持續阻塞/斷音訊號時，才解除降級鎖並重新評估。
+   */
+  reevaluateAfterCleanup(input: {
+    capabilities: DeviceCapabilitiesSnapshot;
+    performanceSignals: PerformanceSignals;
+    cleanupCompleted: boolean;
+    stabilityVerified: boolean;
+  }): {
+    profile: DeviceResourceProfile;
+    upgraded: boolean;
+    previousTier: DeviceResourceTier | null;
+  } {
+    const previousTier = this.lastProfile?.tier ?? this.lockedTier;
+    const hasResidualStress =
+      (input.performanceSignals.audioUnderrunCount ?? 0) >= 2
+      || input.performanceSignals.longTaskCount >= 3;
+
+    if (input.cleanupCompleted && input.stabilityVerified && !hasResidualStress) {
+      this.lockedTier = null;
+    }
+
+    const profile = selectDeviceResourceProfile({
+      capabilities: input.capabilities,
+      performanceSignals: input.performanceSignals,
+      lockedTier: this.lockedTier,
+    });
+    this.lockedTier = profile.tier;
+    this.lastProfile = profile;
+
+    const upgraded = previousTier !== null && TIER_RANK[profile.tier] > TIER_RANK[previousTier];
+    return { profile, upgraded, previousTier };
+  }
+
+  reset(): void {
+    this.lockedTier = null;
+    this.lastProfile = null;
+  }
+}
+
+export const sharedResourceProfileManager = new ResourceProfileStateManager();
+
+export function evaluateTaskAdmission(input: TaskAdmissionInput): TaskAdmissionDecision {
+  const { profile, capabilities, operation } = input;
+  const projectedMem = Math.max(0, input.inMemoryAudioBytes ?? 0) + Math.max(0, input.estimatedTaskMemoryBytes);
+  const estStorage = Math.max(0, input.estimatedTaskStorageBytes ?? 0);
+
+  if (operation === "separate") {
+    if ((input.runningDemucsCount ?? 0) >= profile.demucsConcurrency) {
+      return {
+        allowed: false,
+        requiresWarning: true,
+        hardRejected: true,
+        rejectionReason: "demucs-concurrency-limit",
+        message: "Demucs 分離任務同時執行上限固定為 1，請等待目前任務完成或先中止後再試。",
+      };
+    }
+
+    if (input.requireWorkerForSeparation !== false && !capabilities.supportsWorker && !profile.allowMainThreadLargeInference) {
+      return {
+        allowed: false,
+        requiresWarning: true,
+        hardRejected: true,
+        rejectionReason: "worker-unavailable",
+        message: "此瀏覽器不支援背景 Web Worker，依資源保護原則預設拒絕主執行緒大型 AI 推論，以避免介面失去反應。",
+      };
+    }
+  }
+
+  if (capabilities.storageRemainingBytes !== null && estStorage > capabilities.storageRemainingBytes * 0.9) {
+    return {
+      allowed: false,
+      requiresWarning: true,
+      hardRejected: true,
+      rejectionReason: "insufficient-storage",
+      message: `預估寫入快取（${formatEstimatedMiB(estStorage)}）接近或超出剩餘儲存空間，建議先清理未使用的分離快取。`,
+    };
+  }
+
+  if (operation === "soundtouch-playback") {
+    const projectedTracks = input.projectedActiveSoundTouchTracks ?? 1;
+    if (projectedTracks > profile.maxActiveSoundTouchTracks) {
+      return {
+        allowed: true,
+        requiresWarning: true,
+        hardRejected: false,
+        rejectionReason: "soundtouch-track-pressure",
+        message: `同時活躍 SoundTouch 軌道（${projectedTracks} 軌）超出目前 ${profile.tier} 配置建議上限（${profile.maxActiveSoundTouchTracks} 軌），可能發生破音或 CPU 過載；系統將先預警，不會擅自中斷播放中的歌曲。`,
+      };
+    }
+  }
+
+  if (projectedMem > profile.workingMemoryBudgetBytes) {
+    const isConstrainedHardBlock =
+      profile.tier === "constrained"
+      && projectedMem > profile.workingMemoryBudgetBytes * 1.35
+      && (operation === "separate" || operation === "decode");
+    return {
+      allowed: !isConstrainedHardBlock,
+      requiresWarning: true,
+      hardRejected: isConstrainedHardBlock,
+      rejectionReason: "exceeds-working-memory-budget",
+      message: `預估累計工作記憶體（${formatEstimatedMiB(projectedMem)}）超出目前 ${profile.tier} 配置上限（${formatEstimatedMiB(profile.workingMemoryBudgetBytes)}）；建議先釋放閒置音訊緩衝或暫停其他歌曲，絕不會擅自降低音訊品質。`,
+    };
+  }
+
+  return {
+    allowed: true,
+    requiresWarning: false,
+    hardRejected: false,
+    rejectionReason: null,
+    message: `符合目前 ${profile.tier} 資源配置上限。`,
   };
 }
 
@@ -264,6 +632,20 @@ export function estimateOperationFootprint(input: ResourceRiskAssessmentInput): 
 export function assessResourceRisk(input: ResourceRiskAssessmentInput): ResourceRiskAssessment {
   const { estimatedMemoryBytes, estimatedStorageBytes } = estimateOperationFootprint(input);
   const cap = input.capabilities;
+  const profile = input.profile ?? selectDeviceResourceProfile({
+    capabilities: cap,
+    performanceSignals: input.performanceSignals,
+  });
+  const admission = evaluateTaskAdmission({
+    operation: input.operation,
+    profile,
+    capabilities: cap,
+    estimatedTaskMemoryBytes: estimatedMemoryBytes,
+    estimatedTaskStorageBytes: estimatedStorageBytes,
+    inMemoryAudioBytes: input.estimatedInMemoryAudioBytes,
+    runningDemucsCount: input.runningDemucsCount,
+    projectedActiveSoundTouchTracks: input.activeSoundTouchTracks,
+  });
   const reasons: string[] = [];
   let score = 0;
 
@@ -274,7 +656,7 @@ export function assessResourceRisk(input: ResourceRiskAssessmentInput): Resource
   const activeSoundTouch = input.activeSoundTouchTracks ?? 0;
 
   if (cap.deviceMemoryGb === null) {
-    reasons.push("無法讀取實際裝置 RAM，風險為依歌曲規模與工作負載所做的估計。");
+    reasons.push("無法讀取實際裝置 RAM，已採保守配置並依歌曲規模估算風險。");
   } else if (cap.deviceMemoryGb <= 4) {
     score += 2;
     reasons.push(`裝置回報記憶體上限較低（約 ${cap.deviceMemoryGb} GB）。`);
@@ -283,6 +665,12 @@ export function assessResourceRisk(input: ResourceRiskAssessmentInput): Resource
   if (cap.hardwareConcurrency !== null && cap.hardwareConcurrency <= 4) {
     score += 1;
     reasons.push(`裝置可用處理器核心數較少（${cap.hardwareConcurrency} 核心），重型運算較易引起介面延遲。`);
+  }
+
+  if (admission.rejectionReason && !reasons.includes(admission.message)) {
+    reasons.push(admission.message);
+    if (admission.hardRejected) score += 5;
+    else score += 3;
   }
 
   if (cap.jsHeapEstimatedAvailableBytes !== null && estimatedMemoryBytes > cap.jsHeapEstimatedAvailableBytes * 0.75) {
@@ -322,14 +710,14 @@ export function assessResourceRisk(input: ResourceRiskAssessmentInput): Resource
     reasons.push("目前仍有歌曲正在播放，同時執行 AI 分離可能造成聲音斷續或介面卡頓。");
   }
 
-  if (activeSoundTouch >= 4) {
+  if (activeSoundTouch > profile.maxActiveSoundTouchTracks) {
     score += 2;
-    reasons.push(`同時啟用 ${activeSoundTouch} 軌 SoundTouch 變速變調處理，對行動裝置 CPU 負擔較高。`);
+    reasons.push(`同時啟用 ${activeSoundTouch} 軌 SoundTouch 處理（超過目前 ${profile.tier} 上限 ${profile.maxActiveSoundTouchTracks} 軌），CPU 壓力升高。`);
   }
 
-  if (input.performanceSignals && input.performanceSignals.longTaskCount >= 3) {
+  if (input.performanceSignals && (input.performanceSignals.longTaskCount >= 3 || (input.performanceSignals.audioUnderrunCount ?? 0) >= 2)) {
     score += 2;
-    reasons.push(`偵測到近期主執行緒多次長任務阻塞（最長約 ${Math.round(input.performanceSignals.maxLongTaskDurationMs)} ms）。`);
+    reasons.push(`偵測到近期主執行緒阻塞或音訊欠載（Long Tasks: ${input.performanceSignals.longTaskCount}, Underruns: ${input.performanceSignals.audioUnderrunCount ?? 0}）。`);
   }
 
   if (cap.storageRemainingBytes !== null && estimatedStorageBytes > 0) {
@@ -343,9 +731,9 @@ export function assessResourceRisk(input: ResourceRiskAssessmentInput): Resource
   }
 
   let riskLevel: ResourceRiskLevel = "low";
-  if (score >= 7) {
+  if (score >= 7 || admission.hardRejected) {
     riskLevel = "critical";
-  } else if (score >= 4) {
+  } else if (score >= 4 || admission.requiresWarning) {
     riskLevel = "high";
   } else if (score >= 2) {
     riskLevel = "medium";
@@ -356,7 +744,7 @@ export function assessResourceRisk(input: ResourceRiskAssessmentInput): Resource
     lowLoadSuggestions.push({
       id: "pause-other-songs",
       label: "暫停目前播放中的歌曲",
-      description: "釋放即時音訊排程與 SoundTouch 處理壓力，降低爆音與畫面卡頓。",
+      description: "釋放即時音訊排程與 SoundTouch 處理壓力，降低爆音與畫面卡頓（需由您主動確認，系統不會無提示中斷播放）。",
     });
   }
   if (input.hasOtherIdleDecodedSongs) {
@@ -369,8 +757,8 @@ export function assessResourceRisk(input: ResourceRiskAssessmentInput): Resource
   if (input.operation === "separate") {
     lowLoadSuggestions.push({
       id: "limit-inference-threads",
-      label: "改用較低併行度（安全降載）",
-      description: "在背景 Worker 限制併行執行緒數以減少記憶體尖峰，保留原音質不降採樣。",
+      label: `依 ${profile.tier} 配置限制執行緒數（目前上限 ${profile.maxWasmThreads}）`,
+      description: "在背景 Worker 限制併行執行緒數以減少記憶體尖峰，完整保留原音質不降採樣。",
     });
   }
 
@@ -392,8 +780,10 @@ export function assessResourceRisk(input: ResourceRiskAssessmentInput): Resource
   return {
     operation: input.operation,
     riskLevel,
-    requiresConfirmation: riskLevel === "high" || riskLevel === "critical",
-    blockedByDefault: riskLevel === "critical",
+    requiresConfirmation: riskLevel === "high" || riskLevel === "critical" || admission.requiresWarning,
+    blockedByDefault: riskLevel === "critical" || admission.hardRejected,
+    profile,
+    admission,
     estimatedMemoryBytes,
     estimatedStorageBytes,
     estimatedDurationLabel,
@@ -409,6 +799,8 @@ export class PerformanceTelemetryTracker {
   private maxLongTaskDurationMs = 0;
   private lastSeparationDurationMs: number | null = null;
   private lastDecodeDurationMs: number | null = null;
+  private audioUnderrunCount = 0;
+  private lastAudioUnderrunAt: number | null = null;
   private longTaskSupported = false;
   private observer: PerformanceObserver | null = null;
 
@@ -455,6 +847,17 @@ export class PerformanceTelemetryTracker {
     }
   }
 
+  recordAudioUnderrun(): void {
+    this.audioUnderrunCount += 1;
+    this.lastAudioUnderrunAt = Date.now();
+  }
+
+  resetStressCountersAfterCleanup(): void {
+    this.longTaskCount = 0;
+    this.maxLongTaskDurationMs = 0;
+    this.audioUnderrunCount = 0;
+  }
+
   getSignals(): PerformanceSignals {
     return {
       longTaskSupported: this.longTaskSupported,
@@ -462,6 +865,8 @@ export class PerformanceTelemetryTracker {
       maxLongTaskDurationMs: this.maxLongTaskDurationMs,
       lastSeparationDurationMs: this.lastSeparationDurationMs,
       lastDecodeDurationMs: this.lastDecodeDurationMs,
+      audioUnderrunCount: this.audioUnderrunCount,
+      lastAudioUnderrunAt: this.lastAudioUnderrunAt,
     };
   }
 }

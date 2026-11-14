@@ -77,9 +77,9 @@ type CachedProcessor = {
 export type StemSeparationOptions = {
   mode: StemSeparationMode;
   controller?: SeparationTaskController;
-  allowOverBudgetNetwork?: boolean;
   maxThreads?: number;
   preferWorker?: boolean;
+  allowMainThreadLargeInference?: boolean;
   onStatus?: (message: string) => void;
   onDownloadProgress?: (progress: number) => void;
   onProgress?: (progress: number, currentSegment: number, totalSegments: number) => void;
@@ -113,7 +113,6 @@ function describeError(error: unknown): Error {
 }
 
 export async function preflightSeparationNetworkBudget(options?: {
-  allowOverBudget?: boolean;
   budgetBytes?: number;
 }): Promise<NetworkBatchEvaluation> {
   const [modelCacheStatus, ortWasmCached, ortBundleCached, ortGlueCached] = await Promise.all([
@@ -145,7 +144,6 @@ export async function preflightSeparationNetworkBudget(options?: {
     ],
     budgetBytes: options?.budgetBytes ?? DEFAULT_NETWORK_BUDGET_BYTES,
     sessionTransferredBytes: sharedNetworkBudgetLedger.getSnapshot().totalBytes,
-    allowOverBudget: options?.allowOverBudget,
   });
 }
 
@@ -550,9 +548,7 @@ export async function separateAudio(
     controller.updateProgress("preparing", 0.02, "正在檢查資源與傳輸預算…");
     options.onStatus?.("正在檢查資源與傳輸預算…");
 
-    const networkCheck = await preflightSeparationNetworkBudget({
-      allowOverBudget: options.allowOverBudgetNetwork,
-    });
+    const networkCheck = await preflightSeparationNetworkBudget();
     if (!networkCheck.allowed) {
       throw new Error(networkCheck.message);
     }
@@ -569,7 +565,6 @@ export async function separateAudio(
     options.onStatus?.("正在準備或下載 Demucs AI 模型…");
     const modelUrl = await prepareCachedModelUrl(DEFAULT_DEMUCS_MODEL_URL, DEMUCS_MODEL_VERSION, {
       signal: controller.signal,
-      allowOverBudget: options.allowOverBudgetNetwork,
       onProgress: (progress, details) => {
         if (!controller.isCurrent() || controller.isCancellingOrCancelled()) return;
         controller.updateProgress("downloading", 0.08 + progress * 0.14, "正在下載 Demucs AI 模型…", {
@@ -582,7 +577,12 @@ export async function separateAudio(
 
     controller.throwIfAborted();
     const canUseWorker = options.preferWorker !== false && typeof Worker !== "undefined";
+    const allowMainThread = options.allowMainThreadLargeInference === true;
     const preferredBackend = await pickBackend();
+
+    if (!canUseWorker && !allowMainThread) {
+      throw new Error("目前環境不支援背景 Web Worker，預設拒絕在主執行緒進行大型 Demucs 推論，以避免操作介面完全失去反應。");
+    }
 
     if (canUseWorker) {
       try {
@@ -609,7 +609,10 @@ export async function separateAudio(
         if (isAbortError(workerError) || controller.isCancellingOrCancelled()) {
           throw workerError;
         }
-        // 若 Worker 在特定瀏覽器環境初始化失敗，且非中止，才安全降級至有分段讓出主執行緒的路徑
+        if (!allowMainThread) {
+          const reason = workerError instanceof Error ? workerError.message : String(workerError);
+          throw new Error(`背景 Web Worker 推論無法運作（${reason}），預設拒絕切換至主執行緒執行大型推論以避免畫面卡死。請釋放資源後重試。`);
+        }
         controller.updateProgress("preparing", 0.16, "Worker 無法啟動，切換至分段讓出執行模式…");
         options.onStatus?.("Worker 無法啟動，切換至分段讓出執行模式…");
       }

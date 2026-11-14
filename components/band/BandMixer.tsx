@@ -30,8 +30,11 @@ import {
 import {
   assessResourceRisk,
   collectDeviceCapabilities,
+  evaluateTaskAdmission,
   formatEstimatedMiB,
   sharedPerfTelemetry,
+  sharedResourceProfileManager,
+  type DeviceResourceProfile,
   type LowLoadActionId,
   type ResourceRiskAssessment,
 } from "@/lib/band/resourceGuard";
@@ -119,6 +122,8 @@ export function BandMixer() {
     resolve: (selection: ResourceGuardConfirmSelection | null) => void;
   } | null>(null);
   const [idleCleanupReport, setIdleCleanupReport] = useState<string>("");
+  const [resourceProfile, setResourceProfile] = useState<DeviceResourceProfile | null>(null);
+  const [profileWarning, setProfileWarning] = useState<string>("");
   const [collapsedIds, setCollapsedIds] = useState<Set<string>>(new Set());
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [selection, setSelection] = useState<MixerSelection>(EMPTY_MIXER_SELECTION);
@@ -148,6 +153,7 @@ export function BandMixer() {
   const restorePromiseRef = useRef<Promise<void>>(Promise.resolve());
   const removedSongIdsRef = useRef<Set<string>>(new Set());
   const lastPlayheadPersistAtRef = useRef<Map<string, number>>(new Map());
+  const lastTimerTickAtRef = useRef<number>(0);
   const persistRequestedRef = useRef(false);
 
   const getEngine = useCallback(() => {
@@ -193,6 +199,39 @@ export function BandMixer() {
       setShortcutHint("");
     }, 3000);
   }, []);
+
+  const refreshResourceProfile = useCallback(async (options?: {
+    afterCleanup?: boolean;
+    stabilityVerified?: boolean;
+  }): Promise<DeviceResourceProfile> => {
+    const cap = await collectDeviceCapabilities();
+    const signals = sharedPerfTelemetry.getSignals();
+    if (options?.afterCleanup) {
+      const result = sharedResourceProfileManager.reevaluateAfterCleanup({
+        capabilities: cap,
+        performanceSignals: signals,
+        cleanupCompleted: true,
+        stabilityVerified: Boolean(options.stabilityVerified),
+      });
+      setResourceProfile(result.profile);
+      if (result.upgraded) {
+        setProfileWarning("");
+      } else if (result.profile.degradationReason) {
+        setProfileWarning(result.profile.degradationReason);
+      }
+      return result.profile;
+    }
+
+    const result = sharedResourceProfileManager.evaluate(cap, signals);
+    setResourceProfile(result.profile);
+    if (result.justDegraded && result.profile.degradationReason) {
+      setProfileWarning(result.profile.degradationReason);
+      showShortcutHint(`資源保護已自動降級至 ${result.profile.tier} 模式：${result.profile.degradationReason}`);
+    } else if (result.profile.degradationReason && !profileWarning) {
+      setProfileWarning(result.profile.degradationReason);
+    }
+    return result.profile;
+  }, [profileWarning, showShortcutHint]);
 
   const showCardFeedback = useCallback((songId: string, message: string) => {
     setCardFeedbacks((previous) => ({ ...previous, [songId]: message }));
@@ -454,6 +493,20 @@ export function BandMixer() {
       revokedModelUrl = true;
     }
 
+    if (!options?.quiet && (idleSongIds.length > 0 || revokedModelUrl)) {
+      sharedPerfTelemetry.resetStressCountersAfterCleanup();
+    }
+    const stabilityVerified = Boolean(
+      !options?.quiet
+      && (idleSongIds.length > 0 || revokedModelUrl)
+      && !sharedSeparationCoordinator.hasRunningHeavyTask()
+      && !sharedSeparationCoordinator.isBusyWaitingCleanup(),
+    );
+    await refreshResourceProfile({
+      afterCleanup: idleSongIds.length > 0 || revokedModelUrl,
+      stabilityVerified,
+    }).catch(() => undefined);
+
     const reportText = idleSongIds.length > 0 || revokedModelUrl
       ? `已釋放 ${idleSongIds.length} 首閒置歌曲的解碼音訊緩衝（估計減少約 ${formatEstimatedMiB(estimatedFreedBytes)}）${revokedModelUrl ? "、已關閉閒置 AI 分離模型/Worker" : ""}。已解除記憶體參照與斷開音訊節點，實際作業系統 RAM 回收由瀏覽器決定（不會刪除原始音檔與已存快取）。`
       : "目前沒有可安全釋放的閒置音訊資源（播放中／分離中歌曲及快照參照已保留）。";
@@ -468,7 +521,7 @@ export function BandMixer() {
       estimatedFreedBytes,
       revokedModelUrl,
     };
-  }, [getEngine, showShortcutHint]);
+  }, [getEngine, refreshResourceProfile, showShortcutHint]);
 
   const ensureSongAudioReady = useCallback(async (
     song: BandSong,
@@ -502,6 +555,8 @@ export function BandMixer() {
 
     if (!options?.skipGuard) {
       const cap = await collectDeviceCapabilities();
+      const profileEval = sharedResourceProfileManager.evaluate(cap, sharedPerfTelemetry.getSignals());
+      setResourceProfile(profileEval.profile);
       const assessment = assessResourceRisk({
         operation: "decode",
         songName: song.name,
@@ -510,8 +565,10 @@ export function BandMixer() {
         mimeType: file.type,
         activeSongCount: sessionRef.current.songs.length,
         playingSongCount: sessionRef.current.songs.filter((s) => s.status === "playing").length,
+        activeSoundTouchTracks: engine.getActiveSoundTouchCount(),
         estimatedInMemoryAudioBytes: engine.getTrackMemoryEstimateBytes(),
         hasOtherIdleDecodedSongs: sessionRef.current.songs.some((s) => s.id !== song.id && s.status !== "playing" && engine.hasTrack(s.sourceAudioId)),
+        profile: profileEval.profile,
         capabilities: cap,
         performanceSignals: sharedPerfTelemetry.getSignals(),
       });
@@ -521,7 +578,7 @@ export function BandMixer() {
           subtitle: "大型或高負載音檔解碼前風險檢查",
           assessment,
         });
-        if (!decision) return false;
+        if (!decision || assessment.admission.hardRejected) return false;
         if (decision.applyLowLoadActions.includes("pause-other-songs")) {
           for (const other of sessionRef.current.songs) {
             if (other.id !== song.id && other.status === "playing") {
@@ -714,6 +771,7 @@ export function BandMixer() {
   useEffect(() => {
     let cancelled = false;
     sharedPerfTelemetry.startObservingLongTasks();
+    void refreshResourceProfile();
 
     const runRestore = async () => {
       setRestoringSession(true);
@@ -901,13 +959,20 @@ export function BandMixer() {
       engineRef.current = null;
       void disposeStemSeparator({ revokeModelUrl: true });
     };
-  }, [applySongToEngine, getEngine, hydrateOnePersistedSong, patchSongMetadataOnly, refreshCacheStats, restoreAttempt, showCardFeedback, showShortcutHint]);
+  }, [applySongToEngine, getEngine, hydrateOnePersistedSong, patchSongMetadataOnly, refreshCacheStats, refreshResourceProfile, restoreAttempt, showCardFeedback, showShortcutHint]);
 
   useEffect(() => {
+    lastTimerTickAtRef.current = Date.now();
     const timer = window.setInterval(() => {
       const engine = engineRef.current;
-      if (!engine) return;
       const now = Date.now();
+      const elapsed = now - lastTimerTickAtRef.current;
+      lastTimerTickAtRef.current = now;
+      if (elapsed > 380 && sessionRef.current.songs.some((song) => song.status === "playing")) {
+        sharedPerfTelemetry.recordAudioUnderrun();
+        void refreshResourceProfile();
+      }
+      if (!engine) return;
       setSession((previous) => {
         let changed = false;
         const songs = previous.songs.map((song) => {
@@ -931,7 +996,7 @@ export function BandMixer() {
       });
     }, 100);
     return () => window.clearInterval(timer);
-  }, [handlePersistResult]);
+  }, [handlePersistResult, refreshResourceProfile]);
 
   const updateSong = useCallback((songId: string, patch: Partial<BandSong>, options?: { persistDelayMs?: number }) => {
     let shouldPersist = false;
@@ -1210,8 +1275,28 @@ export function BandMixer() {
       const ready = await ensureSongAudioReady(song);
       if (!ready) return;
       const latestSong = sessionRef.current.songs.find((item) => item.id === song.id) ?? song;
+      const trackIds = getSongPlaybackTrackIds(latestSong);
+      const engine = getEngine();
+      const cap = await collectDeviceCapabilities();
+      const profileEval = sharedResourceProfileManager.evaluate(cap, sharedPerfTelemetry.getSignals());
+      setResourceProfile(profileEval.profile);
+      const projectedActiveSoundTouchTracks = engine.getActiveSoundTouchCount() + trackIds.length;
+      const admission = evaluateTaskAdmission({
+        operation: "soundtouch-playback",
+        profile: profileEval.profile,
+        capabilities: cap,
+        estimatedTaskMemoryBytes: 0,
+        inMemoryAudioBytes: engine.getTrackMemoryEstimateBytes(),
+        projectedActiveSoundTouchTracks,
+      });
+      if (admission.requiresWarning) {
+        // 先預警使用者，不無提示中斷其他播放中的音軌或降低音質
+        setProfileWarning(admission.message);
+        showShortcutHint(admission.message);
+        showCardFeedback(latestSong.id, admission.message);
+      }
       applySongToEngine(latestSong);
-      await getEngine().playTracks(getSongPlaybackTrackIds(latestSong));
+      await engine.playTracks(trackIds);
       updateSong(latestSong.id, { status: "playing" });
     } catch (error) {
       const errorMsg = describePlaybackError(error);
@@ -1284,6 +1369,25 @@ export function BandMixer() {
     const oldIds = getSongPlaybackTrackIds(song);
     const nextSong = { ...song, playbackSource };
     const newIds = getSongPlaybackTrackIds(nextSong);
+    if (song.status === "playing" && playbackSource === "stems") {
+      const cap = await collectDeviceCapabilities();
+      const profileEval = sharedResourceProfileManager.evaluate(cap, sharedPerfTelemetry.getSignals());
+      setResourceProfile(profileEval.profile);
+      const projected = Math.max(0, engine.getActiveSoundTouchCount() - oldIds.length) + newIds.length;
+      const admission = evaluateTaskAdmission({
+        operation: "soundtouch-playback",
+        profile: profileEval.profile,
+        capabilities: cap,
+        estimatedTaskMemoryBytes: 0,
+        inMemoryAudioBytes: engine.getTrackMemoryEstimateBytes(),
+        projectedActiveSoundTouchTracks: projected,
+      });
+      if (admission.requiresWarning) {
+        setProfileWarning(admission.message);
+        showShortcutHint(admission.message);
+        showCardFeedback(song.id, admission.message);
+      }
+    }
     engine.seekTracks(newIds, song.playheadSec);
     applySongToEngine(nextSong);
     if (song.status === "playing") {
@@ -1311,6 +1415,12 @@ export function BandMixer() {
       separationMessage: "正在停止並釋放 Worker / Tensor 資源…",
     });
     await sharedSeparationCoordinator.cancelTask(song.id, "已中止音源分離，未改動既有設定與快取。", 80);
+    await disposeStemSeparator({ revokeModelUrl: false });
+    sharedPerfTelemetry.resetStressCountersAfterCleanup();
+    await refreshResourceProfile({
+      afterCleanup: true,
+      stabilityVerified: !sharedSeparationCoordinator.hasRunningHeavyTask() && !sharedSeparationCoordinator.isBusyWaitingCleanup(),
+    }).catch(() => undefined);
   };
 
   const restoreSongSnapshot = (song: BandSong) => {
@@ -1367,14 +1477,13 @@ export function BandMixer() {
     });
     const preCached = await getCachedStemSet(cacheKey).catch(() => null);
 
-    let allowOverBudgetNetwork = false;
-    let maxThreads = 4;
+    const cap = await collectDeviceCapabilities();
+    const profileEval = sharedResourceProfileManager.evaluate(cap, sharedPerfTelemetry.getSignals());
+    setResourceProfile(profileEval.profile);
+    let maxThreads = profileEval.profile.maxWasmThreads;
 
     if (!preCached) {
-      const [cap, networkEval] = await Promise.all([
-        collectDeviceCapabilities(),
-        preflightSeparationNetworkBudget(),
-      ]);
+      const networkEval = await preflightSeparationNetworkBudget();
       const assessment = assessResourceRisk({
         operation: "separate",
         songName: latestReadySong.name,
@@ -1385,8 +1494,10 @@ export function BandMixer() {
         activeSongCount: sessionRef.current.songs.length,
         playingSongCount: sessionRef.current.songs.filter((s) => s.status === "playing").length,
         activeSoundTouchTracks: getEngine().getActiveSoundTouchCount(),
+        runningDemucsCount: sharedSeparationCoordinator.hasRunningHeavyTask() ? 1 : 0,
         estimatedInMemoryAudioBytes: getEngine().getTrackMemoryEstimateBytes(),
         hasOtherIdleDecodedSongs: sessionRef.current.songs.some((s) => s.id !== song.id && s.status !== "playing" && getEngine().hasTrack(s.sourceAudioId)),
+        profile: profileEval.profile,
         capabilities: cap,
         performanceSignals: sharedPerfTelemetry.getSignals(),
       });
@@ -1399,7 +1510,7 @@ export function BandMixer() {
           networkEvaluation: networkEval,
         });
         if (!decision) return;
-        allowOverBudgetNetwork = decision.allowOverBudgetNetwork;
+        if (assessment.admission.hardRejected || !networkEval.allowed) return;
         if (decision.applyLowLoadActions.includes("pause-other-songs")) {
           for (const other of sessionRef.current.songs) {
             if (other.id !== song.id && other.status === "playing") {
@@ -1412,7 +1523,7 @@ export function BandMixer() {
           await releaseIdleResources({ excludeSongIds: [song.id], quiet: true });
         }
         if (decision.applyLowLoadActions.includes("limit-inference-threads")) {
-          maxThreads = 2;
+          maxThreads = Math.max(1, Math.min(maxThreads, 2));
         }
       } else if (assessment.riskLevel === "medium") {
         showCardFeedback(song.id, `提示：本裝置估計達中等負載（${assessment.estimatedDurationLabel}），背景執行中可繼續操作其他卡片。`);
@@ -1486,10 +1597,10 @@ export function BandMixer() {
         const result = await separateAudio(file, {
           mode,
           controller,
-          allowOverBudgetNetwork,
           maxThreads,
         });
         sharedPerfTelemetry.recordSeparationDuration(result.durationMs);
+        void refreshResourceProfile();
         controller.throwIfAborted();
         stems = result.stems;
         controller.updateProgress("processing", 0.98, "正在驗證並寫入本機分離快取…");
@@ -1858,6 +1969,15 @@ export function BandMixer() {
         </div>
       )}
 
+      {profileWarning && (
+        <div role="status" aria-live="polite" className="card card-warning-banner">
+          <span>{profileWarning}</span>
+          <button type="button" className="btn mixer-button" style={{ padding: "4px 10px", fontSize: 12 }} onClick={() => setProfileWarning("")}>
+            關閉
+          </button>
+        </div>
+      )}
+
       {idleCleanupReport && (
         <div role="status" aria-live="polite" className="card card-warning-banner" style={{ borderColor: "rgba(56, 189, 248, 0.35)", background: "rgba(56, 189, 248, 0.08)", color: "#e0f2fe" }}>
           <span>{idleCleanupReport}</span>
@@ -1919,9 +2039,19 @@ export function BandMixer() {
             <button type="button" className="btn mixer-button" onClick={() => void refreshCacheStats()}>重新整理</button>
           </div>
           <div className="small" style={{ opacity: 0.78, marginTop: 8 }}>
-            網路預算監測（工作階段上限 {(sharedNetworkBudgetLedger.getSnapshot().budgetBytes / (1024 * 1024)).toFixed(1)} MiB）：
+            網路預算監測（所有裝置統一上限 {(sharedNetworkBudgetLedger.getSnapshot().budgetBytes / (1024 * 1024)).toFixed(1)} MiB）：
             Vercel 靜態 {(sharedNetworkBudgetLedger.getSnapshot().vercelStaticBytes / (1024 * 1024)).toFixed(1)} MiB ｜ 外部 CDN {(sharedNetworkBudgetLedger.getSnapshot().externalCdnBytes / (1024 * 1024)).toFixed(1)} MiB
           </div>
+          {resourceProfile && (
+            <div className="small" style={{ opacity: 0.85, marginTop: 6 }}>
+              動態資源配置：<strong>{resourceProfile.tier.toUpperCase()}</strong>
+              {resourceProfile.degraded ? `（已自動降級，原 ${resourceProfile.initialTier}）` : ""}
+              {" ｜ "}WASM Threads 上限：{resourceProfile.maxWasmThreads}
+              {" ｜ "}工作記憶體預算：{(resourceProfile.workingMemoryBudgetBytes / (1024 * 1024)).toFixed(0)} MiB
+              {" ｜ "}SoundTouch 上限：{resourceProfile.maxActiveSoundTouchTracks} 軌
+              {" ｜ "}Demucs 併發上限：{resourceProfile.demucsConcurrency}
+            </div>
+          )}
           {storageActionMsg && (
             <p role="status" className="small" style={{ color: "#38bdf8", marginTop: 8, marginBottom: 0 }}>
               {storageActionMsg}

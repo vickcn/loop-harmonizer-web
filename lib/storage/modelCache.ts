@@ -76,7 +76,6 @@ export async function isStaticAssetCached(assetUrl: string): Promise<boolean> {
 
 export type PrepareModelUrlOptions = {
   signal?: AbortSignal;
-  allowOverBudget?: boolean;
   onProgress?: (progress: number, details?: { loadedBytes: number; totalBytes: number }) => void;
 };
 
@@ -87,7 +86,7 @@ export async function prepareCachedModelUrl(
 ): Promise<string> {
   const options: PrepareModelUrlOptions =
     typeof optionsOrCallback === "function" ? { onProgress: optionsOrCallback } : (optionsOrCallback ?? {});
-  const { signal, allowOverBudget = false, onProgress } = options;
+  const { signal, onProgress } = options;
 
   throwIfAborted(signal);
 
@@ -96,7 +95,6 @@ export async function prepareCachedModelUrl(
       url: sourceUrl,
       isCached: false,
       sessionTransferredBytes: sharedNetworkBudgetLedger.getSnapshot().totalBytes,
-      allowOverBudget,
     });
     if (!decision.allowed) {
       throw new Error(decision.message);
@@ -117,7 +115,6 @@ export async function prepareCachedModelUrl(
         url: sourceUrl,
         isCached: false,
         sessionTransferredBytes: sharedNetworkBudgetLedger.getSnapshot().totalBytes,
-        allowOverBudget,
       });
       if (!decision.allowed) throw new Error(decision.message);
       return sourceUrl;
@@ -142,7 +139,6 @@ export async function prepareCachedModelUrl(
         url: sourceUrl,
         isCached: false,
         sessionTransferredBytes: sharedNetworkBudgetLedger.getSnapshot().totalBytes,
-        allowOverBudget,
       });
       if (!budgetDecision.allowed) {
         throw new Error(budgetDecision.message);
