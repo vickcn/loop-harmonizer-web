@@ -23,6 +23,7 @@ import {
   buildInitialCheckpoint,
   createCheckpointTaskId,
   deleteCheckpointAndChunks,
+  findCompletedCheckpointBySourceAudioHash,
   getCheckpoint,
   saveCheckpoint,
   updateCheckpointStatus,
@@ -45,6 +46,7 @@ import {
   sharedSeparationLeaseManager,
   validateAndPrepareResume,
 } from "./separationResumeController.ts";
+import { recordSeparationDiagnostic } from "./separationStateRecovery.ts";
 import {
   isAbortError,
   isPauseError,
@@ -521,6 +523,23 @@ async function runSeparationInWorker(params: {
     let latestCheckpoint: SeparationCheckpoint | undefined;
     let commitChain: Promise<void> = Promise.resolve();
 
+    const logWorkerExit = (workerExitReason: string, toState: string, note?: string) => {
+      recordSeparationDiagnostic({
+        source: "runSeparationInWorker",
+        taskId: checkpointTaskId ?? controller.taskId,
+        songId: latestCheckpoint?.songId ?? null,
+        generation: lease?.generation ?? null,
+        checkpointStatus: latestCheckpoint?.status ?? null,
+        validChunkCount: latestCheckpoint?.nextChunkIndex ?? null,
+        totalChunks: latestCheckpoint?.totalChunks ?? null,
+        workerExitReason,
+        leaseOwner: lease?.ownerTabId ?? null,
+        fromState: "running",
+        toState,
+        note,
+      });
+    };
+
     const cleanupWorkerListeners = () => {
       worker.onmessage = null;
       worker.onerror = null;
@@ -540,6 +559,7 @@ async function runSeparationInWorker(params: {
       if (!settled) {
         settled = true;
         cleanupWorkerListeners();
+        logWorkerExit("cleanup-abort", "cancelled");
         try {
           worker.postMessage({ type: "cancel", taskId: controller.taskId });
         } catch {
@@ -699,6 +719,8 @@ async function runSeparationInWorker(params: {
           unregister();
           cleanupWorkerListeners();
           terminateActiveWorker();
+          const msg = err instanceof Error ? err.message : String(err);
+          logWorkerExit("chunk-commit-error", "failed", msg);
           reject(err instanceof Error ? err : new Error(String(err)));
         });
         return;
@@ -714,6 +736,7 @@ async function runSeparationInWorker(params: {
             cleanupWorkerListeners();
             terminateActiveWorker();
             syncApprovedStaticScriptsFromHttpCacheOnly();
+            logWorkerExit("paused", "paused");
             resolve({
               backend: data.backend ?? "wasm",
               streamed: true,
@@ -740,6 +763,7 @@ async function runSeparationInWorker(params: {
               try { worker.terminate(); } catch { /* ignore */ }
             }
             syncApprovedStaticScriptsFromHttpCacheOnly();
+            logWorkerExit("completed", "completed");
             resolve({
               backend: data.backend ?? "wasm",
               streamed: Boolean(data.streamed),
@@ -759,6 +783,7 @@ async function runSeparationInWorker(params: {
         unregister();
         cleanupWorkerListeners();
         terminateActiveWorker();
+        logWorkerExit("cancelled", "cancelled");
         reject(new SeparationAbortError());
         return;
       }
@@ -770,6 +795,7 @@ async function runSeparationInWorker(params: {
         unregister();
         cleanupWorkerListeners();
         terminateActiveWorker();
+        logWorkerExit("failed", "failed", data.errorMessage);
         reject(new Error(data.errorMessage || "Worker 分離推論失敗"));
       }
     };
@@ -781,6 +807,7 @@ async function runSeparationInWorker(params: {
       unregister();
       cleanupWorkerListeners();
       terminateActiveWorker();
+      logWorkerExit("onerror", "failed", event.message);
       reject(new Error(event.message || "Worker 執行發生錯誤"));
     };
 
@@ -791,6 +818,7 @@ async function runSeparationInWorker(params: {
       unregister();
       cleanupWorkerListeners();
       terminateActiveWorker();
+      logWorkerExit("onmessageerror", "failed");
       reject(new Error("Worker 訊息傳遞異常"));
     };
 
@@ -961,6 +989,7 @@ export async function separateAudio(
   let decodedRight: Float32Array | null = null;
   let activeLease: SeparationLeaseInfo | null = null;
   let leaseReleased = false;
+  let streamCompleted = false;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
   const stopLeaseHeartbeat = () => {
@@ -975,16 +1004,45 @@ export async function separateAudio(
     lastError?: string,
   ) => {
     stopLeaseHeartbeat();
-    if (!checkpointTaskId || !activeLease || leaseReleased) return;
+    if (!checkpointTaskId) return;
+    let effectiveNextStatus = nextStatus;
+    const latestCp = await getCheckpoint(checkpointTaskId).catch(() => null);
+    if (streamCompleted || latestCp?.status === "completed") {
+      effectiveNextStatus = "completed";
+    }
+    if (!activeLease || leaseReleased) return;
     leaseReleased = true;
     try {
-      await sharedSeparationLeaseManager.releaseLease(checkpointTaskId, activeLease, nextStatus);
-      if (lastError !== undefined) {
+      await sharedSeparationLeaseManager.releaseLease(
+        checkpointTaskId,
+        activeLease,
+        effectiveNextStatus,
+      );
+      if (effectiveNextStatus === "completed") {
+        sharedSeparationLeaseManager.notifyTaskCompleted(
+          checkpointTaskId,
+          activeLease.ownerTabId,
+          activeLease.generation,
+        );
+      } else if (lastError !== undefined) {
         await updateCheckpointStatus(checkpointTaskId, {
-          status: nextStatus,
+          status: effectiveNextStatus,
           lastError,
         });
       }
+      recordSeparationDiagnostic({
+        source: "stemSeparator.releaseActiveLease",
+        taskId: checkpointTaskId,
+        songId: effectiveSongId,
+        generation: activeLease.generation,
+        checkpointStatus: latestCp?.status ?? effectiveNextStatus,
+        validChunkCount: latestCp?.nextChunkIndex ?? null,
+        totalChunks: latestCp?.totalChunks ?? null,
+        leaseOwner: activeLease.ownerTabId,
+        fromState: latestCp?.status ?? "running",
+        toState: effectiveNextStatus,
+        note: lastError,
+      });
     } catch {
       // 釋放鎖失敗不覆蓋原始錯誤
     }
@@ -1020,30 +1078,67 @@ export async function separateAudio(
         await deleteCheckpointAndChunks(checkpointTaskId);
       }
 
-      const validation = await validateAndPrepareResume(checkpointTaskId, {
+      const tabId = getOrCreateTabId();
+      let resolvedTaskId = checkpointTaskId;
+      let validation = await validateAndPrepareResume(resolvedTaskId, {
         sourceAudioAvailable: true,
         sourceAudioHash: options.sourceAudioHash,
         totalSamples,
         sampleRate: DEMUCS_SAMPLE_RATE,
+        viewerTabId: tabId,
       });
+
+      if (!validation.checkpoint && !options.forceRecompute) {
+        const completedByHash = await findCompletedCheckpointBySourceAudioHash(
+          options.sourceAudioHash,
+        );
+        if (completedByHash) {
+          const hashValidation = await validateAndPrepareResume(completedByHash.taskId, {
+            sourceAudioAvailable: true,
+            sourceAudioHash: options.sourceAudioHash,
+            totalSamples,
+            sampleRate: DEMUCS_SAMPLE_RATE,
+            viewerTabId: tabId,
+          });
+          if (hashValidation.action === "already_completed") {
+            resolvedTaskId = completedByHash.taskId;
+            validation = hashValidation;
+          }
+        }
+      }
 
       if (validation.action === "already_completed" && !options.forceRecompute && validation.checkpoint) {
         decodedLeft = null;
         decodedRight = null;
+        streamCompleted = true;
         if (validation.checkpoint.requestedMode !== options.mode) {
-          await updateCheckpointStatus(checkpointTaskId, {
+          await updateCheckpointStatus(resolvedTaskId, {
             status: "completed",
             requestedMode: options.mode,
           });
         }
-        const finalCp = (await getCheckpoint(checkpointTaskId)) ?? validation.checkpoint;
+        const finalCp = (await getCheckpoint(resolvedTaskId)) ?? validation.checkpoint;
         const durationMs =
           (typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt;
         controller.markCompleted("已從本機分段 Checkpoint 驗證並還原完成狀態");
+        sharedSeparationLeaseManager.notifyTaskCompleted(resolvedTaskId, tabId);
+        recordSeparationDiagnostic({
+          source: "stemSeparator.alreadyCompleted",
+          taskId: resolvedTaskId,
+          songId: effectiveSongId,
+          generation: controller.generation,
+          checkpointStatus: finalCp.status,
+          validChunkCount: validation.validChunkCount,
+          totalChunks: validation.totalChunks,
+          workerExitReason: "skipped-already-completed",
+          leaseOwner: finalCp.lease?.ownerTabId ?? null,
+          fromState: validation.checkpoint.status,
+          toState: "completed",
+        });
         return {
           backend: "wasm",
           chunkedTask: {
-            taskId: checkpointTaskId,
+            taskId: resolvedTaskId,
             mode: options.mode,
             sampleRate: finalCp.sampleRate,
             totalSamples: finalCp.totalSamples,
@@ -1082,12 +1177,25 @@ export async function separateAudio(
 
       const leaseResult = await sharedSeparationLeaseManager.acquireLease(
         checkpointTaskId,
-        getOrCreateTabId(),
+        tabId,
       );
       if (!leaseResult.acquired) {
         throw new Error(leaseResult.reason);
       }
       activeLease = leaseResult.lease;
+      recordSeparationDiagnostic({
+        source: "stemSeparator.acquireLease",
+        taskId: checkpointTaskId,
+        songId: effectiveSongId,
+        generation: activeLease.generation,
+        checkpointStatus: leaseResult.checkpoint.status,
+        validChunkCount: validation.validChunkCount,
+        totalChunks: validation.totalChunks || leaseResult.checkpoint.totalChunks,
+        leaseOwner: activeLease.ownerTabId,
+        fromState: validation.checkpoint?.status ?? "queued",
+        toState: "running",
+        note: `resumeFrom=${validation.action === "resume" ? validation.resumeFromChunkIndex : 0}`,
+      });
 
       heartbeatTimer = setInterval(() => {
         if (!checkpointTaskId || !activeLease || controller.isTerminal()) return;
@@ -1215,11 +1323,30 @@ export async function separateAudio(
             };
           }
 
+          streamCompleted = true;
           await releaseActiveLease("completed");
+          sharedSeparationLeaseManager.notifyTaskCompleted(
+            checkpointTaskId,
+            getOrCreateTabId(),
+            activeLease?.generation,
+          );
           const finalCp =
             (await getCheckpoint(checkpointTaskId)) ?? workerOutput.latestCheckpoint;
           const totalChunks =
             finalCp?.totalChunks ?? computeTotalChunks(totalSamples, DEMUCS_STRIDE_SAMPLES);
+          recordSeparationDiagnostic({
+            source: "stemSeparator.completed",
+            taskId: checkpointTaskId,
+            songId: effectiveSongId,
+            generation: activeLease?.generation ?? controller.generation,
+            checkpointStatus: finalCp?.status ?? "completed",
+            validChunkCount: finalCp?.nextChunkIndex ?? totalChunks,
+            totalChunks,
+            workerExitReason: "completed",
+            leaseOwner: activeLease?.ownerTabId ?? null,
+            fromState: "running",
+            toState: "completed",
+          });
           return {
             backend: workerOutput.backend,
             chunkedTask: {
@@ -1389,17 +1516,31 @@ export async function separateAudio(
 
     throw describeError(lastError);
   } catch (error) {
-    if (isAbortError(error) || controller.isCancellingOrCancelled()) {
-      await releaseActiveLease("cancelled");
-    } else if (!isPauseError(error)) {
-      const msg = error instanceof Error ? error.message : String(error);
-      await releaseActiveLease("failed", msg);
+    if (!streamCompleted) {
+      const latestCp = checkpointTaskId ? await getCheckpoint(checkpointTaskId).catch(() => null) : null;
+      if (latestCp?.status === "completed") {
+        streamCompleted = true;
+        await releaseActiveLease("completed");
+      } else if (isAbortError(error) || controller.isCancellingOrCancelled()) {
+        await releaseActiveLease("cancelled");
+      } else if (!isPauseError(error)) {
+        const msg = error instanceof Error ? error.message : String(error);
+        await releaseActiveLease("failed", msg);
+      }
+    } else {
+      await releaseActiveLease("completed");
     }
     throw describeError(error);
   } finally {
     stopLeaseHeartbeat();
     if (!leaseReleased && checkpointTaskId && activeLease) {
-      await releaseActiveLease(controller.isCancellingOrCancelled() ? "cancelled" : "interrupted");
+      await releaseActiveLease(
+        streamCompleted
+          ? "completed"
+          : controller.isCancellingOrCancelled()
+            ? "cancelled"
+            : "interrupted",
+      );
     }
     decodedLeft = null;
     decodedRight = null;

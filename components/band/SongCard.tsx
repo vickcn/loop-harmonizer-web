@@ -24,7 +24,7 @@ type Props = {
   onClearSongCache: () => void;
   onPauseSeparation?: () => void;
   onResumeSeparation?: () => void;
-  onClearSeparationData?: () => void;
+  onClearSeparationData?: (scope?: "temp" | "completed") => void;
   onAbortSeparation?: () => void;
   onRestoreSnapshot?: () => void;
   onLoadAudio?: () => void;
@@ -808,18 +808,40 @@ export const SongCard = memo(function SongCard(props: Props) {
                       },
                       {
                         key: "clear-cache",
-                        label: song.cacheKey || hasSavedChunks ? "清除此歌分離快取／進度" : "目前已無本機快取",
-                        disabled: focusLocked || (!song.cacheKey && !hasSavedChunks) || isSeparating,
-                        disabledReason: focusLocked ? focusLockReason : (!song.cacheKey && !hasSavedChunks ? "目前已無本機快取" : isSeparating ? "分離執行中暫無法清除" : undefined),
-                        onSelect: props.onClearSeparationData ?? props.onClearSongCache,
+                        label:
+                          song.separationStatus === "completed"
+                            ? "刪除已完成分軌"
+                            : hasSavedChunks
+                              ? "清理暫存進度"
+                              : "目前已無本機快取",
+                        disabled: focusLocked || (!song.cacheKey && !hasSavedChunks && song.separationStatus !== "completed") || isSeparating,
+                        disabledReason: focusLocked ? focusLockReason : (!song.cacheKey && !hasSavedChunks && song.separationStatus !== "completed" ? "目前已無本機快取" : isSeparating ? "分離執行中暫無法清除" : undefined),
+                        onSelect: () =>
+                          props.onClearSeparationData
+                            ? props.onClearSeparationData(
+                                song.separationStatus === "completed" ? "completed" : "temp",
+                              )
+                            : props.onClearSongCache(),
                         renderInline: () => (
                           <IconActionButton
                             icon="🧹"
-                            label={song.cacheKey || hasSavedChunks ? "清除此歌分離快取／進度" : "目前已無本機快取"}
-                            disabled={focusLocked || (!song.cacheKey && !hasSavedChunks) || isSeparating}
-                            disabledReason={focusLocked ? focusLockReason : (!song.cacheKey && !hasSavedChunks ? "目前已無本機快取" : isSeparating ? "分離執行中暫無法清除" : undefined)}
+                            label={
+                              song.separationStatus === "completed"
+                                ? "刪除已完成分軌"
+                                : hasSavedChunks
+                                  ? "清理暫存進度"
+                                  : "目前已無本機快取"
+                            }
+                            disabled={focusLocked || (!song.cacheKey && !hasSavedChunks && song.separationStatus !== "completed") || isSeparating}
+                            disabledReason={focusLocked ? focusLockReason : (!song.cacheKey && !hasSavedChunks && song.separationStatus !== "completed" ? "目前已無本機快取" : isSeparating ? "分離執行中暫無法清除" : undefined)}
                             className="is-compact"
-                            onClick={props.onClearSeparationData ?? props.onClearSongCache}
+                            onClick={() =>
+                              props.onClearSeparationData
+                                ? props.onClearSeparationData(
+                                    song.separationStatus === "completed" ? "completed" : "temp",
+                                  )
+                                : props.onClearSongCache()
+                            }
                           />
                         ),
                       },
@@ -929,20 +951,28 @@ export const SongCard = memo(function SongCard(props: Props) {
             <div role="status" className="card-warning-banner" style={{ alignItems: "flex-start" }}>
               <div className="grid" style={{ gap: 4, flex: "1 1 220px", minWidth: 0 }}>
                 <strong style={{ fontSize: 13 }}>
-                  {song.separationStatus === "paused" ? "已暫停分離（已保存安全檢查點）" : "背景中斷，可從最近完成段落接續"}
+                  {hasSavedChunks
+                    ? (song.separationStatus === "paused" ? "已暫停分離（已保存安全檢查點）" : "背景中斷，可從最近完成段落接續")
+                    : (song.separationStatus === "paused" ? "已暫停分離（尚無已保存分段進度）" : "分離尚未完成（尚無已保存分段進度）")}
                 </strong>
-                <span>{song.separationMessage || "返回頁面後可接續未完成的分離段落。"}</span>
-                {totalChunks > 0 && (
+                <span>
+                  {hasSavedChunks
+                    ? (song.separationMessage || "返回頁面後可接續未完成的分離段落。")
+                    : "前次分離尚未完成第 1 段，本機尚無可接續的分段進度。"}
+                </span>
+                {hasSavedChunks && (
                   <span className="small" style={{ fontVariantNumeric: "tabular-nums" }}>
                     {`進度：第 ${completedChunks} / ${totalChunks} 段（${chunkResumePct}%）｜本機已保存 ${committedMiB} MiB`}
                   </span>
                 )}
-                <span className="small" style={{ opacity: 0.85 }}>
-                  切換 App 或鎖定螢幕時允許瀏覽器暫停運算，已完成的段落不會重算。
-                </span>
+                {hasSavedChunks && (
+                  <span className="small" style={{ opacity: 0.85 }}>
+                    切換 App 或鎖定螢幕時允許瀏覽器暫停運算，已完成的段落不會重算。
+                  </span>
+                )}
               </div>
               <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
-                {props.onResumeSeparation && (
+                {hasSavedChunks && props.onResumeSeparation && (
                   <button
                     type="button"
                     className="btn mixer-button primary"
@@ -954,15 +984,27 @@ export const SongCard = memo(function SongCard(props: Props) {
                     <span>{`繼續分離（第 ${Math.min(completedChunks + 1, Math.max(1, totalChunks))} 段起）`}</span>
                   </button>
                 )}
-                {props.onClearSeparationData && (
+                {!hasSavedChunks && (
+                  <button
+                    type="button"
+                    className="btn mixer-button primary"
+                    style={{ minHeight: 44, minWidth: 44, padding: "8px 12px" }}
+                    disabled={focusLocked || audioUnavailable}
+                    onClick={() => props.onSeparate(mode)}
+                  >
+                    <ResumePlayIcon />
+                    <span>重新開始分離</span>
+                  </button>
+                )}
+                {props.onClearSeparationData && (hasSavedChunks || Boolean(song.separationTaskId) || totalChunks > 0) && (
                   <button
                     type="button"
                     className="btn mixer-button"
                     style={{ minHeight: 44, minWidth: 44, padding: "8px 12px" }}
                     disabled={focusLocked}
-                    onClick={props.onClearSeparationData}
+                    onClick={() => props.onClearSeparationData?.("temp")}
                   >
-                    清除分離進度
+                    {hasSavedChunks ? "清理未完成暫存進度" : "清理暫存"}
                   </button>
                 )}
                 {song.activeSnapshot && props.onRestoreSnapshot && (
@@ -1002,9 +1044,9 @@ export const SongCard = memo(function SongCard(props: Props) {
                     className="btn mixer-button"
                     style={{ minHeight: 44, minWidth: 44, padding: "8px 12px" }}
                     disabled={focusLocked}
-                    onClick={props.onClearSeparationData}
+                    onClick={() => props.onClearSeparationData?.("temp")}
                   >
-                    清除已保存進度
+                    清理未完成暫存進度
                   </button>
                 )}
                 {song.activeSnapshot && props.onRestoreSnapshot && (
@@ -1030,9 +1072,9 @@ export const SongCard = memo(function SongCard(props: Props) {
                   className="btn mixer-button"
                   style={{ minHeight: 44, minWidth: 44, padding: "6px 12px", fontSize: 12 }}
                   disabled={focusLocked}
-                  onClick={props.onClearSeparationData}
+                  onClick={() => props.onClearSeparationData?.("completed")}
                 >
-                  清除分段資料
+                  刪除已完成分軌
                 </button>
               )}
             </div>
@@ -1066,9 +1108,9 @@ export const SongCard = memo(function SongCard(props: Props) {
                     className="btn mixer-button"
                     style={{ minHeight: 44, minWidth: 44, padding: "8px 12px" }}
                     disabled={focusLocked}
-                    onClick={props.onClearSeparationData}
+                    onClick={() => props.onClearSeparationData?.("temp")}
                   >
-                    清除分離進度
+                    清理未完成暫存進度
                   </button>
                 )}
                 {song.activeSnapshot && props.onRestoreSnapshot && (

@@ -465,6 +465,7 @@ export function restoreSongsAfterSeparationFocus(
 
     if (
       song.id === focusSnapshot.targetSongId &&
+      song.separationStatus !== "completed" &&
       (options.outcome === "cancelled" || options.outcome === "paused" || options.outcome === "failed")
     ) {
       const reverted = applySongOperationSnapshot(song, entry.snapshot);
@@ -500,7 +501,8 @@ export function restoreSongsAfterSeparationFocus(
       keyShiftSemitones: entry.snapshot.keyShiftSemitones,
       masterVolume: entry.snapshot.masterVolume,
       stemChannels:
-        song.id === focusSnapshot.targetSongId && options.outcome === "completed"
+        song.id === focusSnapshot.targetSongId &&
+        (options.outcome === "completed" || song.separationStatus === "completed")
           ? song.stemChannels
           : entry.snapshot.stemChannels.map((ch) => ({ ...ch })),
     };

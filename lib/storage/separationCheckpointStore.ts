@@ -177,6 +177,7 @@ export async function updateCheckpointStatus(
     userAuthorized?: boolean;
     requestedMode?: "two_stem" | "four_stem";
     clearLeaseIfTerminal?: boolean;
+    allowDowngradeCompleted?: boolean;
   },
   now = Date.now(),
 ): Promise<SeparationCheckpoint | null> {
@@ -186,6 +187,22 @@ export async function updateCheckpointStatus(
       | SeparationCheckpoint
       | undefined;
     if (!existing) return null;
+    if (
+      existing.status === "completed" &&
+      patch.status !== "completed" &&
+      !patch.allowDowngradeCompleted
+    ) {
+      if (patch.clearLeaseIfTerminal && existing.lease !== null) {
+        const preserved: SeparationCheckpoint = {
+          ...existing,
+          lease: null,
+          updatedAt: now,
+        };
+        await idbRequestPromise(store.put(preserved));
+        return preserved;
+      }
+      return existing;
+    }
     const next: SeparationCheckpoint = {
       ...existing,
       status: patch.status,
@@ -353,6 +370,143 @@ export async function deleteCheckpointAndChunks(taskId: string): Promise<{
     return {
       deletedChunks,
       deletedCheckpoint: Boolean(existingCp),
+    };
+  });
+}
+
+export async function findLatestCheckpointBySourceAudioHash(
+  sourceAudioHash: string,
+  options?: {
+    modelVersion?: string;
+    processingVersion?: string;
+    preferredStatus?: SeparationCheckpointStatus;
+  },
+): Promise<SeparationCheckpoint | null> {
+  if (!sourceAudioHash) return null;
+  const modelVersion = options?.modelVersion ?? DEMUCS_MODEL_VERSION;
+  const processingVersion = options?.processingVersion ?? SEPARATION_PROCESSING_VERSION;
+  const all = await getAllCheckpoints();
+  const candidates = all.filter(
+    (cp) =>
+      cp.sourceAudioHash === sourceAudioHash &&
+      cp.modelVersion === modelVersion &&
+      cp.processingVersion === processingVersion &&
+      (!options?.preferredStatus || cp.status === options.preferredStatus),
+  );
+  candidates.sort((a, b) => {
+    if (a.status === "completed" && b.status !== "completed") return -1;
+    if (b.status === "completed" && a.status !== "completed") return 1;
+    return b.updatedAt - a.updatedAt;
+  });
+  return candidates[0] ?? null;
+}
+
+export async function findCompletedCheckpointBySourceAudioHash(
+  sourceAudioHash: string,
+  options?: {
+    modelVersion?: string;
+    processingVersion?: string;
+  },
+): Promise<SeparationCheckpoint | null> {
+  return findLatestCheckpointBySourceAudioHash(sourceAudioHash, {
+    ...options,
+    preferredStatus: "completed",
+  });
+}
+
+export async function deleteIncompleteCheckpointsForSong(params: {
+  songId?: string;
+  sourceAudioHash?: string;
+  excludeTaskId?: string;
+}): Promise<{
+  deletedCheckpoints: number;
+  deletedChunks: number;
+  preservedCompletedTaskIds: string[];
+}> {
+  return withIdbTransaction(["separationChunks", "separationCheckpoints"], "readwrite", async (tx) => {
+    const chunkStore = tx.objectStore("separationChunks");
+    const cpStore = tx.objectStore("separationCheckpoints");
+    const allCps = (await idbRequestPromise(cpStore.getAll())) as SeparationCheckpoint[];
+    const allChunks = (await idbRequestPromise(chunkStore.getAll())) as SeparationChunkRecord[];
+
+    const targetTaskIds = new Set<string>();
+    const preservedCompletedTaskIds: string[] = [];
+
+    for (const cp of allCps) {
+      const matchesSong =
+        (params.songId && cp.songId === params.songId) ||
+        (params.sourceAudioHash && cp.sourceAudioHash === params.sourceAudioHash);
+      if (!matchesSong) continue;
+      if (params.excludeTaskId && cp.taskId === params.excludeTaskId) continue;
+      if (cp.status === "completed") {
+        preservedCompletedTaskIds.push(cp.taskId);
+        continue;
+      }
+      targetTaskIds.add(cp.taskId);
+    }
+
+    let deletedCheckpoints = 0;
+    for (const taskId of targetTaskIds) {
+      await idbRequestPromise(cpStore.delete(taskId));
+      deletedCheckpoints++;
+    }
+
+    let deletedChunks = 0;
+    for (const rec of allChunks) {
+      if (targetTaskIds.has(rec.taskId)) {
+        await idbRequestPromise(chunkStore.delete(rec.key));
+        deletedChunks++;
+      }
+    }
+
+    return {
+      deletedCheckpoints,
+      deletedChunks,
+      preservedCompletedTaskIds,
+    };
+  });
+}
+
+export async function deleteAllIncompleteCheckpoints(): Promise<{
+  deletedCheckpoints: number;
+  deletedChunks: number;
+  preservedCompletedCount: number;
+}> {
+  return withIdbTransaction(["separationChunks", "separationCheckpoints"], "readwrite", async (tx) => {
+    const chunkStore = tx.objectStore("separationChunks");
+    const cpStore = tx.objectStore("separationCheckpoints");
+    const allCps = (await idbRequestPromise(cpStore.getAll())) as SeparationCheckpoint[];
+    const allChunks = (await idbRequestPromise(chunkStore.getAll())) as SeparationChunkRecord[];
+
+    const completedTaskIds = new Set<string>();
+    const incompleteTaskIds = new Set<string>();
+
+    for (const cp of allCps) {
+      if (cp.status === "completed") {
+        completedTaskIds.add(cp.taskId);
+      } else {
+        incompleteTaskIds.add(cp.taskId);
+      }
+    }
+
+    let deletedCheckpoints = 0;
+    for (const taskId of incompleteTaskIds) {
+      await idbRequestPromise(cpStore.delete(taskId));
+      deletedCheckpoints++;
+    }
+
+    let deletedChunks = 0;
+    for (const rec of allChunks) {
+      if (!completedTaskIds.has(rec.taskId)) {
+        await idbRequestPromise(chunkStore.delete(rec.key));
+        deletedChunks++;
+      }
+    }
+
+    return {
+      deletedCheckpoints,
+      deletedChunks,
+      preservedCompletedCount: completedTaskIds.size,
     };
   });
 }

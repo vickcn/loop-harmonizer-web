@@ -381,6 +381,10 @@ export class SeparationTaskCoordinator {
     return this.activeControllers.get(songId) ?? null;
   }
 
+  getCurrentGeneration(songId: string): number | null {
+    return this.songGenerations.get(songId) ?? null;
+  }
+
   isBusyWaitingCleanup(): boolean {
     const stage = this.globalBusyTask?.getStage();
     return Boolean(this.globalBusyTask && (stage === "cancelling" || stage === "pausing"));
