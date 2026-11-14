@@ -566,6 +566,69 @@ export function BandMixer() {
     });
   }, [getEngine]);
 
+  const applySongAudioPatch = useCallback((prevSong: BandSong, nextSong: BandSong) => {
+    const engine = getEngine();
+    const allIds = [nextSong.sourceAudioId, ...nextSong.stemIds];
+
+    const prevRate = getEffectivePlaybackRate(prevSong);
+    const nextRate = getEffectivePlaybackRate(nextSong);
+    if (prevRate !== nextRate) {
+      allIds.forEach((id) => {
+        engine.setPlaybackRate(id, nextRate);
+      });
+    }
+
+    if (prevSong.keyShiftSemitones !== nextSong.keyShiftSemitones) {
+      allIds.forEach((id) => {
+        engine.setPitchSemitones(id, nextSong.keyShiftSemitones);
+      });
+    }
+
+    if (prevSong.loop !== nextSong.loop) {
+      engine.setLoop(nextSong.sourceAudioId, nextSong.loop);
+      engine.setLoopGroup(nextSong.stemIds, nextSong.loop);
+    }
+
+    if (prevSong.masterVolume !== nextSong.masterVolume) {
+      engine.setVolume(nextSong.sourceAudioId, nextSong.masterVolume);
+      nextSong.stemChannels.forEach((channel) => {
+        engine.setVolume(channel.id, nextSong.masterVolume * channel.volume);
+      });
+    } else if (prevSong.stemChannels !== nextSong.stemChannels) {
+      nextSong.stemChannels.forEach((channel) => {
+        const prevChannel = prevSong.stemChannels.find((candidate) => candidate.id === channel.id);
+        if (!prevChannel || prevChannel.volume !== channel.volume) {
+          engine.setVolume(channel.id, nextSong.masterVolume * channel.volume);
+        }
+      });
+    }
+
+    const songMutedChanged = Boolean(prevSong.muted) !== Boolean(nextSong.muted);
+    const stemMuteOrSoloChanged =
+      prevSong.stemChannels !== nextSong.stemChannels &&
+      (prevSong.stemChannels.length !== nextSong.stemChannels.length ||
+        nextSong.stemChannels.some((channel, index) => {
+          const prevChannel = prevSong.stemChannels[index];
+          return (
+            !prevChannel ||
+            prevChannel.id !== channel.id ||
+            prevChannel.muted !== channel.muted ||
+            prevChannel.solo !== channel.solo
+          );
+        }));
+
+    if (songMutedChanged) {
+      engine.setMuted(nextSong.sourceAudioId, Boolean(nextSong.muted));
+    }
+    if (songMutedChanged || stemMuteOrSoloChanged) {
+      const isSongMuted = Boolean(nextSong.muted);
+      const audibility = getStemAudibility(nextSong.stemChannels);
+      nextSong.stemChannels.forEach((channel) => {
+        engine.setMuted(channel.id, isSongMuted || !audibility[channel.id]);
+      });
+    }
+  }, [getEngine]);
+
   const installStemSet = useCallback((
     song: BandSong,
     stems: SeparatedStemSet,
@@ -1948,7 +2011,7 @@ export function BandMixer() {
         if ("targetBpm" in normalized) normalized.targetBpm = clampBpm(normalized.targetBpm ?? song.targetBpm);
         if ("keyShiftSemitones" in normalized) normalized.keyShiftSemitones = Math.max(-12, Math.min(12, Math.round(normalized.keyShiftSemitones ?? 0)));
         const next = { ...song, ...normalized };
-        applySongToEngine(next);
+        applySongAudioPatch(song, next);
         shouldPersist = Boolean(next.sourceAudioHash);
         return next;
       }),
@@ -1956,7 +2019,7 @@ export function BandMixer() {
     if (shouldPersist) {
       persistSongDebounced(songId, options?.persistDelayMs ?? 300);
     }
-  }, [applySongToEngine, isFocusLocked, persistSongDebounced, showCardFeedback, showShortcutHint]);
+  }, [applySongAudioPatch, isFocusLocked, persistSongDebounced, showCardFeedback, showShortcutHint]);
 
   const persistNewOrRelinkedSong = useCallback(async (song: BandSong, file: Blob, sourceAudioHash: string, force = false) => {
     const res = await saveSongWithAudioFile({ song, file, sourceAudioHash, force });
@@ -2556,7 +2619,12 @@ export function BandMixer() {
     }
     const result = toggleMuteBySelection(sessionRef.current.songs, targetSelection);
     if (result.changedSong) {
-      applySongToEngine(result.changedSong);
+      const prevSong = sessionRef.current.songs.find((candidate) => candidate.id === result.changedSong!.id);
+      if (prevSong) {
+        applySongAudioPatch(prevSong, result.changedSong);
+      } else {
+        applySongToEngine(result.changedSong);
+      }
       setSession((previous) => ({
         ...previous,
         songs: previous.songs.map((candidate) => (
@@ -2567,7 +2635,7 @@ export function BandMixer() {
       showCardFeedback(result.changedSong.id, result.message);
     }
     showShortcutHint(result.message);
-  }, [applySongToEngine, isFocusLocked, persistSongDebounced, showCardFeedback, showShortcutHint]);
+  }, [applySongAudioPatch, applySongToEngine, isFocusLocked, persistSongDebounced, showCardFeedback, showShortcutHint]);
 
   const toggleSoloForSelection = useCallback((targetSelection: MixerSelection) => {
     if (isFocusLocked()) {
@@ -2578,7 +2646,12 @@ export function BandMixer() {
     }
     const result = toggleSoloBySelection(sessionRef.current.songs, targetSelection);
     if (result.changedSong) {
-      applySongToEngine(result.changedSong);
+      const prevSong = sessionRef.current.songs.find((candidate) => candidate.id === result.changedSong!.id);
+      if (prevSong) {
+        applySongAudioPatch(prevSong, result.changedSong);
+      } else {
+        applySongToEngine(result.changedSong);
+      }
       setSession((previous) => ({
         ...previous,
         songs: previous.songs.map((candidate) => (
@@ -2591,7 +2664,7 @@ export function BandMixer() {
       showCardFeedback(targetSelection.songId, result.message);
     }
     showShortcutHint(result.message);
-  }, [applySongToEngine, isFocusLocked, persistSongDebounced, showCardFeedback, showShortcutHint]);
+  }, [applySongAudioPatch, applySongToEngine, isFocusLocked, persistSongDebounced, showCardFeedback, showShortcutHint]);
 
   const switchSource = async (song: BandSong, playbackSource: "original" | "stems") => {
     if (isFocusLocked()) {
@@ -3747,7 +3820,31 @@ export function BandMixer() {
   };
 
   const updateStem = (song: BandSong, stemId: string, patch: Partial<StemChannel>) => {
-    updateSong(song.id, { stemChannels: song.stemChannels.map((channel) => channel.id === stemId ? { ...channel, ...patch } : channel) });
+    if (isFocusLocked()) {
+      const msg = "分離專注模式啟動中，已暫時鎖定變速、升降 Key 與音軌參數變更。";
+      showCardFeedback(song.id, msg);
+      showShortcutHint(msg);
+      return;
+    }
+    let shouldPersist = false;
+    setSession((previous) => ({
+      ...previous,
+      songs: previous.songs.map((candidate) => {
+        if (candidate.id !== song.id) return candidate;
+        const next: BandSong = {
+          ...candidate,
+          stemChannels: candidate.stemChannels.map((channel) => (
+            channel.id === stemId ? { ...channel, ...patch } : channel
+          )),
+        };
+        applySongAudioPatch(candidate, next);
+        shouldPersist = Boolean(next.sourceAudioHash);
+        return next;
+      }),
+    }));
+    if (shouldPersist) {
+      persistSongDebounced(song.id, 300);
+    }
   };
 
   const downloadStem = async (song: BandSong, stemId: string) => {

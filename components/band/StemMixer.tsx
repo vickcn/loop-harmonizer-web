@@ -78,6 +78,9 @@ export const StemMixer = memo(function StemMixer({
               step={0.01}
               value={channel.volume}
               style={{ flex: "1 1 70px", minWidth: 56, "--range-progress": `${percent}%` } as CSSProperties}
+              onPointerDown={(event) => event.stopPropagation()}
+              onPointerMove={(event) => event.stopPropagation()}
+              onPointerUp={(event) => event.stopPropagation()}
               onChange={(event) => onChange(channel.id, { volume: Number(event.target.value) })}
             />
             <span className="small" style={{ width: 34, flex: "0 0 auto", textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{percent}%</span>

@@ -878,32 +878,38 @@ export class MultiTrackEngine {
   setPlaybackRate(trackId: string, rate: number, rampSec = 0.5): void {
     const t = this.tracks.get(trackId);
     if (!t) return;
-    t.playbackRate = Math.max(0.1, Math.min(4, rate));
+    const clamped = Math.max(0.1, Math.min(4, rate));
     const groupId = this.trackToMixGroup.get(trackId);
     if (groupId) {
+      t.playbackRate = clamped;
       const bus = this.stemMixBuses.get(groupId);
-      if (bus && bus.playbackRate !== t.playbackRate) {
-        bus.playbackRate = t.playbackRate;
+      if (bus && bus.playbackRate !== clamped) {
+        bus.playbackRate = clamped;
         if (this.ctx) bus.adapter.setPlaybackRate(bus.playbackRate, this.ctx, rampSec);
       }
       return;
     }
+    if (t.playbackRate === clamped) return;
+    t.playbackRate = clamped;
     if (this.ctx) t.adapter.setPlaybackRate(t.playbackRate, this.ctx, rampSec);
   }
 
   setPitchSemitones(trackId: string, semitones: number): void {
     const t = this.tracks.get(trackId);
     if (!t) return;
-    t.keyShiftSemitones = Math.max(-12, Math.min(12, Math.round(semitones)));
+    const clamped = Math.max(-12, Math.min(12, Math.round(semitones)));
     const groupId = this.trackToMixGroup.get(trackId);
     if (groupId) {
+      t.keyShiftSemitones = clamped;
       const bus = this.stemMixBuses.get(groupId);
-      if (bus && bus.keyShiftSemitones !== t.keyShiftSemitones) {
-        bus.keyShiftSemitones = t.keyShiftSemitones;
+      if (bus && bus.keyShiftSemitones !== clamped) {
+        bus.keyShiftSemitones = clamped;
         if (this.ctx) bus.adapter.setPitchSemitones(bus.keyShiftSemitones, this.ctx);
       }
       return;
     }
+    if (t.keyShiftSemitones === clamped) return;
+    t.keyShiftSemitones = clamped;
     if (this.ctx) t.adapter.setPitchSemitones(t.keyShiftSemitones, this.ctx);
   }
 
