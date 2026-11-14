@@ -252,6 +252,7 @@ export function BandMixer() {
   const sessionRef = useRef(session);
   const selectionRef = useRef<MixerSelection>(selection);
   const startingSongIdsRef = useRef<Set<string>>(startingSongIds);
+  const profileWarningRef = useRef<string>(profileWarning);
   const hintTimerRef = useRef<number | null>(null);
   const cardFeedbackTimersRef = useRef<Map<string, number>>(new Map());
   const shortcutHandlerRef = useRef<(event: KeyboardEvent) => void>(() => undefined);
@@ -273,17 +274,30 @@ export function BandMixer() {
   const persistRequestedRef = useRef(false);
   const autoResumeDebounceRef = useRef<number | null>(null);
   const attemptForegroundAutoResumeRef = useRef<() => void>(() => undefined);
+  const persistSongDebouncedRef = useRef<(songId: string, delayMs?: number) => void>(() => undefined);
 
   const getEngine = useCallback(() => {
     if (!engineRef.current) {
       const engine = new MultiTrackEngine();
       engine.onTrackEnded = (trackId) => {
+        const endedIds = sessionRef.current.songs
+          .filter((song) => getSongPlaybackTrackIds(song).includes(trackId) && Boolean(song.sourceAudioHash))
+          .map((song) => song.id);
+        const nextSongsSnapshot = sessionRef.current.songs.map((song) =>
+          getSongPlaybackTrackIds(song).includes(trackId)
+            ? { ...song, status: "stopped" as const, playheadSec: 0 }
+            : song,
+        );
+        sessionRef.current = { ...sessionRef.current, songs: nextSongsSnapshot };
         setSession((previous) => ({
           ...previous,
           songs: previous.songs.map((song) => getSongPlaybackTrackIds(song).includes(trackId)
             ? { ...song, status: "stopped", playheadSec: 0 }
             : song),
         }));
+        for (const endedId of endedIds) {
+          persistSongDebouncedRef.current(endedId, 150);
+        }
       };
       engineRef.current = engine;
     }
@@ -306,6 +320,10 @@ export function BandMixer() {
   useEffect(() => {
     startingSongIdsRef.current = startingSongIds;
   }, [startingSongIds]);
+
+  useEffect(() => {
+    profileWarningRef.current = profileWarning;
+  }, [profileWarning]);
 
   const showShortcutHint = useCallback((message: string) => {
     setShortcutHint(message);
@@ -358,13 +376,15 @@ export function BandMixer() {
     const result = sharedResourceProfileManager.evaluate(cap, signals);
     setResourceProfile(result.profile);
     if (result.justDegraded && result.profile.degradationReason) {
+      profileWarningRef.current = result.profile.degradationReason;
       setProfileWarning(result.profile.degradationReason);
       showShortcutHint(`資源保護已自動降級至 ${result.profile.tier} 模式：${result.profile.degradationReason}`);
-    } else if (result.profile.degradationReason && !profileWarning) {
+    } else if (result.profile.degradationReason && !profileWarningRef.current) {
+      profileWarningRef.current = result.profile.degradationReason;
       setProfileWarning(result.profile.degradationReason);
     }
     return result.profile;
-  }, [profileWarning, showShortcutHint]);
+  }, [showShortcutHint]);
 
   const showCardFeedback = useCallback((songId: string, message: string) => {
     setCardFeedbacks((previous) => ({ ...previous, [songId]: message }));
@@ -481,6 +501,7 @@ export function BandMixer() {
   const handlePersistResult = useCallback((songId: string, result: SaveSongResult) => {
     if (!sessionRef.current.songs.some((candidate) => candidate.id === songId)) return;
     if (result.ok) {
+      persistedMetaBySongIdRef.current.set(songId, result.record);
       patchSongMetadataOnly(songId, {
         revision: result.record.revision,
         persistenceStatus: "saved",
@@ -520,6 +541,10 @@ export function BandMixer() {
       delayMs,
     );
   }, [handlePersistResult, patchSongMetadataOnly]);
+
+  useEffect(() => {
+    persistSongDebouncedRef.current = persistSongDebounced;
+  }, [persistSongDebounced]);
 
   const applySongToEngine = useCallback((song: BandSong) => {
     const engine = getEngine();
@@ -589,6 +614,7 @@ export function BandMixer() {
       });
     }
     const nextSongsSnapshot = sessionRef.current.songs.map((candidate) => candidate.id === song.id ? nextSong : candidate);
+    sessionRef.current = { ...sessionRef.current, songs: nextSongsSnapshot };
     setSession((previous) => ({ ...previous, songs: previous.songs.map((candidate) => candidate.id === song.id ? nextSong : candidate) }));
     setSelection((current) => sanitizeMixerSelection(current, nextSongsSnapshot));
     if (!options?.skipPersist) {
@@ -699,6 +725,7 @@ export function BandMixer() {
     const nextSongsSnapshot = sessionRef.current.songs.map((candidate) =>
       candidate.id === song.id ? { ...candidate, ...completedFields } : candidate,
     );
+    sessionRef.current = { ...sessionRef.current, songs: nextSongsSnapshot };
     setSession((previous) => ({
       ...previous,
       songs: previous.songs.map((candidate) =>
@@ -775,6 +802,7 @@ export function BandMixer() {
           const restoredForEngine = restoreSongsAfterSeparationFocus(songsForEngine, snapshot, {
             outcome: safeOutcome,
           });
+          sessionRef.current = { ...sessionRef.current, songs: restoredForEngine };
           for (const restoredSong of restoredForEngine) {
             // 僅還原設定與播放位置，保持暫停絕不自動播放
             engine.pauseTracks([restoredSong.sourceAudioId, ...restoredSong.stemIds]);
@@ -1039,12 +1067,74 @@ export function BandMixer() {
     };
   }, [getEngine, refreshResourceProfile, showShortcutHint]);
 
+  const ensureStemsInstalledForReadySong = useCallback(async (
+    readySong: BandSong,
+    preferredSource: SongPlaybackSource,
+  ): Promise<void> => {
+    if (removedSongIdsRef.current.has(readySong.id)) return;
+    const cpValidation = readySong.sourceAudioHash
+      ? await verifyAuthoritativeCheckpointForSong(readySong, true)
+      : null;
+    if (isValidationCompleted(cpValidation) && cpValidation?.checkpoint && !removedSongIdsRef.current.has(readySong.id)) {
+      const preferredMode = readySong.separationMode ?? cpValidation.checkpoint.requestedMode ?? "four_stem";
+      const resolvedCacheKey =
+        readySong.cacheKey ||
+        createSeparationCacheKey({
+          sourceAudioHash: readySong.sourceAudioHash!,
+          modelVersion: DEMUCS_MODEL_VERSION,
+          separationMode: preferredMode,
+          processingVersion: SEPARATION_PROCESSING_VERSION,
+        });
+      await installChunkedStemSet(
+        readySong,
+        {
+          taskId: cpValidation.checkpoint.taskId,
+          mode: preferredMode,
+          sampleRate: cpValidation.checkpoint.sampleRate,
+          totalSamples: cpValidation.checkpoint.totalSamples,
+          totalChunks: cpValidation.checkpoint.totalChunks,
+          committedBytes: cpValidation.checkpoint.committedBytes,
+          durationSeconds: cpValidation.checkpoint.totalSamples / cpValidation.checkpoint.sampleRate,
+        },
+        resolvedCacheKey,
+        `分段分離完成（共 ${cpValidation.checkpoint.totalChunks} 段按需播放）。`,
+        { preferredSource, skipPersist: true },
+      );
+      return;
+    }
+    if (readySong.cacheKey && !removedSongIdsRef.current.has(readySong.id)) {
+      const cached = await getCachedStemSet(readySong.cacheKey).catch(() => null);
+      if (cached && !removedSongIdsRef.current.has(readySong.id)) {
+        installStemSet(readySong, cached, readySong.cacheKey, "已從本機快取載入分離結果。", {
+          preferredSource,
+          skipPersist: true,
+        });
+      }
+      return;
+    }
+    if (cpValidation?.checkpoint && !removedSongIdsRef.current.has(readySong.id)) {
+      patchSongMetadataOnly(readySong.id, deriveSeparationStateFromValidation({ validation: cpValidation }), {
+        source: "BandMixer.ensureSongAudioReady",
+        checkpointStatus: cpValidation.checkpoint.status,
+      });
+    }
+  }, [installChunkedStemSet, installStemSet, patchSongMetadataOnly, verifyAuthoritativeCheckpointForSong]);
+
   const ensureSongAudioReady = useCallback(async (
     song: BandSong,
     options?: { skipGuard?: boolean; allowDuringFocus?: boolean },
   ): Promise<boolean> => {
     const engine = getEngine();
     if (engine.hasTrack(song.sourceAudioId) && song.audioLoadState !== "unloaded") {
+      const latestSong = sessionRef.current.songs.find((item) => item.id === song.id) ?? song;
+      const stemsMissing =
+        latestSong.playbackSource === "stems" &&
+        (latestSong.stemIds.length === 0 ||
+          latestSong.stemIds.some((id) => !engine.hasTrack(id)) ||
+          (latestSong.separationUsesChunkPlayback && !engine.hasHealthyStemMixBus(latestSong.id)));
+      if (stemsMissing && (!isFocusLocked() || options?.allowDuringFocus)) {
+        await ensureStemsInstalledForReadySong(latestSong, latestSong.playbackSource);
+      }
       return true;
     }
     if (!options?.allowDuringFocus && isFocusLocked()) {
@@ -1152,49 +1242,11 @@ export function BandMixer() {
       }));
 
       if (!removedSongIdsRef.current.has(song.id)) {
-        const preferred = persistedRecord?.playbackSource ?? readySong.playbackSource;
-        const cpValidation = readySong.sourceAudioHash
-          ? await verifyAuthoritativeCheckpointForSong(readySong, true)
-          : null;
-        if (isValidationCompleted(cpValidation) && cpValidation?.checkpoint && !removedSongIdsRef.current.has(song.id)) {
-          const preferredMode = readySong.separationMode ?? cpValidation.checkpoint.requestedMode ?? "four_stem";
-          const resolvedCacheKey =
-            readySong.cacheKey ||
-            createSeparationCacheKey({
-              sourceAudioHash: readySong.sourceAudioHash!,
-              modelVersion: DEMUCS_MODEL_VERSION,
-              separationMode: preferredMode,
-              processingVersion: SEPARATION_PROCESSING_VERSION,
-            });
-          await installChunkedStemSet(
-            readySong,
-            {
-              taskId: cpValidation.checkpoint.taskId,
-              mode: preferredMode,
-              sampleRate: cpValidation.checkpoint.sampleRate,
-              totalSamples: cpValidation.checkpoint.totalSamples,
-              totalChunks: cpValidation.checkpoint.totalChunks,
-              committedBytes: cpValidation.checkpoint.committedBytes,
-              durationSeconds: cpValidation.checkpoint.totalSamples / cpValidation.checkpoint.sampleRate,
-            },
-            resolvedCacheKey,
-            `分段分離完成（共 ${cpValidation.checkpoint.totalChunks} 段按需播放）。`,
-            { preferredSource: preferred, skipPersist: true },
-          );
-        } else if (readySong.cacheKey && !removedSongIdsRef.current.has(song.id)) {
-          const cached = await getCachedStemSet(readySong.cacheKey).catch(() => null);
-          if (cached && !removedSongIdsRef.current.has(song.id)) {
-            installStemSet(readySong, cached, readySong.cacheKey, "已從本機快取載入分離結果。", {
-              preferredSource: preferred,
-              skipPersist: true,
-            });
-          }
-        } else if (cpValidation?.checkpoint && !removedSongIdsRef.current.has(song.id)) {
-          patchSongMetadataOnly(song.id, deriveSeparationStateFromValidation({ validation: cpValidation }), {
-            source: "BandMixer.ensureSongAudioReady",
-            checkpointStatus: cpValidation.checkpoint.status,
-          });
-        }
+        const preferred =
+          readySong.separationStatus === "completed"
+            ? readySong.playbackSource
+            : (persistedRecord?.playbackSource ?? readySong.playbackSource);
+        await ensureStemsInstalledForReadySong(readySong, preferred);
       }
       return true;
     } catch {
@@ -1206,7 +1258,7 @@ export function BandMixer() {
       });
       return false;
     }
-  }, [applySongToEngine, getEngine, installChunkedStemSet, installStemSet, isFocusLocked, patchSongMetadataOnly, releaseIdleResources, requestGuardConfirmation, showCardFeedback, showShortcutHint, verifyAuthoritativeCheckpointForSong]);
+  }, [applySongToEngine, ensureStemsInstalledForReadySong, getEngine, isFocusLocked, patchSongMetadataOnly, releaseIdleResources, requestGuardConfirmation, showCardFeedback, showShortcutHint]);
 
   const hydrateOnePersistedSong = useCallback(async (
     record: PersistedSongRecord,
@@ -1269,6 +1321,13 @@ export function BandMixer() {
               validation: cpValidation,
               cacheKey: resolvedCacheKey,
             }),
+          };
+          const existsInRef = sessionRef.current.songs.some((item) => item.id === lazySong.id);
+          sessionRef.current = {
+            ...sessionRef.current,
+            songs: existsInRef
+              ? sessionRef.current.songs.map((item) => (item.id === lazySong.id ? lazySong : item))
+              : [...sessionRef.current.songs, lazySong],
           };
           setSession((previous) => {
             const exists = previous.songs.some((item) => item.id === lazySong.id);
@@ -1348,6 +1407,13 @@ export function BandMixer() {
     engine.seekTracks([sourceAudioId], restoredSong.playheadSec);
     applySongToEngine(restoredSong);
 
+    const existsInRef = sessionRef.current.songs.some((item) => item.id === restoredSong.id);
+    sessionRef.current = {
+      ...sessionRef.current,
+      songs: existsInRef
+        ? sessionRef.current.songs.map((item) => (item.id === restoredSong.id ? restoredSong : item))
+        : [...sessionRef.current.songs, restoredSong],
+    };
     setSession((previous) => {
       const exists = previous.songs.some((item) => item.id === restoredSong.id);
       return {
@@ -1426,8 +1492,23 @@ export function BandMixer() {
   }, [applySongToEngine, getEngine, installChunkedStemSet, installStemSet, patchSongMetadataOnly, restoreCachedStems, verifyAuthoritativeCheckpointForSong]);
 
   useEffect(() => {
-    let cancelled = false;
     sharedPerfTelemetry.startObservingLongTasks();
+    const feedbackTimers = cardFeedbackTimersRef.current;
+    return () => {
+      if (hintTimerRef.current !== null) {
+        window.clearTimeout(hintTimerRef.current);
+      }
+      feedbackTimers.forEach((timer) => window.clearTimeout(timer));
+      feedbackTimers.clear();
+      sharedPerfTelemetry.stopObserving();
+      engineRef.current?.dispose();
+      engineRef.current = null;
+      void disposeStemSeparator({ revokeModelUrl: true });
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
     void refreshResourceProfile();
 
     const runRestore = async () => {
@@ -1794,7 +1875,6 @@ export function BandMixer() {
       })();
     });
 
-    const feedbackTimers = cardFeedbackTimersRef.current;
     return () => {
       cancelled = true;
       if (autoResumeDebounceRef.current !== null) {
@@ -1808,15 +1888,6 @@ export function BandMixer() {
       window.removeEventListener("pagehide", onPageHide);
       window.removeEventListener("pageshow", onPageShow);
       void flushPendingSongPersists();
-      if (hintTimerRef.current !== null) {
-        window.clearTimeout(hintTimerRef.current);
-      }
-      feedbackTimers.forEach((timer) => window.clearTimeout(timer));
-      feedbackTimers.clear();
-      sharedPerfTelemetry.stopObserving();
-      engineRef.current?.dispose();
-      engineRef.current = null;
-      void disposeStemSeparator({ revokeModelUrl: true });
     };
   }, [applySongToEngine, getEngine, hydrateOnePersistedSong, installChunkedStemSet, patchSongMetadataOnly, refreshCacheStats, refreshResourceProfile, restoreAttempt, restoreCachedStems, showCardFeedback, showShortcutHint, verifyAuthoritativeCheckpointForSong]);
 
@@ -2151,6 +2222,7 @@ export function BandMixer() {
     }
     if (startingSongIdsRef.current.has(song.id)) return;
     startingSongIdsRef.current.add(song.id);
+    getEngine().primeContextFromGesture();
     setStartingSongIds((previous) => new Set(previous).add(song.id));
     setPlaybackErrors((previous) => {
       if (!(song.id in previous)) return previous;
@@ -2272,9 +2344,166 @@ export function BandMixer() {
         showShortcutHint(admission.message);
         showCardFeedback(latestSong.id, admission.message);
       }
-      applySongToEngine(latestSong);
-      await engine.playTracks(trackIds);
-      updateSong(latestSong.id, { status: "playing" });
+
+      let preparedSong = latestSong;
+      if (
+        preparedSong.playbackSource === "stems" &&
+        preparedSong.stemChannels.length === 0 &&
+        preparedSong.stemIds.length > 0
+      ) {
+        const saved = savedSettingsRef.current.get(preparedSong.id);
+        const rebuiltChannels: StemChannel[] = [];
+        for (const id of preparedSong.stemIds) {
+          const match = id.match(/_stem_(vocals|drums|bass|other|instrumental)$/);
+          if (!match) continue;
+          const stemType = match[1] as StemChannel["stemType"];
+          rebuiltChannels.push({
+            id,
+            songId: preparedSong.id,
+            stemType,
+            volume: saved?.stemVolumes?.[stemType] ?? 1,
+            muted: saved?.stemMuted?.[stemType] ?? false,
+            solo: saved?.stemSolo?.[stemType] ?? false,
+          });
+        }
+        if (rebuiltChannels.length > 0) {
+          preparedSong = { ...preparedSong, stemChannels: rebuiltChannels };
+          sessionRef.current = {
+            ...sessionRef.current,
+            songs: sessionRef.current.songs.map((item) => (item.id === preparedSong.id ? preparedSong : item)),
+          };
+          setSession((previous) => ({
+            ...previous,
+            songs: previous.songs.map((item) => (item.id === preparedSong.id ? preparedSong : item)),
+          }));
+          if (preparedSong.sourceAudioHash) {
+            persistSongDebounced(preparedSong.id, 150);
+          }
+        }
+      }
+
+      if (preparedSong.durationSec > 0.5 && preparedSong.playheadSec >= preparedSong.durationSec - 0.4) {
+        engine.seekTracks([preparedSong.sourceAudioId, ...preparedSong.stemIds], 0);
+        preparedSong = { ...preparedSong, playheadSec: 0 };
+        sessionRef.current = {
+          ...sessionRef.current,
+          songs: sessionRef.current.songs.map((item) => (item.id === preparedSong.id ? preparedSong : item)),
+        };
+        setSession((previous) => ({
+          ...previous,
+          songs: previous.songs.map((item) => (item.id === preparedSong.id ? preparedSong : item)),
+        }));
+      }
+
+      if (preparedSong.muted) {
+        showCardFeedback(preparedSong.id, "此歌曲目前為靜音狀態（M），解除靜音即可聽見聲音。");
+      } else if (preparedSong.masterVolume <= 0) {
+        showCardFeedback(preparedSong.id, "此歌曲主音量目前為 0%，調高音量即可聽見聲音。");
+      } else if (preparedSong.playbackSource === "stems" && preparedSong.stemChannels.length > 0) {
+        const audibility = getStemAudibility(preparedSong.stemChannels);
+        const anyAudible = preparedSong.stemChannels.some((ch) => audibility[ch.id] && ch.volume > 0);
+        if (!anyAudible) {
+          showCardFeedback(preparedSong.id, "所有分軌目前均為靜音或音量為 0%，取消靜音或調高音量即可聽見聲音。");
+        }
+      }
+
+      const activeTrackIds = getSongPlaybackTrackIds(preparedSong);
+      applySongToEngine(preparedSong);
+      await engine.playTracks(activeTrackIds);
+
+      const diag = engine.diagnosePlayback(activeTrackIds);
+      console.info("[BandMixer AudioDiag]", JSON.stringify(diag));
+
+      const missingChunkBus =
+        preparedSong.playbackSource === "stems"
+          ? diag.buses.find(
+              (bus) =>
+                bus.adapterDiagnostics !== null &&
+                bus.adapterDiagnostics.residentChunks.length === 0 &&
+                bus.adapterDiagnostics.missingChunkCount > 0,
+            )
+          : undefined;
+
+      if (missingChunkBus) {
+        const verified = preparedSong.sourceAudioHash
+          ? await verifyAuthoritativeCheckpointForSong(preparedSong, true).catch(() => null)
+          : null;
+        if (isValidationCompleted(verified) && verified?.checkpoint) {
+          engine.pauseTracks(activeTrackIds);
+          await ensureStemsInstalledForReadySong(preparedSong, "stems");
+          const repairedSong =
+            sessionRef.current.songs.find((item) => item.id === preparedSong.id) ?? preparedSong;
+          const repairedTrackIds = getSongPlaybackTrackIds(repairedSong);
+          applySongToEngine(repairedSong);
+          await engine.playTracks(repairedTrackIds);
+          const repairedDiag = engine.diagnosePlayback(repairedTrackIds);
+          console.info("[BandMixer AudioDiag][Repaired]", JSON.stringify(repairedDiag));
+          updateSong(repairedSong.id, { status: "playing" });
+          return;
+        }
+
+        if (engine.hasTrack(preparedSong.sourceAudioId)) {
+          engine.pauseTracks(activeTrackIds);
+          preparedSong.stemIds.forEach((id) => engine.removeTrack(id));
+          const derived: Partial<BandSong> = verified
+            ? deriveSeparationStateFromValidation({ validation: verified })
+            : {
+                separationStatus: "interrupted",
+                separationProgress: 0,
+                separationMessage: "",
+                separationTaskId: null,
+                separationCompletedChunks: 0,
+                separationTotalChunks: 0,
+                separationCommittedBytes: 0,
+                separationUsesChunkPlayback: false,
+              };
+          const nextCompleted = derived.separationCompletedChunks ?? 0;
+          const nextTotal = derived.separationTotalChunks ?? 0;
+          const fallbackMsg =
+            nextCompleted > 0 && nextCompleted < nextTotal
+              ? `偵測到先前分軌僅完成第 ${nextCompleted}/${nextTotal} 段，已切換回原曲播放；可點擊「繼續分離」接續完成。`
+              : "偵測到先前分軌資料尚未完整保存，已自動切換回原曲播放；請重新分離音源。";
+          const fallbackSong: BandSong = {
+            ...preparedSong,
+            ...derived,
+            playbackSource: "original",
+            stemIds: [],
+            stemChannels: [],
+            separationStage:
+              derived.separationStatus === "paused" || derived.separationStatus === "interrupted"
+                ? (nextCompleted > 0 ? "paused" : "idle")
+                : derived.separationStatus === "failed"
+                  ? "failed"
+                  : "idle",
+            separationUsesChunkPlayback: false,
+            separationMessage: fallbackMsg,
+            status: "playing",
+          };
+          sessionRef.current = {
+            ...sessionRef.current,
+            songs: sessionRef.current.songs.map((item) =>
+              item.id === fallbackSong.id ? fallbackSong : item,
+            ),
+          };
+          setSession((previous) => ({
+            ...previous,
+            songs: previous.songs.map((item) =>
+              item.id === fallbackSong.id ? fallbackSong : item,
+            ),
+          }));
+          engine.seekTracks([fallbackSong.sourceAudioId], fallbackSong.playheadSec);
+          applySongToEngine(fallbackSong);
+          await engine.playTracks([fallbackSong.sourceAudioId]);
+          if (fallbackSong.sourceAudioHash) {
+            persistSongDebounced(fallbackSong.id, 150);
+          }
+          showCardFeedback(fallbackSong.id, fallbackMsg);
+          showShortcutHint(fallbackMsg);
+          return;
+        }
+      }
+
+      updateSong(preparedSong.id, { status: "playing" });
     } catch (error) {
       const errorMsg = describePlaybackError(error);
       setPlaybackErrors((previous) => ({ ...previous, [song.id]: errorMsg }));

@@ -224,8 +224,12 @@ class FilterSupport {
   fillOutputBuffer(numFrames = 0) {
     while (this.outputBuffer.frameCount < numFrames) {
       const numInputFrames = 8192 * 2 - this.inputBuffer.frameCount;
+      const beforeFrames = this.inputBuffer.frameCount;
       this.fillInputBuffer(numInputFrames);
       if (this.inputBuffer.frameCount < 8192 * 2) {
+        if (this.inputBuffer.frameCount > beforeFrames && this.inputBuffer.frameCount > 0) {
+          this._pipe.process();
+        }
         break;
       }
       this._pipe.process();

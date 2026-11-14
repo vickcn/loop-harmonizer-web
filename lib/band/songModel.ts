@@ -501,8 +501,9 @@ export function restoreSongsAfterSeparationFocus(
       keyShiftSemitones: entry.snapshot.keyShiftSemitones,
       masterVolume: entry.snapshot.masterVolume,
       stemChannels:
-        song.id === focusSnapshot.targetSongId &&
-        (options.outcome === "completed" || song.separationStatus === "completed")
+        (song.id === focusSnapshot.targetSongId &&
+          (options.outcome === "completed" || song.separationStatus === "completed")) ||
+        (song.stemChannels.length > 0 && entry.snapshot.stemChannels.length === 0)
           ? song.stemChannels
           : entry.snapshot.stemChannels.map((ch) => ({ ...ch })),
     };

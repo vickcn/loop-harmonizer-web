@@ -141,6 +141,16 @@ export class MultiTrackEngine {
     return this.ctx;
   }
 
+  /**
+   * 同步於使用者點擊手勢當下喚醒 AudioContext，避免後續非同步準備流程造成 Chrome User Activation 失效。
+   */
+  primeContextFromGesture(): void {
+    const ctx = this.ensureCtx();
+    if (ctx.state === "suspended") {
+      void ctx.resume().catch(() => undefined);
+    }
+  }
+
   async loadTrack(
     trackId: string,
     file: File,
@@ -367,6 +377,86 @@ export class MultiTrackEngine {
     return this.tracks.has(trackId);
   }
 
+  hasHealthyStemMixBus(groupId: string): boolean {
+    const bus = this.stemMixBuses.get(groupId);
+    if (!bus || bus.trackIds.length === 0 || bus.entriesByTrackId.size === 0) {
+      return false;
+    }
+    if (bus.chunkedBuffer) {
+      return (
+        bus.chunkedBuffer.totalChunks > 0 &&
+        bus.chunkedBuffer.duration > 0 &&
+        bus.chunkedBuffer.entries.length > 0
+      );
+    }
+    const duration = this.tracks.get(bus.trackIds[0])?.buffer?.duration ?? 0;
+    return duration > 0;
+  }
+
+  diagnosePlayback(trackIds: string[]): {
+    contextState: AudioContextState | "uninitialized";
+    sampleRate: number | null;
+    buses: Array<{
+      groupId: string;
+      isPlaying: boolean;
+      busGain: number;
+      pausedAt: number;
+      duration: number;
+      activeEntryCount: number;
+      entries: Array<{ trackId: string; gain: number; muted: boolean }>;
+      adapterDiagnostics: ReturnType<ChunkedStemMixBuffer["getDiagnostics"]> | null;
+    }>;
+    standalone: Array<{
+      trackId: string;
+      isPlaying: boolean;
+      gain: number;
+      volume: number;
+      muted: boolean;
+      pausedAt: number;
+      duration: number;
+      playbackMode: EnginePlaybackMode;
+    }>;
+  } {
+    const { buses, standalone } = this._resolvePlaybackTargets(trackIds);
+    return {
+      contextState: this.ctx?.state ?? "uninitialized",
+      sampleRate: this.ctx?.sampleRate ?? null,
+      buses: buses.map((bus) => {
+        const entries = Array.from(bus.entriesByTrackId.values()).map((entry) => ({
+          trackId: entry.trackId,
+          gain: entry.gain,
+          muted: entry.muted,
+        }));
+        const adapterDiagnostics = bus.chunkedBuffer?.getDiagnostics() ?? null;
+        const activeEntryCount =
+          adapterDiagnostics?.activeEntryCount ??
+          entries.filter((entry) => !entry.muted && entry.gain > 0).length;
+        const duration =
+          bus.chunkedBuffer?.duration ?? this.tracks.get(bus.trackIds[0])?.buffer?.duration ?? 0;
+        return {
+          groupId: bus.groupId,
+          isPlaying: bus.isPlaying,
+          busGain: bus.gainNode.gain.value,
+          pausedAt: bus.pausedAt,
+          duration,
+          activeEntryCount,
+          entries,
+          adapterDiagnostics,
+        };
+      }),
+      standalone: standalone.map(({ id, track }) => ({
+        trackId: id,
+        isPlaying: track.isPlaying,
+        gain: track.gainNode.gain.value,
+        volume: track.volume,
+        muted: track.muted,
+        pausedAt: track.pausedAt,
+        duration: track.buffer?.duration ?? 0,
+        playbackMode: track.playbackMode,
+      })),
+    };
+  }
+
   isTrackPlaying(trackId: string): boolean {
     const groupId = this.trackToMixGroup.get(trackId);
     if (groupId) {
@@ -561,6 +651,14 @@ export class MultiTrackEngine {
     const { buses, standalone } = this._resolvePlaybackTargets(trackIds);
     await Promise.all([
       ...buses.map(async (bus) => {
+        const duration = bus.chunkedBuffer?.duration ?? this.tracks.get(bus.trackIds[0])?.buffer?.duration ?? 0;
+        if (duration > 0.5 && bus.pausedAt >= duration - 0.4) {
+          bus.pausedAt = 0;
+          for (const id of bus.trackIds) {
+            const member = this.tracks.get(id);
+            if (member) member.pausedAt = 0;
+          }
+        }
         if (bus.chunkedBuffer) {
           await bus.chunkedBuffer.warmUpAroundSample(
             Math.floor(Math.max(0, bus.pausedAt) * bus.chunkedBuffer.sampleRate),
@@ -762,6 +860,13 @@ export class MultiTrackEngine {
             bus.gainNode.gain.setValueAtTime(1, restoreTime);
           }
         }
+        for (const { track } of fromTargets.standalone) {
+          if (!track.isPlaying) {
+            const target = track.muted ? 0 : track.volume;
+            track.gainNode.gain.cancelScheduledValues(restoreTime);
+            track.gainNode.gain.setValueAtTime(target, restoreTime);
+          }
+        }
       }
     }, Math.ceil(durationSec * 1000) + 10);
   }
@@ -873,6 +978,23 @@ export class MultiTrackEngine {
   }
 
   private _startMixBusAt(bus: StemMixBus, scheduleTime: number): void {
+    const ctx = this.ctx;
+    const duration = bus.chunkedBuffer?.duration ?? this.tracks.get(bus.trackIds[0])?.buffer?.duration ?? 0;
+    if (duration > 0.5 && bus.pausedAt >= duration - 0.4) {
+      bus.pausedAt = 0;
+      for (const id of bus.trackIds) {
+        const member = this.tracks.get(id);
+        if (member) member.pausedAt = 0;
+      }
+      if (bus.chunkedBuffer) {
+        void bus.chunkedBuffer.warmUpAroundSample(0);
+      }
+    }
+    if (ctx) {
+      bus.gainNode.gain.cancelScheduledValues(ctx.currentTime);
+      bus.gainNode.gain.setValueAtTime(1, ctx.currentTime);
+    }
+    bus.gainNode.gain.value = 1;
     bus.adapter.onEnded = () => this._handleMixBusEnded(bus);
     bus.adapter.play(scheduleTime, {
       offsetSec: bus.pausedAt,
@@ -902,6 +1024,17 @@ export class MultiTrackEngine {
   }
 
   private _startAt(t: InternalTrack, trackId: string, scheduleTime: number): void {
+    const ctx = this.ctx;
+    const duration = t.buffer?.duration ?? 0;
+    if (duration > 0.5 && t.pausedAt >= duration - 0.4) {
+      t.pausedAt = 0;
+    }
+    const targetGain = t.muted ? 0 : t.volume;
+    if (ctx) {
+      t.gainNode.gain.cancelScheduledValues(ctx.currentTime);
+      t.gainNode.gain.setValueAtTime(targetGain, ctx.currentTime);
+    }
+    t.gainNode.gain.value = targetGain;
     t.adapter.onEnded = () => this._handleTrackEnded(trackId);
     t.adapter.play(scheduleTime, {
       offsetSec: t.pausedAt,

@@ -282,7 +282,10 @@ export async function validateAndPrepareResume(
     keysToDelete.length > 0 ||
     checkpoint.nextChunkIndex !== validPrefixCount ||
     checkpoint.committedEndSample !== committedEndSample ||
-    checkpoint.committedBytes !== committedBytes;
+    checkpoint.committedBytes !== committedBytes ||
+    (checkpoint.status === "completed" &&
+      (validPrefixCount < checkpoint.totalChunks ||
+        committedEndSample < checkpoint.totalSamples));
 
   let effectiveCheckpoint = checkpoint;
   if (needsCheckpointRepair) {
@@ -559,7 +562,12 @@ export class SeparationJobLeaseManager {
             existingLease: existing.lease,
           };
         }
-        if (existing.status === "completed") {
+        const isActuallyCompleted =
+          existing.status === "completed" &&
+          existing.totalChunks > 0 &&
+          existing.nextChunkIndex >= existing.totalChunks &&
+          existing.committedEndSample >= existing.totalSamples;
+        if (isActuallyCompleted) {
           return {
             acquired: false as const,
             reason: "任務已完成，無須取得執行權。",

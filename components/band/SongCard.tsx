@@ -208,6 +208,7 @@ export const SongCard = memo(function SongCard(props: Props) {
   const completedChunks = song.separationCompletedChunks ?? 0;
   const totalChunks = song.separationTotalChunks ?? 0;
   const hasSavedChunks = completedChunks > 0 && totalChunks > 0;
+  const canResumeSavedChunks = hasSavedChunks && completedChunks < totalChunks;
   const committedMiB = ((song.separationCommittedBytes ?? 0) / (1024 * 1024)).toFixed(1);
   const chunkResumePct = totalChunks > 0
     ? Math.round((completedChunks / totalChunks) * 100)
@@ -985,7 +986,7 @@ export const SongCard = memo(function SongCard(props: Props) {
                 )}
               </div>
               <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
-                {hasSavedChunks && props.onResumeSeparation && (
+                {canResumeSavedChunks && props.onResumeSeparation && (
                   <button
                     type="button"
                     className="btn mixer-button primary"
@@ -997,7 +998,7 @@ export const SongCard = memo(function SongCard(props: Props) {
                     <span>{`繼續分離（第 ${Math.min(completedChunks + 1, Math.max(1, totalChunks))} 段起）`}</span>
                   </button>
                 )}
-                {!hasSavedChunks && (
+                {!canResumeSavedChunks && (
                   <button
                     type="button"
                     className="btn mixer-button primary"
@@ -1039,7 +1040,7 @@ export const SongCard = memo(function SongCard(props: Props) {
                 )}
               </div>
               <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
-                {hasSavedChunks && props.onResumeSeparation && (
+                {canResumeSavedChunks && props.onResumeSeparation && (
                   <button
                     type="button"
                     className="btn mixer-button primary"
@@ -1103,7 +1104,7 @@ export const SongCard = memo(function SongCard(props: Props) {
                 )}
               </div>
               <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
-                {hasSavedChunks && props.onResumeSeparation && (
+                {canResumeSavedChunks && props.onResumeSeparation && (
                   <button
                     type="button"
                     className="btn mixer-button primary"

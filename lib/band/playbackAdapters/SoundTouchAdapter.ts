@@ -31,7 +31,7 @@ let modulePromise: Promise<SoundTouchModule> | null = null;
 
 function loadSoundTouchModule(): Promise<SoundTouchModule> {
   if (!modulePromise) {
-    const moduleUrl = "/vendor/soundtouch.js";
+    const moduleUrl = "/vendor/soundtouch.js?v=2";
     modulePromise = import(/* webpackIgnore: true */ moduleUrl) as Promise<SoundTouchModule>;
   }
   return modulePromise;

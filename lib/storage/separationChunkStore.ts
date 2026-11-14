@@ -132,7 +132,8 @@ export function validateChunkPayloadInPlace(
     if (!Number.isFinite(v)) {
       return { valid: false, reason: `Chunk 包含非有限數值（NaN/Infinity）於索引 ${i}` };
     }
-    if (Math.abs(v) > MAX_VALID_STEM_ABS_SAMPLE) {
+    const abs = v < 0 ? -v : v;
+    if (abs > MAX_VALID_STEM_ABS_SAMPLE) {
       return {
         valid: false,
         reason: `Chunk 振幅異常超限（|${v}| > ${MAX_VALID_STEM_ABS_SAMPLE}）於索引 ${i}`,

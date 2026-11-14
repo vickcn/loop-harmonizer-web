@@ -179,6 +179,17 @@ export type StemSeparationResult = {
   usedWorker: boolean;
 };
 
+function isCheckpointStreamComplete(
+  cp: SeparationCheckpoint | null | undefined,
+  expectedTotalSamples: number,
+): boolean {
+  if (!cp || cp.totalChunks <= 0) return false;
+  return (
+    cp.nextChunkIndex >= cp.totalChunks &&
+    cp.committedEndSample >= Math.max(expectedTotalSamples, cp.totalSamples)
+  );
+}
+
 function isStreamResult(value: unknown): value is ProcessorStreamResult {
   return Boolean(value && typeof value === "object" && (value as ProcessorStreamResult).streamed === true);
 }
@@ -512,7 +523,7 @@ async function runSeparationInWorker(params: {
     : params.right;
 
   terminateActiveWorker();
-  const worker = new Worker("/vendor/demucs-web/worker.js", { type: "module" });
+  const worker = new Worker("/vendor/demucs-web/worker.js?v=2", { type: "module" });
   activeWorker = worker;
 
   return new Promise<{
@@ -1012,7 +1023,7 @@ export async function separateAudio(
     if (!checkpointTaskId) return;
     let effectiveNextStatus = nextStatus;
     const latestCp = await getCheckpoint(checkpointTaskId).catch(() => null);
-    if (streamCompleted || latestCp?.status === "completed") {
+    if (streamCompleted || isCheckpointStreamComplete(latestCp, latestCp?.totalSamples ?? 0)) {
       effectiveNextStatus = "completed";
     }
     if (!activeLease || leaseReleased) return;
@@ -1259,6 +1270,7 @@ export async function separateAudio(
           status: "running",
           requestedMode: options.mode,
           userAuthorized: options.userAuthorized ?? true,
+          allowDowngradeCompleted: true,
         });
       }
 
@@ -1410,6 +1422,17 @@ export async function separateAudio(
             };
           }
 
+          const finalCp =
+            (await getCheckpoint(checkpointTaskId)) ?? workerOutput.latestCheckpoint;
+          const totalChunks =
+            finalCp?.totalChunks ?? computeTotalChunks(totalSamples, DEMUCS_STRIDE_SAMPLES);
+          if (!isCheckpointStreamComplete(finalCp, totalSamples)) {
+            const committedChunks = finalCp?.nextChunkIndex ?? 0;
+            const errMsg = `分軌分段寫入不完整（已完成 ${committedChunks} / ${totalChunks} 段），請重新整理頁面載入最新運算模組後再試。`;
+            await releaseActiveLease("interrupted", errMsg);
+            throw new Error(errMsg);
+          }
+
           streamCompleted = true;
           await releaseActiveLease("completed");
           sharedSeparationLeaseManager.notifyTaskCompleted(
@@ -1417,10 +1440,6 @@ export async function separateAudio(
             getOrCreateTabId(),
             activeLease?.generation,
           );
-          const finalCp =
-            (await getCheckpoint(checkpointTaskId)) ?? workerOutput.latestCheckpoint;
-          const totalChunks =
-            finalCp?.totalChunks ?? computeTotalChunks(totalSamples, DEMUCS_STRIDE_SAMPLES);
           recordSeparationDiagnostic({
             source: "stemSeparator.completed",
             taskId: checkpointTaskId,
@@ -1549,8 +1568,17 @@ export async function separateAudio(
               usedWorker: false,
             };
           }
-          await releaseActiveLease("completed");
           const finalCp = await getCheckpoint(checkpointTaskId);
+          const totalChunks =
+            finalCp?.totalChunks ?? computeTotalChunks(totalSamples, DEMUCS_STRIDE_SAMPLES);
+          if (!isCheckpointStreamComplete(finalCp, totalSamples)) {
+            const committedChunks = finalCp?.nextChunkIndex ?? 0;
+            const errMsg = `分軌分段寫入不完整（已完成 ${committedChunks} / ${totalChunks} 段），請重新整理頁面載入最新運算模組後再試。`;
+            await releaseActiveLease("interrupted", errMsg);
+            throw new Error(errMsg);
+          }
+          streamCompleted = true;
+          await releaseActiveLease("completed");
           return {
             backend,
             chunkedTask: {
@@ -1558,8 +1586,7 @@ export async function separateAudio(
               mode: options.mode,
               sampleRate: finalCp?.sampleRate ?? DEMUCS_SAMPLE_RATE,
               totalSamples: finalCp?.totalSamples ?? totalSamples,
-              totalChunks:
-                finalCp?.totalChunks ?? computeTotalChunks(totalSamples, DEMUCS_STRIDE_SAMPLES),
+              totalChunks,
               committedBytes: finalCp?.committedBytes ?? 0,
               durationSeconds: totalSamples / DEMUCS_SAMPLE_RATE,
             },
@@ -1606,7 +1633,7 @@ export async function separateAudio(
   } catch (error) {
     if (!streamCompleted) {
       const latestCp = checkpointTaskId ? await getCheckpoint(checkpointTaskId).catch(() => null) : null;
-      if (latestCp?.status === "completed") {
+      if (isCheckpointStreamComplete(latestCp, latestCp?.totalSamples ?? 0)) {
         streamCompleted = true;
         await releaseActiveLease("completed");
       } else if (isAbortError(error) || controller.isCancellingOrCancelled()) {

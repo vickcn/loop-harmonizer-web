@@ -1379,3 +1379,120 @@ test("16. Clear temp, delete completed stems, and isolated force recompute maint
   assert.equal(await getCheckpoint(recomputeTaskId), null);
   assert.equal((await getCheckpoint(completed.taskId))?.status, "completed");
 });
+
+test("17. completed checkpoint with missing chunks auto-repairs to interrupted and allows acquireLease", async () => {
+  resetInMemoryIdbForTests();
+  configureInMemoryIdbForTests();
+
+  const totalChunks = 4;
+  const totalSamples = DEMUCS_STRIDE_SAMPLES * (totalChunks - 1) + 4096;
+  const hash = "hash-incomplete-completed";
+  const taskId = createCheckpointTaskId("song-broken-cp", hash);
+
+  await saveCheckpoint(
+    buildInitialCheckpoint({
+      taskId,
+      songId: "song-broken-cp",
+      sourceAudioHash: hash,
+      requestedMode: "four_stem",
+      totalSamples,
+      sampleRate: DEMUCS_SAMPLE_RATE,
+      status: "completed",
+      userAuthorized: true,
+      now: 1000,
+    }),
+  );
+
+  // Checkpoint 為 completed 但 IndexedDB 實際為 0 段（模擬舊版 Worker 誤標 completed）
+  const leaseMgr = new SeparationJobLeaseManager();
+  try {
+    const directAcquire = await leaseMgr.acquireLease(taskId, "tab-recovery", 12_000, 1100);
+    assert.equal(directAcquire.acquired, true);
+
+    await leaseMgr.releaseLease(taskId, directAcquire.lease, "interrupted", 1200);
+    await saveCheckpoint({
+      ...(await getCheckpoint(taskId)),
+      status: "completed",
+      nextChunkIndex: 0,
+      committedEndSample: 0,
+      committedBytes: 0,
+      lease: null,
+    });
+
+    const validation = await validateAndPrepareResume(taskId, {
+      sourceAudioAvailable: true,
+      sourceAudioHash: hash,
+      totalSamples,
+      sampleRate: DEMUCS_SAMPLE_RATE,
+      viewerTabId: "tab-recovery",
+      now: 1300,
+    });
+    assert.equal(validation.action, "resume");
+    assert.equal(validation.validChunkCount, 0);
+    assert.equal(validation.checkpoint?.status, "interrupted");
+
+    const repairedCp = await getCheckpoint(taskId);
+    assert.equal(repairedCp?.status, "interrupted");
+
+    const postRepairAcquire = await leaseMgr.acquireLease(taskId, "tab-recovery", 12_000, 1400);
+    assert.equal(postRepairAcquire.acquired, true);
+  } finally {
+    leaseMgr.close();
+  }
+});
+
+test("18. silent intro/outro chunk payload with valid checksum is preserved during resume validation", async () => {
+  resetInMemoryIdbForTests();
+  configureInMemoryIdbForTests();
+
+  const totalChunks = 2;
+  const totalSamples = DEMUCS_STRIDE_SAMPLES + 4096;
+  const hash = "hash-silent-intro";
+  const taskId = createCheckpointTaskId("song-silent-intro", hash);
+  await saveCheckpoint(
+    buildInitialCheckpoint({
+      taskId,
+      songId: "song-silent-intro",
+      sourceAudioHash: hash,
+      requestedMode: "four_stem",
+      totalSamples,
+      sampleRate: DEMUCS_SAMPLE_RATE,
+      status: "running",
+      userAuthorized: true,
+      now: 1000,
+    }),
+  );
+
+  const mk = (len) => new Float32Array(len);
+  const silentIntroPayload = packChunkStemsToBuffer(
+    {
+      vocals: { left: mk(DEMUCS_STRIDE_SAMPLES), right: mk(DEMUCS_STRIDE_SAMPLES) },
+      drums: { left: mk(DEMUCS_STRIDE_SAMPLES), right: mk(DEMUCS_STRIDE_SAMPLES) },
+      bass: { left: mk(DEMUCS_STRIDE_SAMPLES), right: mk(DEMUCS_STRIDE_SAMPLES) },
+      other: { left: mk(DEMUCS_STRIDE_SAMPLES), right: mk(DEMUCS_STRIDE_SAMPLES) },
+    },
+    DEMUCS_STRIDE_SAMPLES,
+  );
+  await commitChunkAndCheckpointAtomically({
+    taskId,
+    chunkIndex: 0,
+    startSample: 0,
+    endSample: DEMUCS_STRIDE_SAMPLES,
+    payload: silentIntroPayload,
+    overlapCarryBuffer: null,
+    now: 1100,
+  });
+
+  const validation = await validateAndPrepareResume(taskId, {
+    sourceAudioAvailable: true,
+    sourceAudioHash: hash,
+    totalSamples,
+    sampleRate: DEMUCS_SAMPLE_RATE,
+    viewerTabId: "tab-1",
+    now: 1200,
+  });
+  assert.equal(validation.action, "resume");
+  assert.equal(validation.validChunkCount, 1);
+  assert.equal(validation.repairedChunksDeleted, 0);
+  assert.ok(await getChunkRecord(taskId, 0));
+});

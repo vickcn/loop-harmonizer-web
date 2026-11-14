@@ -535,7 +535,8 @@ export function reconcileCrossTabSongUpdate(
   if (options?.verifiedCompletedCheckpoint) {
     needsChunkPlaybackRestore =
       localSong.separationStatus !== "completed" ||
-      (!localSong.separationUsesChunkPlayback && localSong.stemIds.length === 0);
+      localSong.stemIds.length === 0 ||
+      !localSong.separationUsesChunkPlayback;
     return {
       song: {
         ...baseUpdated,

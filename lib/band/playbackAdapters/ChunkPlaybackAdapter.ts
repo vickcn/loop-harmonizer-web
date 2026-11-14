@@ -23,6 +23,7 @@ interface ResidentChunkEntry {
   endSample: number;
   frameCount: number;
   payloadBytes: number;
+  peakAbs: number;
   stems: FourStemPcm;
   lastUsedSeq: number;
 }
@@ -67,6 +68,9 @@ export class ChunkedStemMixBuffer implements SoundTouchBufferLike {
   private lastPositionChunk = 0;
   private loopEnabled: boolean;
   private disposed = false;
+  private residentPeakAbs = 0;
+  private missingChunkCount = 0;
+  private lastLoadError: string | null = null;
 
   constructor(options: ChunkedStemMixBufferOptions) {
     this.taskId = options.taskId;
@@ -90,6 +94,34 @@ export class ChunkedStemMixBuffer implements SoundTouchBufferLike {
 
   getResidentChunkIndices(): number[] {
     return Array.from(this.resident.keys()).sort((a, b) => a - b);
+  }
+
+  getDiagnostics(): {
+    taskId: string;
+    totalChunks: number;
+    residentChunks: number[];
+    residentPeakAbs: number;
+    activeEntryCount: number;
+    missingChunkCount: number;
+    lastLoadError: string | null;
+  } {
+    return {
+      taskId: this.taskId,
+      totalChunks: this.totalChunks,
+      residentChunks: this.getResidentChunkIndices(),
+      residentPeakAbs: this.residentPeakAbs,
+      activeEntryCount: this.entries.filter((e) => !e.muted && e.gain > 0).length,
+      missingChunkCount: this.missingChunkCount,
+      lastLoadError: this.lastLoadError,
+    };
+  }
+
+  private recomputeResidentPeakAbs(): void {
+    let peak = 0;
+    for (const entry of this.resident.values()) {
+      if (entry.peakAbs > peak) peak = entry.peakAbs;
+    }
+    this.residentPeakAbs = peak;
   }
 
   getEstimatedResidentBytes(): number {
@@ -139,22 +171,40 @@ export class ChunkedStemMixBuffer implements SoundTouchBufferLike {
     const loadPromise = (async () => {
       try {
         const rec = await this.loadChunkFn(this.taskId, chunkIndex);
-        if (this.disposed || !rec) return null;
+        if (this.disposed) return null;
+        if (!rec) {
+          this.missingChunkCount += 1;
+          return null;
+        }
         const frameCount = rec.endSample - rec.startSample;
-        if (frameCount <= 0) return null;
+        if (frameCount <= 0) {
+          this.missingChunkCount += 1;
+          return null;
+        }
         const stems = unpackBufferToChunkStems(rec.payload, frameCount);
+        const view = new Float32Array(rec.payload);
+        let peakAbs = 0;
+        for (let i = 0; i < view.length; i++) {
+          const abs = view[i] < 0 ? -view[i] : view[i];
+          if (abs > peakAbs) peakAbs = abs;
+        }
         const residentEntry: ResidentChunkEntry = {
           chunkIndex,
           startSample: rec.startSample,
           endSample: rec.endSample,
           frameCount,
           payloadBytes: rec.payload.byteLength,
+          peakAbs,
           stems,
           lastUsedSeq: ++this.lruCounter,
         };
         this.resident.set(chunkIndex, residentEntry);
         this.evictExcessChunks(this.lastPositionChunk);
+        this.recomputeResidentPeakAbs();
         return residentEntry;
+      } catch (err) {
+        this.lastLoadError = err instanceof Error ? err.message : String(err);
+        return null;
       } finally {
         this.inFlight.delete(chunkIndex);
       }
@@ -197,6 +247,7 @@ export class ChunkedStemMixBuffer implements SoundTouchBufferLike {
       if (victimKey === null) break;
       this.resident.delete(victimKey);
     }
+    this.recomputeResidentPeakAbs();
   }
 
   getChannelData(channel: number): Float32Array {
@@ -301,5 +352,6 @@ export class ChunkedStemMixBuffer implements SoundTouchBufferLike {
     this.disposed = true;
     this.resident.clear();
     this.inFlight.clear();
+    this.residentPeakAbs = 0;
   }
 }

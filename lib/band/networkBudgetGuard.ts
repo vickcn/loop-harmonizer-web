@@ -76,7 +76,7 @@ export const KNOWN_NETWORK_ASSETS: readonly KnownNetworkAssetEntry[] = [
     label: "SoundTouch 變速變調模組（soundtouch.js）",
     matchPathOrUrl: "/vendor/soundtouch.js",
     origin: "vercel-static",
-    sizeBytes: 26324,
+    sizeBytes: 26515,
     sizeSource: "exact-static-file",
   },
   {
@@ -84,7 +84,7 @@ export const KNOWN_NETWORK_ASSETS: readonly KnownNetworkAssetEntry[] = [
     label: "Demucs 分離處理器（processor.js）",
     matchPathOrUrl: "/vendor/demucs-web/processor.js",
     origin: "vercel-static",
-    sizeBytes: 23952,
+    sizeBytes: 26108,
     sizeSource: "exact-static-file",
   },
   {
@@ -116,7 +116,7 @@ export const KNOWN_NETWORK_ASSETS: readonly KnownNetworkAssetEntry[] = [
     label: "Demucs 背景 Worker（worker.js）",
     matchPathOrUrl: "/vendor/demucs-web/worker.js",
     origin: "vercel-static",
-    sizeBytes: 11554,
+    sizeBytes: 11558,
     sizeSource: "exact-static-file",
   },
   {
