@@ -88,7 +88,10 @@ import {
   deleteIncompleteCheckpointsForSong,
   findCompletedCheckpointBySourceAudioHash,
   findLatestCheckpointBySourceAudioHash,
+  getAllCheckpoints,
   getCheckpoint,
+  isCheckpointLeaseActive,
+  isCheckpointSharedOrLeased,
   releaseCheckpointReferenceAndMaybeGc,
   updateCheckpointStatus,
 } from "@/lib/storage/separationCheckpointStore";
@@ -122,6 +125,7 @@ import {
 import { SongCard } from "./SongCard";
 import { IconActionButton } from "./IconActionButton";
 import { ResourceGuardModal, type ResourceGuardConfirmSelection } from "./ResourceGuardModal";
+import { ConfirmDeleteDialog } from "./ConfirmDeleteDialog";
 import {
   EMPTY_MIXER_SELECTION,
   applyResetKey,
@@ -232,6 +236,21 @@ export function BandMixer() {
     networkEvaluation?: NetworkBatchEvaluation | null;
     resolve: (selection: ResourceGuardConfirmSelection | null) => void;
   } | null>(null);
+  const [deleteDialog, setDeleteDialog] = useState<{
+    title: string;
+    subtitle?: string;
+    deleteItems: string[];
+    preserveItems: string[];
+    recoverability: string;
+    safetyNote?: string | null;
+    confirmLabel: string;
+    danger?: boolean;
+    checkboxLabel?: string;
+    checkboxDescription?: string;
+    onExecute: (checkboxChecked: boolean) => Promise<void>;
+  } | null>(null);
+  const [deleteDialogCheckbox, setDeleteDialogCheckbox] = useState(false);
+  const [deleteSubmitting, setDeleteSubmitting] = useState(false);
   const [idleCleanupReport, setIdleCleanupReport] = useState<string>("");
   const [resourceProfile, setResourceProfile] = useState<DeviceResourceProfile | null>(null);
   const [profileWarning, setProfileWarning] = useState<string>("");
@@ -2789,22 +2808,25 @@ export function BandMixer() {
     song: BandSong,
     scope?: "temp" | "completed",
   ) => {
-    if (isFocusLocked()) {
+    if (isFocusLocked() || sharedSeparationCoordinator.hasRunningHeavyTask()) {
       showCardFeedback(song.id, "分離作業進行中，請先暫停或中止後再執行清除。");
       return;
     }
 
+    const latestSong = sessionRef.current.songs.find((item) => item.id === song.id);
+    if (!latestSong) return;
+
     const effectiveScope: "temp" | "completed" =
-      scope ?? (song.separationStatus === "completed" ? "completed" : "temp");
+      scope ?? (latestSong.separationStatus === "completed" ? "completed" : "temp");
 
     if (effectiveScope === "temp") {
       // 安全清理暫存：僅刪除未完成的暫存進度，若本機已有已完成分軌 Checkpoint 則予以保留並優先恢復播放
-      const completedCheck = song.sourceAudioHash
-        ? await verifyAuthoritativeCheckpointForSong(song, true)
+      const completedCheck = latestSong.sourceAudioHash
+        ? await verifyAuthoritativeCheckpointForSong(latestSong, true)
         : null;
       const result = await deleteIncompleteCheckpointsForSong({
-        songId: song.id,
-        sourceAudioHash: song.sourceAudioHash ?? undefined,
+        songId: latestSong.id,
+        sourceAudioHash: latestSong.sourceAudioHash ?? undefined,
         knownInMemorySongs: sessionRef.current.songs,
       }).catch(() => ({
         deletedCheckpoints: 0,
@@ -2813,19 +2835,25 @@ export function BandMixer() {
         blockedByLeaseTaskIds: [] as string[],
       }));
 
+      if (result.blockedByLeaseTaskIds.length > 0) {
+        showCardFeedback(latestSong.id, "其他分頁正在執行或持有此分離任務，已安全保護並保留暫存進度。");
+        void refreshCacheStats();
+        return;
+      }
+
       if (isValidationCompleted(completedCheck) && completedCheck?.checkpoint) {
         const resolvedMode =
-          song.separationMode ?? completedCheck.checkpoint.requestedMode ?? "four_stem";
+          latestSong.separationMode ?? completedCheck.checkpoint.requestedMode ?? "four_stem";
         const resolvedCacheKey =
-          song.cacheKey ||
+          latestSong.cacheKey ||
           createSeparationCacheKey({
-            sourceAudioHash: song.sourceAudioHash!,
+            sourceAudioHash: latestSong.sourceAudioHash!,
             modelVersion: DEMUCS_MODEL_VERSION,
             separationMode: resolvedMode,
             processingVersion: SEPARATION_PROCESSING_VERSION,
           });
         await installChunkedStemSet(
-          song,
+          latestSong,
           {
             taskId: completedCheck.checkpoint.taskId,
             mode: resolvedMode,
@@ -2838,21 +2866,21 @@ export function BandMixer() {
           },
           resolvedCacheKey,
           `已清理未完成暫存，並自動恢復既有的已完成分軌（共 ${completedCheck.checkpoint.totalChunks} 段按需播放）。`,
-          { preferredSource: song.playbackSource },
+          { preferredSource: latestSong.playbackSource },
         );
-        showCardFeedback(song.id, "已清理未完成暫存，既有已完成分軌已保留並恢復。");
+        showCardFeedback(latestSong.id, "已清理未完成暫存，既有已完成分軌已保留並恢復。");
         void refreshCacheStats();
         return;
       }
 
-      if (song.separationStatus === "completed") {
-        showCardFeedback(song.id, "已清理未完成暫存，已完成分軌不受影響。");
+      if (latestSong.separationStatus === "completed") {
+        showCardFeedback(latestSong.id, "已清理未完成暫存，已完成分軌不受影響。");
         void refreshCacheStats();
         return;
       }
 
       patchSongMetadataOnly(
-        song.id,
+        latestSong.id,
         {
           separationStatus: "not_started",
           separationStage: "idle",
@@ -2870,46 +2898,53 @@ export function BandMixer() {
         },
         { source: "BandMixer.clearSongTempProgress" },
       );
-      persistSongDebounced(song.id, 150);
-      showCardFeedback(song.id, "已清理未完成暫存進度。");
+      persistSongDebounced(latestSong.id, 150);
+      showCardFeedback(latestSong.id, "已清理未完成暫存進度。");
       void refreshCacheStats();
       return;
     }
 
-    const confirmed =
-      typeof window === "undefined" ||
-      typeof window.confirm !== "function" ||
-      window.confirm(
-        `確定要刪除「${song.name}」已完成的分軌與分段檔案嗎？\n（會保留原曲檔案與混音設定；若有其他歌曲共用相同分段資料，將保留共用的底層檔案，僅解除此歌曲的分軌連結）`,
-      );
-    if (!confirmed) return;
-
-    sharedSeparationCoordinator.invalidateSongGeneration(song.id);
-    const engine = getEngine();
-    if (song.playbackSource === "stems" && song.status === "playing") {
-      engine.pauseTracks(song.stemIds);
-    }
-    song.stemIds.forEach((id) => engine.removeTrack(id));
-    stemResultsRef.current.delete(song.id);
-
     const taskId =
-      song.separationTaskId ||
-      (song.sourceAudioHash
-        ? createCheckpointTaskId(song.id, song.sourceAudioHash, DEMUCS_MODEL_VERSION, SEPARATION_PROCESSING_VERSION)
+      latestSong.separationTaskId ||
+      (latestSong.sourceAudioHash
+        ? createCheckpointTaskId(latestSong.id, latestSong.sourceAudioHash, DEMUCS_MODEL_VERSION, SEPARATION_PROCESSING_VERSION)
         : null);
+    if (taskId) {
+      const freshCp = await getCheckpoint(taskId).catch(() => null);
+      const currentTabId = getOrCreateTabId();
+      if (
+        freshCp
+        && freshCp.status === "running"
+        && freshCp.lease
+        && freshCp.lease.ownerTabId !== currentTabId
+        && isCheckpointLeaseActive(freshCp)
+      ) {
+        showCardFeedback(latestSong.id, "其他分頁正在執行此歌曲的分離任務，已安全阻擋刪除。");
+        return;
+      }
+    }
+
+    sharedSeparationCoordinator.invalidateSongGeneration(latestSong.id);
+    const engine = getEngine();
+    if (latestSong.playbackSource === "stems" && latestSong.status === "playing") {
+      engine.pauseTracks(latestSong.stemIds);
+    }
+    latestSong.stemIds.forEach((id) => engine.removeTrack(id));
+    stemResultsRef.current.delete(latestSong.id);
+
     const cacheKeyToRelease =
-      song.cacheKey ||
-      (song.sourceAudioHash && song.separationMode
+      latestSong.cacheKey ||
+      (latestSong.sourceAudioHash && latestSong.separationMode
         ? createSeparationCacheKey({
-            sourceAudioHash: song.sourceAudioHash,
+            sourceAudioHash: latestSong.sourceAudioHash,
             modelVersion: DEMUCS_MODEL_VERSION,
-            separationMode: song.separationMode,
+            separationMode: latestSong.separationMode,
             processingVersion: SEPARATION_PROCESSING_VERSION,
           })
         : null);
 
     const clearedSong: BandSong = {
-      ...song,
+      ...latestSong,
       stemIds: [],
       stemChannels: [],
       playbackSource: "original",
@@ -2924,27 +2959,27 @@ export function BandMixer() {
       separationCommittedBytes: 0,
       separationUserAuthorized: false,
       separationUsesChunkPlayback: false,
-      status: song.playbackSource === "stems" && song.status === "playing" ? "paused" : song.status,
+      status: latestSong.playbackSource === "stems" && latestSong.status === "playing" ? "paused" : latestSong.status,
     };
     const nextSongsSnapshot = sessionRef.current.songs.map((item) =>
-      item.id === song.id ? clearedSong : item,
+      item.id === latestSong.id ? clearedSong : item,
     );
     setSession((previous) => ({
       ...previous,
-      songs: previous.songs.map((item) => (item.id === song.id ? clearedSong : item)),
+      songs: previous.songs.map((item) => (item.id === latestSong.id ? clearedSong : item)),
     }));
     applySongToEngine(clearedSong);
     if (clearedSong.sourceAudioHash && clearedSong.persistenceStatus !== "missing_audio") {
       await saveSongStateRecord(clearedSong).catch(() => undefined);
     } else {
-      persistSongDebounced(song.id, 0);
+      persistSongDebounced(latestSong.id, 0);
     }
 
-    const releaseResult = taskId || song.sourceAudioHash || cacheKeyToRelease
+    const releaseResult = taskId || latestSong.sourceAudioHash || cacheKeyToRelease
       ? await releaseCheckpointReferenceAndMaybeGc({
           taskId,
-          sourceAudioHash: song.sourceAudioHash ?? null,
-          songId: song.id,
+          sourceAudioHash: latestSong.sourceAudioHash ?? null,
+          songId: latestSong.id,
           cacheKeyToRelease,
           knownInMemorySongs: nextSongsSnapshot,
           knownRemovedSongIds: removedSongIdsRef.current,
@@ -2953,8 +2988,8 @@ export function BandMixer() {
       : null;
 
     await deleteIncompleteCheckpointsForSong({
-      songId: song.id,
-      sourceAudioHash: song.sourceAudioHash ?? undefined,
+      songId: latestSong.id,
+      sourceAudioHash: latestSong.sourceAudioHash ?? undefined,
       excludeTaskId: releaseResult?.preservedTaskIds[0],
       knownInMemorySongs: nextSongsSnapshot,
     }).catch(() => undefined);
@@ -2966,7 +3001,7 @@ export function BandMixer() {
     );
     if (keptSharedData) {
       patchSongMetadataOnly(
-        song.id,
+        latestSong.id,
         {
           separationStatus: "not_started",
           separationTaskId: null,
@@ -2979,9 +3014,9 @@ export function BandMixer() {
 
     recordSeparationDiagnostic({
       source: "BandMixer.deleteCompletedStems",
-      songId: song.id,
+      songId: latestSong.id,
       taskId,
-      fromState: song.separationStatus,
+      fromState: latestSong.separationStatus,
       toState: "not_started",
       referenceCount: releaseResult?.remainingReferences ?? 0,
       leaseState: releaseResult?.blockedByLeaseTaskIds.length ? "active" : "none",
@@ -2992,7 +3027,7 @@ export function BandMixer() {
     });
 
     showCardFeedback(
-      song.id,
+      latestSong.id,
       keptSharedData
         ? "已解除本歌曲分軌連結（共用底層資料仍為其他歌曲保留）。"
         : "已刪除已完成分軌。",
@@ -3906,34 +3941,75 @@ export function BandMixer() {
   };
 
   const clearSongCache = async (song: BandSong) => {
-    if (isFocusLocked()) {
+    const latestSong = sessionRef.current.songs.find((item) => item.id === song.id) ?? song;
+    if (isFocusLocked() || sharedSeparationCoordinator.hasRunningHeavyTask()) {
       const msg = "分離進行中暫停清理快取，以確保既有分離快取不被誤刪。";
-      showCardFeedback(song.id, msg);
+      showCardFeedback(latestSong.id, msg);
       showShortcutHint(msg);
       return;
     }
-    if (!song.cacheKey) {
-      showCardFeedback(song.id, "目前已無本機分軌快取。");
+    if (!latestSong.cacheKey) {
+      showCardFeedback(latestSong.id, "目前已無本機分軌快取。");
       return;
     }
-    await deleteCachedStemSet(song.cacheKey).catch(() => undefined);
-    updateSong(song.id, { cacheKey: null, separationMessage: "已清除硬碟快取；目前載入的分軌仍可繼續播放。" });
-    showCardFeedback(song.id, "已清除本機分軌快取（目前播放不受影響）");
+    const cacheSharedByOtherSong = sessionRef.current.songs.some(
+      (candidate) => candidate.id !== latestSong.id && candidate.cacheKey === latestSong.cacheKey,
+    );
+    const currentTabId = getOrCreateTabId();
+    const allCheckpoints = await getAllCheckpoints().catch(() => []);
+    const activeForeignCheckpoint = allCheckpoints.find((cp) => {
+      if (!cp.lease || cp.lease.ownerTabId === currentTabId || !isCheckpointLeaseActive(cp)) {
+        return false;
+      }
+      if (latestSong.sourceAudioHash && cp.sourceAudioHash === latestSong.sourceAudioHash) {
+        return true;
+      }
+      const cpCacheKey = createSeparationCacheKey({
+        sourceAudioHash: cp.sourceAudioHash,
+        modelVersion: cp.modelVersion,
+        separationMode: cp.requestedMode,
+        processingVersion: cp.processingVersion,
+      });
+      return cpCacheKey === latestSong.cacheKey;
+    });
+    if (activeForeignCheckpoint) {
+      const msg = "其他分頁正在使用此分軌快取，已安全阻擋清理。";
+      showCardFeedback(latestSong.id, msg);
+      showShortcutHint(msg);
+      return;
+    }
+    if (!cacheSharedByOtherSong) {
+      await deleteCachedStemSet(latestSong.cacheKey).catch(() => undefined);
+    }
+    updateSong(latestSong.id, {
+      cacheKey: null,
+      separationMessage: cacheSharedByOtherSong
+        ? "已解除此曲分軌快取連結（其他歌曲仍共用同一快取，底層資料已保留）。"
+        : "已清除硬碟分軌快取；目前載入的分軌仍可繼續播放。",
+    });
+    showCardFeedback(
+      latestSong.id,
+      cacheSharedByOtherSong ? "已解除快取連結（共用快取已保留）" : "已清除本機分軌快取（目前播放不受影響）",
+    );
     void refreshCacheStats();
   };
 
   const clearAllSeparationCache = async () => {
-    if (isFocusLocked()) {
-      showShortcutHint("分離專注模式啟動中，暫停刪除已完成分軌。");
+    if (isFocusLocked() || sharedSeparationCoordinator.hasRunningHeavyTask()) {
+      showShortcutHint("分離進行中暫停刪除已完成分軌快取。");
       return;
     }
-    const confirmed =
-      typeof window === "undefined" ||
-      typeof window.confirm !== "function" ||
-      window.confirm(
-        "確定要刪除所有本機「已完成分軌」快取嗎？（保留原曲檔案與未完成設定；已載入記憶體中的分軌仍可播放至重新整理前）",
-      );
-    if (!confirmed) return;
+    const currentTabId = getOrCreateTabId();
+    const allCheckpoints = await getAllCheckpoints().catch(() => []);
+    const foreignActiveLease = allCheckpoints.find(
+      (cp) => cp.lease && cp.lease.ownerTabId !== currentTabId && isCheckpointLeaseActive(cp),
+    );
+    if (foreignActiveLease) {
+      const msg = "偵測到其他分頁正持有分離或資源鎖定，已安全阻擋清除所有分軌快取。";
+      setStorageActionMsg(msg);
+      showShortcutHint(msg);
+      return;
+    }
     await clearAllCachedStemSets().catch(() => undefined);
     setSession((previous) => ({
       ...previous,
@@ -3941,7 +4017,7 @@ export function BandMixer() {
         ...song,
         cacheKey: null,
         separationMessage: song.stemIds.length
-          ? "已刪除已完成分軌快取；目前載入的分軌仍可播放。"
+          ? "已刪除已完成分軌快取；目前載入的分軌仍可繼續播放。"
           : song.separationMessage,
       })),
     }));
@@ -3950,8 +4026,8 @@ export function BandMixer() {
   };
 
   const handleClearTempSeparationProgress = async () => {
-    if (isFocusLocked()) {
-      showShortcutHint("分離專注模式啟動中，暫停清理暫存。");
+    if (isFocusLocked() || sharedSeparationCoordinator.hasRunningHeavyTask()) {
+      showShortcutHint("分離進行中暫停清理暫存。");
       return;
     }
     try {
@@ -3959,10 +4035,14 @@ export function BandMixer() {
         clearUnusedSeparationCaches(sessionRef.current.songs),
         deleteAllIncompleteCheckpoints(),
       ]);
+      const blockedSet = new Set(incompleteResult.blockedByLeaseTaskIds);
       setSession((previous) => ({
         ...previous,
         songs: previous.songs.map((song) => {
           if (song.separationStatus === "completed") return song;
+          if (song.separationTaskId && blockedSet.has(song.separationTaskId)) {
+            return song;
+          }
           if (
             song.separationStatus === "interrupted" ||
             song.separationStatus === "paused" ||
@@ -3985,8 +4065,12 @@ export function BandMixer() {
           return song;
         }),
       }));
+      const blockedNote =
+        incompleteResult.blockedByLeaseTaskIds.length > 0
+          ? `；另有 ${incompleteResult.blockedByLeaseTaskIds.length} 筆任務正由其他分頁鎖定而略過`
+          : "";
       setStorageActionMsg(
-        `已清理未完成暫存：刪除 ${incompleteResult.deletedCheckpoints} 筆中斷進度（${incompleteResult.deletedChunks} 個暫存分段）與 ${unusedResult.deletedCount} 筆未使用快取；已保留 ${incompleteResult.preservedCompletedCount} 首已完成分軌。`,
+        `已清理未完成暫存：刪除 ${incompleteResult.deletedCheckpoints} 筆中斷進度（${incompleteResult.deletedChunks} 個暫存分段）與 ${unusedResult.deletedCount} 筆未使用快取；已保留 ${incompleteResult.preservedCompletedCount} 首已完成分軌${blockedNote}。`,
       );
       setDiagnosticLogs(getSeparationDiagnosticLogs());
       void refreshCacheStats();
@@ -4040,6 +4124,10 @@ export function BandMixer() {
   };
 
   const handleClearUnusedSeparationCaches = async () => {
+    if (isFocusLocked() || sharedSeparationCoordinator.hasRunningHeavyTask()) {
+      showShortcutHint("分離進行中暫停清理未使用快取。");
+      return;
+    }
     try {
       const result = await clearUnusedSeparationCaches(sessionRef.current.songs);
       setStorageActionMsg(
@@ -4051,6 +4139,248 @@ export function BandMixer() {
     } catch {
       setStorageActionMsg("清理未使用的分離快取時發生錯誤。");
     }
+  };
+
+  const openDeleteConfirmDialog = (config: NonNullable<typeof deleteDialog>, defaultChecked = false) => {
+    setDeleteDialogCheckbox(defaultChecked);
+    setDeleteDialog(config);
+  };
+
+  const requestClearSongSeparationData = (song: BandSong, scope?: "temp" | "completed") => {
+    const latestSong = sessionRef.current.songs.find((item) => item.id === song.id) ?? song;
+    const effectiveScope: "temp" | "completed" =
+      scope ?? (latestSong.separationStatus === "completed" ? "completed" : "temp");
+    if (
+      latestSong.separationStatus === "processing" ||
+      latestSong.separationStatus === "cancelling" ||
+      isFocusLocked() ||
+      sharedSeparationCoordinator.hasRunningHeavyTask()
+    ) {
+      const msg = "此歌曲或混音器目前正在進行音源分離，請先等待完成或手動中止後再進行清理。";
+      showCardFeedback(latestSong.id, msg);
+      showShortcutHint(msg);
+      return;
+    }
+    if (effectiveScope === "temp") {
+      if (latestSong.separationStatus === "completed") {
+        showCardFeedback(latestSong.id, "已完成分軌受到保護，清理未完成進度不會刪除已完成分軌。");
+        return;
+      }
+      openDeleteConfirmDialog({
+        title: "清理未完成暫存進度",
+        subtitle: latestSong.name,
+        deleteItems: [
+          "此歌曲尚未完成的 Checkpoint 紀錄",
+          "已算出的未完成分軌 Chunk（不會寫入/保留至已完成分軌）",
+        ],
+        preserveItems: [
+          "原始音檔與清單中的歌曲項目",
+          "所有其他歌曲與既有的已完成分軌資料",
+          "跨歌曲或跨分頁仍被鎖定/共用的底層 Chunk（安全檢查後才會釋放）",
+        ],
+        recoverability: "不可恢復；清理後若需分軌需從頭重新計算。執行前會再次檢查跨分頁鎖定。",
+        confirmLabel: "確認清理",
+        danger: false,
+        onExecute: async () => {
+          await clearSongSeparationData(latestSong, "temp");
+        },
+      });
+      return;
+    }
+
+    openDeleteConfirmDialog({
+      title: "刪除已完成分軌",
+      subtitle: latestSong.name,
+      deleteItems: [
+        "此歌曲的已完成分軌 AudioBuffer 與本機暫存 Chunk/Checkpoint",
+        "分軌播放快取連結（若無其他歌曲共用則同步釋放底層 Chunk）",
+      ],
+      preserveItems: [
+        "原始音檔（歌曲維持載入，可立即切回「原曲」播放）",
+        "BPM、Key、播放倍率與歌曲其他設定",
+        "若有其他歌曲共用同一分軌資源或持有分頁鎖定，底層共用資料將自動保留",
+      ],
+      recoverability: "不可恢復；若需再次分離須重新執行分軌。刪除前會再次確認分頁鎖定與共用引用。",
+      confirmLabel: "確認刪除分軌",
+      danger: true,
+      onExecute: async () => {
+        await clearSongSeparationData(latestSong, "completed");
+      },
+    });
+  };
+
+  const requestClearSongCache = (song: BandSong) => {
+    const latestSong = sessionRef.current.songs.find((item) => item.id === song.id) ?? song;
+    if (isFocusLocked() || sharedSeparationCoordinator.hasRunningHeavyTask()) {
+      const msg = "分離進行中暫停清理快取，以確保既有分離快取不被誤刪。";
+      showCardFeedback(latestSong.id, msg);
+      showShortcutHint(msg);
+      return;
+    }
+    if (!latestSong.cacheKey) {
+      showCardFeedback(latestSong.id, "目前已無本機分軌快取。");
+      return;
+    }
+    openDeleteConfirmDialog({
+      title: "清除歌曲分軌快取",
+      subtitle: latestSong.name,
+      deleteItems: [
+        "此歌曲對應的 IndexedDB 分軌快取索引（若無其他歌曲共用將釋放快取紀錄）",
+      ],
+      preserveItems: [
+        "原始音檔、目前載入記憶體中的分軌（仍可繼續播放至頁面關閉前）",
+        "未完成的分離 Checkpoint 與共用同一快取的其他歌曲",
+      ],
+      recoverability: "不可恢復；下次重新載入頁面時將不再自動從此快取還原（執行前會再檢查共用與鎖定）。",
+      confirmLabel: "確認清除快取",
+      danger: true,
+      onExecute: async () => {
+        await clearSongCache(latestSong);
+      },
+    });
+  };
+
+  const requestClearAllSeparationCache = () => {
+    if (isFocusLocked() || sharedSeparationCoordinator.hasRunningHeavyTask()) {
+      showShortcutHint("分離進行中暫停刪除已完成分軌快取。");
+      return;
+    }
+    openDeleteConfirmDialog({
+      title: "清除所有分軌快取",
+      deleteItems: [
+        "IndexedDB 中所有「已完成分軌」快取索引與快取資料",
+      ],
+      preserveItems: [
+        "所有歌曲的原始音檔與清單設定（BPM / Key / 倍率）",
+        "未完成的分離 Checkpoint 與目前記憶體內已載入的音軌",
+      ],
+      recoverability: "不可恢復；下次重新整理頁面後已清除快取的分軌需重新分離（刪除前會再檢查跨分頁鎖定）。",
+      confirmLabel: "確認清除全部",
+      danger: true,
+      onExecute: async () => {
+        await clearAllSeparationCache();
+      },
+    });
+  };
+
+  const requestClearAllTempSeparationProgress = () => {
+    if (isFocusLocked() || sharedSeparationCoordinator.hasRunningHeavyTask()) {
+      showShortcutHint("分離進行中暫停清理暫存。");
+      return;
+    }
+    openDeleteConfirmDialog({
+      title: "清理未完成暫存進度",
+      deleteItems: [
+        "所有未完成（已暫停 / 已中斷 / 失敗 / 已取消）的分離 Checkpoint 與暫存 Chunk",
+        "已未被任何歌曲使用的孤立快取",
+      ],
+      preserveItems: [
+        "所有已完成分軌與其 Checkpoint / Chunk",
+        "所有歌曲的原始音檔與設定",
+        "其他分頁正持有有效 Lease 鎖定的進行中任務",
+      ],
+      recoverability: "不可恢復；中斷任務將無法續接，僅能重新開始分離。",
+      confirmLabel: "確認清理暫存",
+      danger: false,
+      onExecute: async () => {
+        await handleClearTempSeparationProgress();
+      },
+    });
+  };
+
+  const requestClearUnusedSeparationCaches = () => {
+    if (isFocusLocked() || sharedSeparationCoordinator.hasRunningHeavyTask()) {
+      showShortcutHint("分離進行中暫停清理未使用快取。");
+      return;
+    }
+    openDeleteConfirmDialog({
+      title: "清理未使用暫存",
+      deleteItems: [
+        "IndexedDB 中已不再被任何已保存歌曲或進行中任務引用的分離快取與孤立 Chunk",
+      ],
+      preserveItems: [
+        "所有目前清單與已保存工作階段中的原曲與已完成分軌",
+        "正在進行或暫停中可續接的分離 Checkpoint",
+      ],
+      recoverability: "不可恢復；已刪除之孤立快取無法還原，但使用中的歌曲資料完整保留。",
+      confirmLabel: "確認清理未使用項目",
+      danger: false,
+      onExecute: async () => {
+        await handleClearUnusedSeparationCaches();
+      },
+    });
+  };
+
+  const requestRemoveSong = (song: BandSong) => {
+    const latestSong = sessionRef.current.songs.find((item) => item.id === song.id) ?? song;
+    openDeleteConfirmDialog(
+      {
+        title: "移除歌曲",
+        subtitle: latestSong.name,
+        deleteItems: [
+          "從目前混音器工作階段清單移除此歌曲與畫面播放控制項目",
+          "若勾選下方選項：將同步刪除僅由本曲持有的本機原始音檔與分離快取/Checkpoint",
+        ],
+        preserveItems: [
+          "未勾選下方選項時：本機原始音檔、分軌快取與模型檔將完整保留於 IndexedDB",
+          "即使勾選同步刪除，若有其他歌曲共用同一檔案/Chunk 或其他分頁正鎖定，底層共用資料仍會自動保留",
+        ],
+        recoverability: "清單項目將立即移除；若一併刪除未共用的本機音檔與快取，該資料將無法恢復。",
+        checkboxLabel: "同時刪除未共用的本機音檔與分離快取（若無其他歌曲共用）",
+        checkboxDescription: "建議僅在確定釋放瀏覽器磁碟空間時勾選；若有其他歌曲共用相同檔案將自動略過底層刪除。",
+        confirmLabel: "確認移除歌曲",
+        danger: true,
+        onExecute: async (deleteLocalData) => {
+          await removeSong(latestSong, deleteLocalData);
+        },
+      },
+      false,
+    );
+  };
+
+  const requestClearModelCache = () => {
+    if (isFocusLocked() || sharedSeparationCoordinator.hasRunningHeavyTask()) {
+      showShortcutHint("分離進行中暫停清理模型快取。");
+      return;
+    }
+    openDeleteConfirmDialog({
+      title: "清理 Demucs 模型快取",
+      deleteItems: [
+        "本機 CacheStorage / IndexedDB 中已下載的 Demucs ONNX 模型檔案",
+      ],
+      preserveItems: [
+        "所有歌曲的原始音檔、已完成分軌與未完成進度",
+        "混音器 BPM / Key / 倍率等所有設定",
+      ],
+      recoverability: "可透過網路重新下載；下次執行分離時會再次下載模型權重。",
+      confirmLabel: "確認清理模型快取",
+      danger: false,
+      onExecute: async () => {
+        await clearModelCache();
+        await refreshCacheStats();
+        setStorageActionMsg("已清理本機 Demucs 模型快取（既有歌曲與分軌資料已保留）。");
+      },
+    });
+  };
+
+  const requestClearDiagnosticLogs = () => {
+    openDeleteConfirmDialog({
+      title: "清空本機診斷紀錄",
+      deleteItems: [
+        "儲存於瀏覽器 localStorage 中的本機分離診斷循環日誌",
+      ],
+      preserveItems: [
+        "所有歌曲音檔、已完成分軌、暫存進度與模型快取",
+      ],
+      recoverability: "不可恢復；僅影響除錯紀錄檢視，不影響播放與分離功能。",
+      confirmLabel: "確認清空紀錄",
+      danger: false,
+      onExecute: async () => {
+        clearSeparationDiagnosticLogs();
+        setDiagnosticLogs([]);
+        setStorageActionMsg("已清空本機診斷紀錄。");
+      },
+    });
   };
 
   const handleRequestPersistentStorage = async () => {
@@ -4467,10 +4797,10 @@ export function BandMixer() {
               </button>
             )}
             <button type="button" className="btn mixer-button" disabled={focusLocked} onClick={() => void releaseIdleResources()}>🧹 釋放閒置資源</button>
-            <button type="button" className="btn mixer-button" disabled={focusLocked} onClick={() => void handleClearTempSeparationProgress()}>清理暫存進度</button>
-            <button type="button" className="btn mixer-button" disabled={focusLocked} onClick={() => void handleClearUnusedSeparationCaches()}>清除未使用快取</button>
-            <button type="button" className="btn mixer-button" disabled={focusLocked} onClick={() => void clearAllSeparationCache()}>刪除已完成分軌快取</button>
-            <button type="button" className="btn mixer-button" disabled={focusLocked} onClick={() => void clearModelCache().then(refreshCacheStats)}>清理模型快取</button>
+            <button type="button" className="btn mixer-button" disabled={focusLocked} onClick={requestClearAllTempSeparationProgress}>清理暫存進度</button>
+            <button type="button" className="btn mixer-button" disabled={focusLocked} onClick={requestClearUnusedSeparationCaches}>清除未使用快取</button>
+            <button type="button" className="btn mixer-button" disabled={focusLocked} onClick={requestClearAllSeparationCache}>刪除已完成分軌快取</button>
+            <button type="button" className="btn mixer-button" disabled={focusLocked} onClick={requestClearModelCache}>清理模型快取</button>
             <button
               type="button"
               className="btn mixer-button"
@@ -4502,10 +4832,7 @@ export function BandMixer() {
                   type="button"
                   className="btn mixer-button"
                   style={{ padding: "2px 8px", fontSize: 12 }}
-                  onClick={() => {
-                    clearSeparationDiagnosticLogs();
-                    setDiagnosticLogs([]);
-                  }}
+                  onClick={requestClearDiagnosticLogs}
                 >
                   清空紀錄
                 </button>
@@ -4660,14 +4987,14 @@ export function BandMixer() {
                 onSwitchSource={(source) => void switchSource(song, source)}
                 onStemChange={(id, patch) => updateStem(song, id, patch)}
                 onDownloadStem={(id) => void downloadStem(song, id)}
-                onClearSongCache={() => void clearSongCache(song)}
+                onClearSongCache={() => requestClearSongCache(song)}
                 onPauseSeparation={() => void pauseSongSeparation(song)}
                 onResumeSeparation={() => void resumeSongSeparation(song)}
-                onClearSeparationData={(scope) => void clearSongSeparationData(song, scope)}
+                onClearSeparationData={(scope) => requestClearSongSeparationData(song, scope)}
                 onAbortSeparation={() => void abortSongSeparation(song)}
                 onRestoreSnapshot={() => restoreSongSnapshot(song)}
                 onLoadAudio={() => void ensureSongAudioReady(song)}
-                onRemove={(deleteLocalData) => void removeSong(song, deleteLocalData)}
+                onRemove={(_deleteLocalData) => requestRemoveSong(song)}
                 onRelinkAudio={() => {
                   relinkingSongIdRef.current = song.id;
                   relinkInputRef.current?.click();
@@ -4695,6 +5022,48 @@ export function BandMixer() {
             const finish = guardDialog.resolve;
             setGuardDialog(null);
             finish(null);
+          }}
+        />
+      )}
+      {deleteDialog && (
+        <ConfirmDeleteDialog
+          open
+          title={deleteDialog.title}
+          subtitle={deleteDialog.subtitle}
+          deleteItems={deleteDialog.deleteItems}
+          preserveItems={deleteDialog.preserveItems}
+          recoverability={deleteDialog.recoverability}
+          safetyNote={deleteDialog.safetyNote}
+          checkboxOption={
+            deleteDialog.checkboxLabel
+              ? {
+                  label: deleteDialog.checkboxLabel,
+                  description: deleteDialog.checkboxDescription,
+                  checked: deleteDialogCheckbox,
+                  onChange: setDeleteDialogCheckbox,
+                }
+              : undefined
+          }
+          confirmLabel={deleteDialog.confirmLabel}
+          danger={deleteDialog.danger}
+          submitting={deleteSubmitting}
+          onConfirm={() => {
+            if (deleteSubmitting) return;
+            const activeDialog = deleteDialog;
+            const checked = deleteDialogCheckbox;
+            setDeleteSubmitting(true);
+            void activeDialog
+              .onExecute(checked)
+              .finally(() => {
+                setDeleteSubmitting(false);
+                setDeleteDialog(null);
+                setDeleteDialogCheckbox(false);
+              });
+          }}
+          onCancel={() => {
+            if (deleteSubmitting) return;
+            setDeleteDialog(null);
+            setDeleteDialogCheckbox(false);
           }}
         />
       )}
