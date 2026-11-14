@@ -118,12 +118,22 @@ export type LowLoadActionId =
   | "pause-other-songs"
   | "release-idle-buffers"
   | "limit-inference-threads"
+  | "use-two-stem-buffers"
   | "defer-other-songs";
 
 export type LowLoadSuggestion = {
   id: LowLoadActionId;
   label: string;
   description: string;
+};
+
+export type SeparationStageMemoryBreakdown = {
+  stereoPcmBytes: number;
+  decodePeakBytes: number;
+  inferencePeakBytes: number;
+  reassemblyPeakBytes: number;
+  peakWorkingMemoryBytes: number;
+  mode: "two_stem" | "four_stem";
 };
 
 export type ResourceRiskAssessmentInput = {
@@ -153,6 +163,7 @@ export type ResourceRiskAssessment = {
   admission: TaskAdmissionDecision;
   estimatedMemoryBytes: number;
   estimatedStorageBytes: number;
+  stageBreakdown: SeparationStageMemoryBreakdown | null;
   estimatedDurationLabel: string;
   reasons: string[];
   honestModeNote: string | null;
@@ -339,13 +350,13 @@ function buildProfileForTier(
     reasons.push("瀏覽器未處於 crossOriginIsolated 環境，WASM 執行緒上限鎖定為 1。");
   }
 
-  let workingMemoryBudgetBytes = 320 * BYTES_PER_MB;
+  let workingMemoryBudgetBytes = 480 * BYTES_PER_MB;
   if (tier === "balanced") {
     workingMemoryBudgetBytes = 768 * BYTES_PER_MB;
   } else if (tier === "performance") {
     workingMemoryBudgetBytes = 1536 * BYTES_PER_MB;
   } else if (capabilities.deviceMemoryGb !== null && capabilities.deviceMemoryGb <= 2) {
-    workingMemoryBudgetBytes = 240 * BYTES_PER_MB;
+    workingMemoryBudgetBytes = 280 * BYTES_PER_MB;
   }
 
   const maxActiveSoundTouchTracks = tier === "performance" ? 8 : tier === "balanced" ? 4 : 2;
@@ -640,7 +651,7 @@ export function evaluateTaskAdmission(input: TaskAdmissionInput): TaskAdmissionD
   if (projectedMem > profile.workingMemoryBudgetBytes) {
     const isConstrainedHardBlock =
       profile.tier === "constrained"
-      && projectedMem > profile.workingMemoryBudgetBytes * 1.35
+      && projectedMem > profile.workingMemoryBudgetBytes * 1.55
       && (operation === "separate" || operation === "decode" || operation === "soundtouch-playback");
     return {
       allowed: operation === "soundtouch-playback" ? false : !isConstrainedHardBlock,
@@ -666,9 +677,51 @@ export function estimateStereoPcmBytes(durationSec: number, sampleRate = DEFAULT
   return Math.round(safeDuration * sampleRate * 2 * 4);
 }
 
+/**
+ * 依分離工作之三個不重疊生命週期階段估算峰值工作記憶體，避免把不會同時駐留的資料重複加總：
+ * - Stage 1（解碼與重採樣）：1.4x stereo PCM（解碼後即 zero-copy 轉移至 Worker）
+ * - Stage 2（Worker 7.8s 區段推論 + 滾動權重就地正規化）：
+ *   固定區段 ONNX/STFT 與 1.3 MiB rollingWeights 工作集 (~175 MiB)
+ *   + 並存音訊工作緩衝（省去全域 0.5x weights 與冗餘複製：two_stem 為 2.5x stereo PCM；four_stem 為 4.5x）
+ * - Stage 3（Session 釋放後 AudioBuffer 重組）：Worker 已釋放 ONNX Session，僅存輸出 PCM 與 WebAudio AudioBuffer（two_stem 約 3.0x；four_stem 約 5.0x）
+ */
+export function estimateSeparationStagePeaks(
+  durationSec: number,
+  mode: "two_stem" | "four_stem" = "four_stem",
+  stereoPcmBytesOverride?: number,
+): SeparationStageMemoryBreakdown {
+  const stereoPcmBytes =
+    typeof stereoPcmBytesOverride === "number" && Number.isFinite(stereoPcmBytesOverride) && stereoPcmBytesOverride >= 0
+      ? Math.round(stereoPcmBytesOverride)
+      : estimateStereoPcmBytes(durationSec);
+  const decodePeakBytes = Math.round(stereoPcmBytes * 1.4);
+  const fixedSegmentAndSessionBytes = 175 * BYTES_PER_MB;
+  const concurrentAudioMultiplier = mode === "two_stem" ? 2.5 : 4.5;
+  const inferencePeakBytes = Math.round(
+    fixedSegmentAndSessionBytes + stereoPcmBytes * concurrentAudioMultiplier,
+  );
+  const reassemblyPeakBytes = Math.round(
+    stereoPcmBytes * (mode === "two_stem" ? 3.0 : 5.0),
+  );
+  const peakWorkingMemoryBytes = Math.max(
+    decodePeakBytes,
+    inferencePeakBytes,
+    reassemblyPeakBytes,
+  );
+  return {
+    stereoPcmBytes,
+    decodePeakBytes,
+    inferencePeakBytes,
+    reassemblyPeakBytes,
+    peakWorkingMemoryBytes,
+    mode,
+  };
+}
+
 export function estimateOperationFootprint(input: ResourceRiskAssessmentInput): {
   estimatedMemoryBytes: number;
   estimatedStorageBytes: number;
+  stageBreakdown: SeparationStageMemoryBreakdown | null;
 } {
   const fileSize = Math.max(0, input.fileSizeBytes ?? 0);
   const durationSec = Math.max(0, input.durationSec ?? 0);
@@ -685,6 +738,7 @@ export function estimateOperationFootprint(input: ResourceRiskAssessmentInput): 
       return {
         estimatedMemoryBytes: fileSize + stereoPcmBytes,
         estimatedStorageBytes: fileSize,
+        stageBreakdown: null,
       };
     }
     case "decode": {
@@ -692,18 +746,19 @@ export function estimateOperationFootprint(input: ResourceRiskAssessmentInput): 
       return {
         estimatedMemoryBytes: fileSize + stereoPcmBytes * 1.4,
         estimatedStorageBytes: 0,
+        stageBreakdown: null,
       };
     }
     case "separate": {
-      // Demucs 模型與推論工作記憶體（估計 ~260 MiB 基本模型+tensor開銷 + 4 軌 stereo PCM 緩衝）
-      const fourStemPcm = stereoPcmBytes * 4;
-      const runtimeWorkingSet = 260 * BYTES_PER_MB;
+      const mode = input.separationMode === "two_stem" ? "two_stem" : "four_stem";
+      const stageBreakdown = estimateSeparationStagePeaks(durationSec, mode, stereoPcmBytes);
       // 寫入 IndexedDB 時保存 PCM Float32 陣列；2-stem 保存 2 軌，4-stem 保存 4 軌
-      const storedTrackCount = input.separationMode === "two_stem" ? 2 : 4;
+      const storedTrackCount = mode === "two_stem" ? 2 : 4;
       const estimatedStorageBytes = stereoPcmBytes * storedTrackCount;
       return {
-        estimatedMemoryBytes: runtimeWorkingSet + stereoPcmBytes + fourStemPcm,
+        estimatedMemoryBytes: stageBreakdown.peakWorkingMemoryBytes,
         estimatedStorageBytes,
+        stageBreakdown,
       };
     }
     case "encode-wav": {
@@ -712,6 +767,7 @@ export function estimateOperationFootprint(input: ResourceRiskAssessmentInput): 
       return {
         estimatedMemoryBytes: wavSize * 2,
         estimatedStorageBytes: 0,
+        stageBreakdown: null,
       };
     }
     case "soundtouch-playback": {
@@ -719,13 +775,14 @@ export function estimateOperationFootprint(input: ResourceRiskAssessmentInput): 
       return {
         estimatedMemoryBytes: stereoPcmBytes + tracks * 12 * BYTES_PER_MB,
         estimatedStorageBytes: 0,
+        stageBreakdown: null,
       };
     }
   }
 }
 
 export function assessResourceRisk(input: ResourceRiskAssessmentInput): ResourceRiskAssessment {
-  const { estimatedMemoryBytes, estimatedStorageBytes } = estimateOperationFootprint(input);
+  const { estimatedMemoryBytes, estimatedStorageBytes, stageBreakdown } = estimateOperationFootprint(input);
   const cap = input.capabilities;
   const profile = input.profile ?? selectDeviceResourceProfile({
     capabilities: cap,
@@ -856,11 +913,26 @@ export function assessResourceRisk(input: ResourceRiskAssessmentInput): Resource
       label: `依 ${profile.tier} 配置限制執行緒數（目前上限 ${profile.maxWasmThreads}）`,
       description: "在背景 Worker 限制併行執行緒數以減少記憶體尖峰，完整保留原音質不降採樣。",
     });
+    if (input.separationMode === "four_stem" && stageBreakdown) {
+      const twoStemPeak = estimateSeparationStagePeaks(
+        input.durationSec ?? 0,
+        "two_stem",
+        stageBreakdown.stereoPcmBytes,
+      ).peakWorkingMemoryBytes;
+      const savedBytes = Math.max(0, stageBreakdown.peakWorkingMemoryBytes - twoStemPeak);
+      if (savedBytes >= 8 * BYTES_PER_MB && (riskLevel !== "low" || profile.tier !== "performance")) {
+        lowLoadSuggestions.push({
+          id: "use-two-stem-buffers",
+          label: `改用 2 Stem 即時合併模式（預估可省 ${formatEstimatedMiB(savedBytes)}）`,
+          description: "於每個 7.8 秒推論區段直接合併伴奏（僅配置 2 軌全曲輸出緩衝區與快取），維持原始音質不降採樣。",
+        });
+      }
+    }
   }
 
   const honestModeNote =
     input.operation === "separate"
-      ? "註：目前 2 Stem 模式仍以同一套 4 Stem AI 模型推論，再於完成後合併伴奏；切換 2 Stem 僅減少後續混音與快取寫入軌數，不會降低模型推論本身的記憶體與運算量。"
+      ? "註：目前 2 Stem 與 4 Stem 使用同一套 4 Stem AI 模型推論單段音訊，不會降低模型推論本身的運算量；但 2 Stem 會在推論階段即時累加伴奏，僅配置 2 軌全曲輸出 PCM 緩衝區與快取（較 4 Stem 省下約一半全曲輸出緩衝與寫入容量）。"
       : null;
 
   let estimatedDurationLabel = "數秒內";
@@ -882,6 +954,7 @@ export function assessResourceRisk(input: ResourceRiskAssessmentInput): Resource
     admission,
     estimatedMemoryBytes,
     estimatedStorageBytes,
+    stageBreakdown,
     estimatedDurationLabel,
     reasons: reasons.length ? reasons : ["資源估計位於正常範圍內。"],
     honestModeNote,

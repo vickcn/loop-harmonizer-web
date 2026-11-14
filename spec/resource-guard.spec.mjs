@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   assessResourceRisk,
+  estimateSeparationStagePeaks,
   evaluateTaskAdmission,
   formatDeviceCapabilitiesSummary,
   formatEstimatedMiB,
@@ -487,4 +488,87 @@ test("telemetry tracker records main-thread stages, long tasks, and abort latenc
   assert.equal(report.lastAbortLatencyMs, latency);
   assert.ok(report.summary.includes("245 ms"));
   assert.ok(report.summary.includes("最近中止回應延遲"));
+});
+
+test("stage-peak estimation and rolling weights allow up to 6-min songs on constrained mobile while protecting extreme overloads", () => {
+  const androidConstrainedCap = makeCap({
+    deviceMemoryGb: 3,
+    hardwareConcurrency: 4,
+    supportsWebGpu: false,
+    crossOriginIsolated: false,
+    formFactorHint: "mobile",
+  });
+  const laptopBalancedCap = makeCap({
+    deviceMemoryGb: 8,
+    hardwareConcurrency: 6,
+    supportsWebGpu: false,
+    crossOriginIsolated: true,
+    formFactorHint: "desktop",
+  });
+  const desktopPerfCap = makeCap({
+    deviceMemoryGb: 16,
+    hardwareConcurrency: 12,
+    supportsWebGpu: true,
+    crossOriginIsolated: true,
+    formFactorHint: "desktop",
+  });
+
+  // 1) Constrained (480 MiB budget, 744 MiB hard block):
+  // - 30s, 2m, 4m, 6m 2-stem all fit within 480 MiB budget cleanly
+  for (const dur of [30, 120, 240, 360]) {
+    const mobileTwoStem = assessResourceRisk({
+      operation: "separate",
+      durationSec: dur,
+      separationMode: "two_stem",
+      capabilities: androidConstrainedCap,
+    });
+    assert.equal(mobileTwoStem.admission.allowed, true, `constrained ${dur}s 2-stem must be allowed`);
+    assert.equal(mobileTwoStem.admission.hardRejected, false);
+  }
+
+  // - 6m 4-stem on constrained (720 MiB <= 744 MiB hard limit): not hard-blocked; warns and suggests 2-stem savings
+  const constrained6mFourStem = assessResourceRisk({
+    operation: "separate",
+    durationSec: 360,
+    separationMode: "four_stem",
+    capabilities: androidConstrainedCap,
+  });
+  assert.equal(constrained6mFourStem.admission.hardRejected, false);
+  assert.equal(constrained6mFourStem.requiresConfirmation, true);
+  assert.ok(constrained6mFourStem.lowLoadSuggestions.some((s) => s.id === "use-two-stem-buffers"));
+
+  // - Extreme 9m+ 4-stem full concert track still fails safely on 3GB constrained mobile (> 744 MiB)
+  const constrained9mFourStem = assessResourceRisk({
+    operation: "separate",
+    durationSec: 540,
+    separationMode: "four_stem",
+    capabilities: androidConstrainedCap,
+  });
+  assert.equal(constrained9mFourStem.admission.allowed, false);
+  assert.equal(constrained9mFourStem.admission.hardRejected, true);
+
+  // 2) Balanced (768 MiB budget): 4m and 6m (even 4-stem = 720 MiB) fit within budget!
+  const balanced6mFourStem = assessResourceRisk({
+    operation: "separate",
+    durationSec: 360,
+    separationMode: "four_stem",
+    capabilities: laptopBalancedCap,
+  });
+  assert.equal(balanced6mFourStem.admission.allowed, true);
+  assert.equal(balanced6mFourStem.admission.rejectionReason, null);
+
+  // 3) Performance (1536 MiB budget): 6m 4-stem allowed comfortably
+  const desktop6mFourStem = assessResourceRisk({
+    operation: "separate",
+    durationSec: 360,
+    separationMode: "four_stem",
+    capabilities: desktopPerfCap,
+  });
+  assert.equal(desktop6mFourStem.admission.allowed, true);
+
+  // Stage peak calculation sanity check
+  const p2 = estimateSeparationStagePeaks(360, "two_stem");
+  const p4 = estimateSeparationStagePeaks(360, "four_stem");
+  assert.ok(p4.peakWorkingMemoryBytes > p2.peakWorkingMemoryBytes);
+  assert.ok(Math.abs((p4.peakWorkingMemoryBytes - p2.peakWorkingMemoryBytes) - p4.stereoPcmBytes * 2) < 1024);
 });

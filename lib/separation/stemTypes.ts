@@ -14,6 +14,11 @@ export type FourStemPcm = {
   other: StereoPcm;
 };
 
+export type TwoStemPcm = {
+  vocals: StereoPcm;
+  instrumental: StereoPcm;
+};
+
 export type SeparatedStem = StereoPcm & {
   stemType: StemType;
 };
@@ -90,6 +95,20 @@ export function buildSeparatedStemSet(
       { stemType: "drums", ...result.drums },
       { stemType: "bass", ...result.bass },
       { stemType: "other", ...result.other },
+    ],
+  };
+}
+
+export function buildDirectTwoStemSet(
+  result: TwoStemPcm,
+  sampleRate: number,
+): SeparatedStemSet {
+  return {
+    mode: "two_stem",
+    sampleRate,
+    tracks: [
+      { stemType: "vocals", ...result.vocals },
+      { stemType: "instrumental", ...result.instrumental },
     ],
   };
 }

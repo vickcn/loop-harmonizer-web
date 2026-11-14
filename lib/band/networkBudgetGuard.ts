@@ -1,6 +1,28 @@
-export const DEFAULT_NETWORK_BUDGET_BYTES = 10 * 1024 * 1024; // 10 MiB
+export const DEFAULT_NETWORK_BUDGET_BYTES = 10 * 1024 * 1024; // 10 MiB（Vercel 靜態資源統一下載硬上限）
+export const DEFAULT_VERCEL_STATIC_BUDGET_BYTES = DEFAULT_NETWORK_BUDGET_BYTES;
+export const DEFAULT_EXTERNAL_CDN_BUDGET_BYTES = 220 * 1024 * 1024; // 220 MiB（外部可信 CDN：Demucs 172 MiB + ORT WASM 24.6 MiB）
+
+export const ORT_RUNTIME_VERSION = "1.29.0";
+export const EXTERNAL_ORT_WASM_CDN_URL =
+  `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_RUNTIME_VERSION}/dist/ort-wasm-simd-threaded.asyncify.wasm`;
+
+let configuredExternalCdnBudgetBytes = DEFAULT_EXTERNAL_CDN_BUDGET_BYTES;
+
+export function getExternalCdnBudgetBytes(): number {
+  return configuredExternalCdnBudgetBytes;
+}
+
+export function setExternalCdnBudgetBytes(bytes: number): number {
+  if (!Number.isFinite(bytes) || bytes < 1) {
+    configuredExternalCdnBudgetBytes = DEFAULT_EXTERNAL_CDN_BUDGET_BYTES;
+    return configuredExternalCdnBudgetBytes;
+  }
+  configuredExternalCdnBudgetBytes = Math.round(bytes);
+  return configuredExternalCdnBudgetBytes;
+}
 
 export type NetworkAssetOrigin = "vercel-static" | "external-cdn" | "local-cache" | "unknown";
+export type NetworkCacheStatus = "cache-storage-hit" | "http-cache-hit" | "uncached" | "unknown";
 
 export type KnownNetworkAssetEntry = {
   id: string;
@@ -9,6 +31,7 @@ export type KnownNetworkAssetEntry = {
   origin: Exclude<NetworkAssetOrigin, "local-cache" | "unknown">;
   sizeBytes: number;
   sizeSource: "exact-static-file" | "estimated-upstream";
+  version?: string;
 };
 
 export const KNOWN_NETWORK_ASSETS: readonly KnownNetworkAssetEntry[] = [
@@ -19,6 +42,16 @@ export const KNOWN_NETWORK_ASSETS: readonly KnownNetworkAssetEntry[] = [
     origin: "vercel-static",
     sizeBytes: 25749873,
     sizeSource: "exact-static-file",
+    version: ORT_RUNTIME_VERSION,
+  },
+  {
+    id: "ort-wasm-threaded-asyncify-external-cdn",
+    label: "ONNX Runtime WASM 核心檔（外部可信 jsDelivr CDN）",
+    matchPathOrUrl: EXTERNAL_ORT_WASM_CDN_URL,
+    origin: "external-cdn",
+    sizeBytes: 25749873,
+    sizeSource: "estimated-upstream",
+    version: ORT_RUNTIME_VERSION,
   },
   {
     id: "ort-webgpu-bundle",
@@ -27,6 +60,7 @@ export const KNOWN_NETWORK_ASSETS: readonly KnownNetworkAssetEntry[] = [
     origin: "vercel-static",
     sizeBytes: 116102,
     sizeSource: "exact-static-file",
+    version: ORT_RUNTIME_VERSION,
   },
   {
     id: "ort-wasm-glue",
@@ -35,6 +69,7 @@ export const KNOWN_NETWORK_ASSETS: readonly KnownNetworkAssetEntry[] = [
     origin: "vercel-static",
     sizeBytes: 51407,
     sizeSource: "exact-static-file",
+    version: ORT_RUNTIME_VERSION,
   },
   {
     id: "soundtouch-js",
@@ -49,7 +84,7 @@ export const KNOWN_NETWORK_ASSETS: readonly KnownNetworkAssetEntry[] = [
     label: "Demucs 分離處理器（processor.js）",
     matchPathOrUrl: "/vendor/demucs-web/processor.js",
     origin: "vercel-static",
-    sizeBytes: 15104,
+    sizeBytes: 16482,
     sizeSource: "exact-static-file",
   },
   {
@@ -81,7 +116,7 @@ export const KNOWN_NETWORK_ASSETS: readonly KnownNetworkAssetEntry[] = [
     label: "Demucs 背景 Worker（worker.js）",
     matchPathOrUrl: "/vendor/demucs-web/worker.js",
     origin: "vercel-static",
-    sizeBytes: 7144,
+    sizeBytes: 8062,
     sizeSource: "exact-static-file",
   },
   {
@@ -91,35 +126,42 @@ export const KNOWN_NETWORK_ASSETS: readonly KnownNetworkAssetEntry[] = [
     origin: "external-cdn",
     sizeBytes: 172 * 1024 * 1024,
     sizeSource: "estimated-upstream",
+    version: "browser-demucs-v1",
   },
 ];
 
 export type NetworkTransferEvaluationInput = {
   url: string;
   isCached?: boolean;
+  cacheStatus?: NetworkCacheStatus;
   knownSizeBytes?: number | null;
   budgetBytes?: number;
+  externalCdnBudgetBytes?: number;
   sessionTransferredBytes?: number;
+  sessionExternalTransferredBytes?: number;
 };
 
 export type NetworkTransferDecision = {
   allowed: boolean;
   fromCache: boolean;
+  cacheStatus: NetworkCacheStatus;
   failClosed: boolean;
   hardBlocked: boolean;
+  requiresExternalDownloadConfirmation: boolean;
   origin: NetworkAssetOrigin;
   assetLabel: string;
   estimatedTransferBytes: number;
   projectedSessionBytes: number;
   budgetBytes: number;
   sizeSource: "cached" | "exact-static-file" | "estimated-upstream" | "caller-supplied" | "unknown";
-  reason: "cached" | "within-budget" | "exceeds-budget" | "unknown-asset-or-size" | "server-compute-prohibited";
+  reason: "cached" | "within-budget" | "exceeds-budget" | "exceeds-external-cdn-budget" | "unknown-asset-or-size" | "server-compute-prohibited";
   message: string;
 };
 
 export type NetworkAssetBatchItem = {
   url: string;
   isCached?: boolean;
+  cacheStatus?: NetworkCacheStatus;
   knownSizeBytes?: number | null;
 };
 
@@ -127,12 +169,17 @@ export type NetworkBatchEvaluation = {
   allowed: boolean;
   failClosed: boolean;
   hardBlocked: boolean;
+  requiresExternalDownloadConfirmation: boolean;
   totalEstimatedTransferBytes: number;
   vercelStaticBytes: number;
   externalCdnBytes: number;
+  cachedHitCount: number;
+  uncachedCount: number;
   budgetBytes: number;
+  vercelStaticBudgetBytes: number;
+  externalCdnBudgetBytes: number;
   items: NetworkTransferDecision[];
-  blockingReason: "unknown-asset-or-size" | "exceeds-budget" | "server-compute-prohibited" | null;
+  blockingReason: "unknown-asset-or-size" | "exceeds-budget" | "exceeds-external-cdn-budget" | "server-compute-prohibited" | null;
   message: string;
 };
 
@@ -194,21 +241,31 @@ function formatMiB(bytes: number): string {
 export function evaluateNetworkTransfer(
   input: NetworkTransferEvaluationInput,
 ): NetworkTransferDecision {
-  const budgetBytes = Math.max(1, input.budgetBytes ?? DEFAULT_NETWORK_BUDGET_BYTES);
-  const priorBytes = Math.max(0, input.sessionTransferredBytes ?? 0);
+  const vercelBudgetBytes = Math.min(
+    DEFAULT_VERCEL_STATIC_BUDGET_BYTES,
+    Math.max(1, input.budgetBytes ?? DEFAULT_VERCEL_STATIC_BUDGET_BYTES),
+  );
+  const externalBudgetBytes = Math.max(
+    1,
+    input.externalCdnBudgetBytes ?? input.budgetBytes ?? configuredExternalCdnBudgetBytes,
+  );
+  const priorVercelBytes = Math.max(0, input.sessionTransferredBytes ?? 0);
+  const priorExternalBytes = Math.max(0, input.sessionExternalTransferredBytes ?? 0);
   const normalized = normalizeAssetUrlPath(input.url);
 
   if (normalized.startsWith("/api/") || normalized.includes("/api/")) {
     return {
       allowed: false,
       fromCache: false,
+      cacheStatus: "uncached",
       failClosed: true,
       hardBlocked: true,
+      requiresExternalDownloadConfirmation: false,
       origin: "unknown",
       assetLabel: normalized || "後端 API",
       estimatedTransferBytes: 0,
-      projectedSessionBytes: priorBytes,
-      budgetBytes,
+      projectedSessionBytes: priorVercelBytes,
+      budgetBytes: vercelBudgetBytes,
       sizeSource: "unknown",
       reason: "server-compute-prohibited",
       message: "禁止使用 Vercel Functions 或後端 Worker 代替本機音訊與 AI 運算。",
@@ -216,19 +273,28 @@ export function evaluateNetworkTransfer(
   }
 
   if (normalized.startsWith("blob:") || normalized.startsWith("data:") || input.isCached) {
+    const resolvedCacheStatus: NetworkCacheStatus =
+      input.cacheStatus && (input.cacheStatus === "cache-storage-hit" || input.cacheStatus === "http-cache-hit")
+        ? input.cacheStatus
+        : "cache-storage-hit";
     return {
       allowed: true,
       fromCache: true,
+      cacheStatus: resolvedCacheStatus,
       failClosed: false,
       hardBlocked: false,
+      requiresExternalDownloadConfirmation: false,
       origin: "local-cache",
       assetLabel: resolveKnownNetworkAsset(input.url)?.label ?? normalized,
       estimatedTransferBytes: 0,
-      projectedSessionBytes: priorBytes,
-      budgetBytes,
+      projectedSessionBytes: priorVercelBytes,
+      budgetBytes: vercelBudgetBytes,
       sizeSource: "cached",
       reason: "cached",
-      message: "已命中本機快取，無須額外網路下載。",
+      message:
+        resolvedCacheStatus === "http-cache-hit"
+          ? "已確定命中瀏覽器 HTTP Cache，無須新增網路下載。"
+          : "已確定命中本機 CacheStorage，無須額外網路下載。",
     };
   }
 
@@ -238,21 +304,24 @@ export function evaluateNetworkTransfer(
     typeof input.knownSizeBytes === "number" && Number.isFinite(input.knownSizeBytes) && input.knownSizeBytes >= 0
       ? input.knownSizeBytes
       : known?.sizeBytes ?? null;
+  const effectiveCacheStatus: NetworkCacheStatus = input.cacheStatus ?? "uncached";
 
   if (origin === "unknown" || resolvedSize === null) {
     return {
       allowed: false,
       fromCache: false,
+      cacheStatus: effectiveCacheStatus,
       failClosed: true,
       hardBlocked: true,
+      requiresExternalDownloadConfirmation: false,
       origin,
       assetLabel: known?.label ?? (normalized || "未識別資產"),
       estimatedTransferBytes: resolvedSize ?? 0,
-      projectedSessionBytes: priorBytes,
-      budgetBytes,
+      projectedSessionBytes: priorVercelBytes,
+      budgetBytes: vercelBudgetBytes,
       sizeSource: "unknown",
       reason: "unknown-asset-or-size",
-      message: `未登記來源或無法確認大小（${normalized || "空白 URL"}），已直接拒絕下載（fail-closed，不提供強制繼續）。`,
+      message: `未登記來源、快取狀態未知或無法確認大小（${normalized || "空白 URL"}），已採保守策略直接拒絕下載（fail-closed，不提供繞過）。`,
     };
   }
 
@@ -260,104 +329,164 @@ export function evaluateNetworkTransfer(
     typeof input.knownSizeBytes === "number" && Number.isFinite(input.knownSizeBytes)
       ? "caller-supplied"
       : known?.sizeSource ?? "estimated-upstream";
-  const projected = priorBytes + resolvedSize;
-  const exceeds = resolvedSize > budgetBytes || projected > budgetBytes;
   const label = known?.label ?? normalized;
-  const originText = origin === "vercel-static" ? "Vercel 本站靜態資產" : "外部 CDN";
+  const isVercelStatic = origin === "vercel-static";
+  const activeBudgetBytes = isVercelStatic ? vercelBudgetBytes : externalBudgetBytes;
+  const activePriorBytes = isVercelStatic ? priorVercelBytes : priorExternalBytes;
+  const projected = activePriorBytes + resolvedSize;
+  const exceeds = resolvedSize > activeBudgetBytes || projected > activeBudgetBytes;
+  const originText = isVercelStatic ? "Vercel 本站靜態資產" : "外部可信 CDN";
 
   if (exceeds) {
     return {
       allowed: false,
       fromCache: false,
+      cacheStatus: effectiveCacheStatus,
       failClosed: false,
       hardBlocked: true,
+      requiresExternalDownloadConfirmation: !isVercelStatic,
       origin,
       assetLabel: label,
       estimatedTransferBytes: resolvedSize,
       projectedSessionBytes: projected,
-      budgetBytes,
+      budgetBytes: activeBudgetBytes,
       sizeSource,
-      reason: "exceeds-budget",
-      message: `${label}（來源：${originText}）未快取下載量約 ${formatMiB(resolvedSize)}，超過統一 ${formatMiB(budgetBytes)} 網路預算上限，已直接拒絕（不因裝置等級放行）。`,
+      reason: isVercelStatic ? "exceeds-budget" : "exceeds-external-cdn-budget",
+      message: isVercelStatic
+        ? `${label}（來源：${originText}）未快取下載量約 ${formatMiB(resolvedSize)}，超過統一 ${formatMiB(activeBudgetBytes)} 靜態預算上限，已直接拒絕（不因裝置等級或確認放行）。`
+        : `${label}（來源：${originText}）預計下載約 ${formatMiB(resolvedSize)}，超出外部 CDN 獨立預算（${formatMiB(activeBudgetBytes)}），已拒絕下載。`,
     };
   }
 
   return {
     allowed: true,
     fromCache: false,
+    cacheStatus: effectiveCacheStatus,
     failClosed: false,
     hardBlocked: false,
+    requiresExternalDownloadConfirmation: !isVercelStatic && resolvedSize > 0,
     origin,
     assetLabel: label,
     estimatedTransferBytes: resolvedSize,
     projectedSessionBytes: projected,
-    budgetBytes,
+    budgetBytes: activeBudgetBytes,
     sizeSource,
     reason: "within-budget",
-    message: `${label} 預計下載 ${formatMiB(resolvedSize)}（${originText}），位於預算內。`,
+    message: isVercelStatic
+      ? `${label} 預計下載 ${formatMiB(resolvedSize)}（${originText}），位於 ${formatMiB(activeBudgetBytes)} 靜態預算內。`
+      : `${label} 預計自外部可信 CDN 下載 ${formatMiB(resolvedSize)}（不經 Vercel 計費），快取後重複執行為 0 MiB。`,
   };
 }
 
 export function evaluateNetworkAssetBatch(options: {
   assets: readonly NetworkAssetBatchItem[];
   budgetBytes?: number;
+  vercelStaticBudgetBytes?: number;
+  externalCdnBudgetBytes?: number;
   sessionTransferredBytes?: number;
+  sessionExternalTransferredBytes?: number;
 }): NetworkBatchEvaluation {
-  const budgetBytes = Math.max(1, options.budgetBytes ?? DEFAULT_NETWORK_BUDGET_BYTES);
-  let runningBytes = Math.max(0, options.sessionTransferredBytes ?? 0);
+  const vercelStaticBudgetBytes = Math.min(
+    DEFAULT_VERCEL_STATIC_BUDGET_BYTES,
+    Math.max(1, options.vercelStaticBudgetBytes ?? options.budgetBytes ?? DEFAULT_VERCEL_STATIC_BUDGET_BYTES),
+  );
+  const externalCdnBudgetBytes = Math.max(
+    1,
+    options.externalCdnBudgetBytes ?? options.budgetBytes ?? configuredExternalCdnBudgetBytes,
+  );
+  let runningVercelBytes = Math.max(0, options.sessionTransferredBytes ?? 0);
+  let runningExternalBytes = Math.max(0, options.sessionExternalTransferredBytes ?? 0);
   let totalEstimatedTransferBytes = 0;
   let vercelStaticBytes = 0;
   let externalCdnBytes = 0;
+  let cachedHitCount = 0;
+  let uncachedCount = 0;
   let failClosed = false;
   let hardBlocked = false;
   let serverBlocked = false;
+  let vercelExceeded = false;
+  let externalExceeded = false;
+  let requiresExternalDownloadConfirmation = false;
 
   const items: NetworkTransferDecision[] = [];
   for (const asset of options.assets) {
     const decision = evaluateNetworkTransfer({
       url: asset.url,
       isCached: asset.isCached,
+      cacheStatus: asset.cacheStatus,
       knownSizeBytes: asset.knownSizeBytes,
-      budgetBytes,
-      sessionTransferredBytes: runningBytes,
+      budgetBytes: vercelStaticBudgetBytes,
+      externalCdnBudgetBytes,
+      sessionTransferredBytes: runningVercelBytes,
+      sessionExternalTransferredBytes: runningExternalBytes,
     });
     items.push(decision);
-    runningBytes = decision.projectedSessionBytes;
     totalEstimatedTransferBytes += decision.estimatedTransferBytes;
-    if (decision.origin === "vercel-static") vercelStaticBytes += decision.estimatedTransferBytes;
-    if (decision.origin === "external-cdn") externalCdnBytes += decision.estimatedTransferBytes;
+    if (decision.fromCache) {
+      cachedHitCount += 1;
+    } else {
+      uncachedCount += 1;
+    }
+    if (decision.origin === "vercel-static") {
+      vercelStaticBytes += decision.estimatedTransferBytes;
+      runningVercelBytes = decision.projectedSessionBytes;
+    }
+    if (decision.origin === "external-cdn") {
+      externalCdnBytes += decision.estimatedTransferBytes;
+      runningExternalBytes = decision.projectedSessionBytes;
+    }
+    if (decision.requiresExternalDownloadConfirmation) {
+      requiresExternalDownloadConfirmation = true;
+    }
     if (decision.failClosed) failClosed = true;
     if (decision.hardBlocked) hardBlocked = true;
     if (decision.reason === "server-compute-prohibited") serverBlocked = true;
+    if (decision.reason === "exceeds-budget") vercelExceeded = true;
+    if (decision.reason === "exceeds-external-cdn-budget") externalExceeded = true;
   }
 
   const allowed = !failClosed && !hardBlocked;
-  const blockingReason = serverBlocked
+  const blockingReason: NetworkBatchEvaluation["blockingReason"] = serverBlocked
     ? "server-compute-prohibited"
     : failClosed
       ? "unknown-asset-or-size"
-      : hardBlocked
+      : vercelExceeded
         ? "exceeds-budget"
-        : null;
+        : externalExceeded
+          ? "exceeds-external-cdn-budget"
+          : hardBlocked
+            ? "exceeds-budget"
+            : null;
 
-  let message = "本次操作不需新增超過預算之網路下載（可於本機快取執行）。";
+  let message = "所需資源已全數在本機快取命中，新增網路下載 0.0 MiB。";
   if (blockingReason === "server-compute-prohibited") {
     message = "禁止使用後端伺服器／Vercel Functions 執行本機音訊與 AI 運算，已拒絕請求。";
   } else if (blockingReason === "unknown-asset-or-size") {
     const unknownItem = items.find((item) => item.failClosed);
-    message = unknownItem?.message ?? "偵測到未知來源或無法確認大小的網路下載，已直接拒絕（不提供繞過）。";
+    message = unknownItem?.message ?? "偵測到未知來源、未知快取狀態或無法確認大小的網路下載，已直接拒絕（不提供繞過）。";
   } else if (blockingReason === "exceeds-budget") {
-    message = `預計新增下載 ${formatMiB(totalEstimatedTransferBytes)}（Vercel 靜態：${formatMiB(vercelStaticBytes)}；外部 CDN：${formatMiB(externalCdnBytes)}），超過所有裝置統一的 ${formatMiB(budgetBytes)} 下載上限，已直接拒絕（需已在本機完整快取方能執行）。`;
+    message = `Vercel 靜態未快取下載 ${formatMiB(vercelStaticBytes)}，超過所有裝置統一的 ${formatMiB(vercelStaticBudgetBytes)} 下載硬上限，已直接拒絕（不提供繞過）。`;
+  } else if (blockingReason === "exceeds-external-cdn-budget") {
+    message = `外部 CDN 未快取下載 ${formatMiB(externalCdnBytes)}，超出外部下載預算上限 ${formatMiB(externalCdnBudgetBytes)}，已拒絕下載。`;
+  } else if (requiresExternalDownloadConfirmation) {
+    message = `首次載入或快取遺失時需自外部可信 CDN 下載約 ${formatMiB(externalCdnBytes)}（Vercel 靜態僅 ${formatMiB(vercelStaticBytes)} ≤ ${formatMiB(vercelStaticBudgetBytes)}），請確認後下載並存入本機快取。`;
+  } else if (vercelStaticBytes > 0) {
+    message = `預計僅下載輕量執行期腳本 ${formatMiB(vercelStaticBytes)}（位於 Vercel ${formatMiB(vercelStaticBudgetBytes)} 上限內）。`;
   }
 
   return {
     allowed,
     failClosed,
     hardBlocked,
+    requiresExternalDownloadConfirmation,
     totalEstimatedTransferBytes,
     vercelStaticBytes,
     externalCdnBytes,
-    budgetBytes,
+    cachedHitCount,
+    uncachedCount,
+    budgetBytes: vercelStaticBudgetBytes,
+    vercelStaticBudgetBytes,
+    externalCdnBudgetBytes,
     items,
     blockingReason,
     message,

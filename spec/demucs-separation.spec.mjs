@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { DemucsProcessor } from "../public/vendor/demucs-web/processor.js";
+import { CONSTANTS } from "../public/vendor/demucs-web/constants.js";
 
 let buildSeparatedStemSet;
 let deriveTwoStemFromFourStemSet;
@@ -116,4 +118,70 @@ test("derives two-stem set directly from an existing four-stem set without rerun
   assertSamplesClose(twoStem.tracks[1].left, [0.9, 0.6]);
   assertSamplesClose(twoStem.tracks[1].right, [1.5, 1.2]);
   assert.equal(deriveTwoStemFromFourStemSet(twoStem), null);
+});
+
+test("DemucsProcessor two_stem mode accumulates instrumental per segment using only 2 full-song output buffers", async () => {
+  const samples = CONSTANTS.TRAINING_SAMPLES;
+  const mockOrt = {
+    Tensor: class {
+      constructor(type, data, dims) {
+        this.type = type;
+        this.data = data;
+        this.dims = dims;
+      }
+      dispose() {}
+    },
+    InferenceSession: {
+      create: async () => ({
+        inputNames: ["input", "spec"],
+        outputNames: ["time_out"],
+        release: async () => {},
+        run: async () => {
+          const timeData = new Float32Array(1 * 4 * 2 * samples);
+          for (let t = 0; t < 4; t++) {
+            const val = (t + 1) * 0.1; // drums=0.1, bass=0.2, other=0.3, vocals=0.4
+            for (let c = 0; c < 2; c++) {
+              const offset = t * 2 * samples + c * samples;
+              timeData.fill(val, offset, offset + samples);
+            }
+          }
+          return {
+            time_out: {
+              dims: [1, 4, 2, samples],
+              data: timeData,
+              dispose() {},
+            },
+          };
+        },
+      }),
+    },
+  };
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(new Uint8Array([1, 2, 3, 4]), { status: 200 });
+
+  try {
+    const proc = new DemucsProcessor({ ort: mockOrt });
+    await proc.loadModel("blob:mock-model");
+
+    const len = 320000; // > stride (257985) to exercise rollingWeights copyWithin overlap normalization
+    const left = new Float32Array(len).fill(0.25);
+    const right = new Float32Array(len).fill(0.25);
+
+    const fourOut = await proc.separate(left, right, { mode: "four_stem" });
+    const twoOut = await proc.separate(left, right, { mode: "two_stem" });
+
+    assert.equal("drums" in fourOut, true);
+    assert.equal("drums" in twoOut, false);
+    assert.equal(twoOut.mode, "two_stem");
+    for (const checkIdx of [1000, 260000, 315000]) {
+      assert.ok(Math.abs(twoOut.vocals.left[checkIdx] - 0.4) < 1e-5, `vocals at ${checkIdx}`);
+      assert.ok(Math.abs(twoOut.vocals.left[checkIdx] - fourOut.vocals.left[checkIdx]) < 1e-6);
+      const expectedInst = fourOut.drums.left[checkIdx] + fourOut.bass.left[checkIdx] + fourOut.other.left[checkIdx];
+      assert.ok(Math.abs(expectedInst - 0.6) < 1e-5, `inst at ${checkIdx}`);
+      assert.ok(Math.abs(twoOut.instrumental.left[checkIdx] - expectedInst) < 1e-6);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

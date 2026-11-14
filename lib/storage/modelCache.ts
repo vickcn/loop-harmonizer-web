@@ -2,20 +2,39 @@ import { evaluateNetworkTransfer, sharedNetworkBudgetLedger } from "@/lib/band/n
 import { idbClear, idbGet, idbPut } from "./indexedDb";
 import {
   STATIC_RUNTIME_CACHE_NAME,
+  clearStaticRuntimeCache,
+  configureStaticAssetNetworkGuard,
   ensureStaticAssetCached,
+  inspectStaticAssetCacheStatus,
   isStaticAssetCached,
+  prepareApprovedOrtWasmUrl,
+  revokeActiveOrtWasmBlobUrl,
 } from "./staticAssetCache";
+
+configureStaticAssetNetworkGuard({
+  evaluateTransfer: evaluateNetworkTransfer,
+  recordTransfer: (url, bytes, explicitOrigin) => {
+    sharedNetworkBudgetLedger.recordTransfer(url, bytes, explicitOrigin);
+  },
+  getSnapshot: () => sharedNetworkBudgetLedger.getSnapshot(),
+});
 
 export {
   STATIC_RUNTIME_CACHE_NAME,
+  clearStaticRuntimeCache,
+  configureStaticAssetNetworkGuard,
   ensureStaticAssetCached,
+  inspectStaticAssetCacheStatus,
   isStaticAssetCached,
+  prepareApprovedOrtWasmUrl,
+  revokeActiveOrtWasmBlobUrl,
 };
 
 const CACHE_NAME = "loop-harmonizer-models-v1";
 const MODEL_META_KEY = "demucs-default";
 let activeModelUrl: string | null = null;
 let inFlightDownload: Promise<string> | null = null;
+let inFlightKey: string | null = null;
 
 export type ModelCacheMetadata = {
   key: string;
@@ -92,10 +111,12 @@ export async function prepareCachedModelUrl(
   throwIfAborted(signal);
 
   if (typeof caches === "undefined") {
+    const ledger = sharedNetworkBudgetLedger.getSnapshot();
     const decision = evaluateNetworkTransfer({
       url: sourceUrl,
       isCached: false,
-      sessionTransferredBytes: sharedNetworkBudgetLedger.getSnapshot().totalBytes,
+      sessionTransferredBytes: ledger.vercelStaticBytes,
+      sessionExternalTransferredBytes: ledger.externalCdnBytes,
     });
     if (!decision.allowed) {
       throw new Error(decision.message);
@@ -103,19 +124,23 @@ export async function prepareCachedModelUrl(
     return sourceUrl;
   }
 
-  if (inFlightDownload) {
+  const requestKey = `${modelVersion}::${sourceUrl}`;
+  if (inFlightDownload && inFlightKey === requestKey) {
     return inFlightDownload;
   }
 
+  inFlightKey = requestKey;
   inFlightDownload = (async () => {
     let cache: Cache;
     try {
       cache = await caches.open(CACHE_NAME);
     } catch {
+      const ledger = sharedNetworkBudgetLedger.getSnapshot();
       const decision = evaluateNetworkTransfer({
         url: sourceUrl,
         isCached: false,
-        sessionTransferredBytes: sharedNetworkBudgetLedger.getSnapshot().totalBytes,
+        sessionTransferredBytes: ledger.vercelStaticBytes,
+        sessionExternalTransferredBytes: ledger.externalCdnBytes,
       });
       if (!decision.allowed) throw new Error(decision.message);
       return sourceUrl;
@@ -136,10 +161,12 @@ export async function prepareCachedModelUrl(
     );
 
     if (!cacheIsValid) {
+      const ledger = sharedNetworkBudgetLedger.getSnapshot();
       const budgetDecision = evaluateNetworkTransfer({
         url: sourceUrl,
         isCached: false,
-        sessionTransferredBytes: sharedNetworkBudgetLedger.getSnapshot().totalBytes,
+        sessionTransferredBytes: ledger.vercelStaticBytes,
+        sessionExternalTransferredBytes: ledger.externalCdnBytes,
       });
       if (!budgetDecision.allowed) {
         throw new Error(budgetDecision.message);
@@ -149,7 +176,7 @@ export async function prepareCachedModelUrl(
       await cache.delete(sourceUrl).catch(() => false);
       const downloaded = await fetch(sourceUrl, { signal });
       if (!downloaded.ok) {
-        throw new Error(`Demucs 模型下載失敗：HTTP ${downloaded.status}`);
+        throw new Error(`Demucs 模型下載失敗：HTTP ${downloaded.status}（已停止自動重試）`);
       }
 
       const expectedSize = Number(downloaded.headers.get("content-length") ?? 0);
@@ -232,7 +259,10 @@ export async function prepareCachedModelUrl(
     onProgress?.(1, { loadedBytes: blob.size, totalBytes: blob.size });
     return activeModelUrl;
   })().finally(() => {
-    inFlightDownload = null;
+    if (inFlightKey === requestKey) {
+      inFlightDownload = null;
+      inFlightKey = null;
+    }
   });
 
   return inFlightDownload;
@@ -247,11 +277,13 @@ export function revokeActiveModelObjectUrl(): boolean {
   return true;
 }
 
-export async function clearModelCache(): Promise<void> {
+export async function clearModelCache(options?: { includeRuntimeCache?: boolean }): Promise<void> {
   revokeActiveModelObjectUrl();
   if (typeof caches !== "undefined") {
-    await caches.delete(CACHE_NAME);
-    await caches.delete(STATIC_RUNTIME_CACHE_NAME);
+    await caches.delete(CACHE_NAME).catch(() => false);
   }
   await idbClear("modelMeta").catch(() => undefined);
+  if (options?.includeRuntimeCache) {
+    await clearStaticRuntimeCache();
+  }
 }

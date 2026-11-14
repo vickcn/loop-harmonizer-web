@@ -65,9 +65,13 @@ export function ResourceGuardModal({
     return () => window.removeEventListener("keydown", onKey);
   }, [onCancel]);
 
-  const badge = riskBadgeText(assessment?.riskLevel ?? (networkEvaluation && !networkEvaluation.allowed ? "critical" : "high"));
+  const badge = riskBadgeText(
+    assessment?.riskLevel
+      ?? (networkEvaluation && !networkEvaluation.allowed ? "critical" : networkEvaluation?.requiresExternalDownloadConfirmation ? "medium" : "high"),
+  );
   const hasSuggestions = (assessment?.lowLoadSuggestions.length ?? 0) > 0;
   const networkBlocked = Boolean(networkEvaluation && !networkEvaluation.allowed);
+  const needsExternalDownloadConfirm = Boolean(networkEvaluation?.requiresExternalDownloadConfirmation && networkEvaluation.allowed);
   const admissionHardBlocked = Boolean(assessment?.admission.hardRejected);
   const canBypassWithoutReduction = assessment ? assessment.admission.allowed : true;
   const hardBlocked = networkBlocked || admissionHardBlocked || (!canBypassWithoutReduction && !hasSuggestions);
@@ -120,12 +124,19 @@ export function ResourceGuardModal({
               {" ｜ "}Demucs 併發上限：{assessment.profile.demucsConcurrency}
             </div>
             <div className="small" style={{ opacity: 0.9 }}>
-              預估記憶體需求：{formatEstimatedMiB(assessment.estimatedMemoryBytes)}
+              峰值工作記憶體：{formatEstimatedMiB(assessment.estimatedMemoryBytes)}
               {" ｜ "}工作記憶體預算：{formatMiBExact(assessment.profile.workingMemoryBudgetBytes)}
               {assessment.estimatedStorageBytes > 0
                 ? ` ｜ 預估寫入快取：${formatEstimatedMiB(assessment.estimatedStorageBytes)}`
                 : ""}
             </div>
+            {assessment.stageBreakdown && (
+              <div className="small" style={{ opacity: 0.78 }}>
+                分階段峰值（不重複累加）：解碼 {formatMiBExact(assessment.stageBreakdown.decodePeakBytes)}
+                {" → "}推論 {formatMiBExact(assessment.stageBreakdown.inferencePeakBytes)}
+                {" → "}重組 {formatMiBExact(assessment.stageBreakdown.reassemblyPeakBytes)}
+              </div>
+            )}
             <div className="small" style={{ opacity: 0.78 }}>
               預估處理時間：{assessment.estimatedDurationLabel}
             </div>
@@ -153,16 +164,18 @@ export function ResourceGuardModal({
           </div>
         )}
 
-        {networkEvaluation && !networkEvaluation.allowed && (
+        {networkEvaluation && (!networkEvaluation.allowed || networkEvaluation.requiresExternalDownloadConfirmation) && (
           <div className="grid mixer-modal-section is-network" style={{ gap: 6 }}>
-            <strong style={{ fontSize: 13, color: "#fca5a5" }}>
-              網路傳輸預算保護（所有裝置統一上限 {formatMiBExact(networkEvaluation.budgetBytes)}，不提供繞過）
+            <strong style={{ fontSize: 13, color: networkEvaluation.allowed ? "#fde68a" : "#fca5a5" }}>
+              {networkEvaluation.allowed
+                ? "首次載入或外部資源下載確認（與本機快取明確區分）"
+                : `網路傳輸預算保護（Vercel 上限 ${formatMiBExact(networkEvaluation.vercelStaticBudgetBytes)}，無強制繞過）`}
             </strong>
             <span className="small">{networkEvaluation.message}</span>
-            <div className="small" style={{ opacity: 0.85 }}>
-              未快取預計下載：
-              Vercel 本站靜態 {formatMiBExact(networkEvaluation.vercelStaticBytes)} ｜ 外部 CDN{" "}
-              {formatMiBExact(networkEvaluation.externalCdnBytes)}
+            <div className="small" style={{ opacity: 0.9 }}>
+              Vercel 靜態預算：{formatMiBExact(networkEvaluation.vercelStaticBytes)} / {formatMiBExact(networkEvaluation.vercelStaticBudgetBytes)}
+              {" ｜ "}外部 CDN 預算：{formatMiBExact(networkEvaluation.externalCdnBytes)} / {formatMiBExact(networkEvaluation.externalCdnBudgetBytes)}
+              {" ｜ "}本機快取命中：{networkEvaluation.cachedHitCount} 項（0.0 MiB）
             </div>
             <ul className="mixer-modal-list">
               {networkEvaluation.items
@@ -219,7 +232,7 @@ export function ResourceGuardModal({
                     })
                   }
                 >
-                  直接繼續執行
+                  {needsExternalDownloadConfirm ? "確認下載並直接執行" : "直接繼續執行"}
                 </button>
               )}
               {hasSuggestions && (

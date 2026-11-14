@@ -1,16 +1,27 @@
 "use client";
 
-import { buildSeparatedStemSet, type SeparatedStemSet, type StemSeparationMode } from "./stemTypes";
+import {
+  buildDirectTwoStemSet,
+  buildSeparatedStemSet,
+  type FourStemPcm,
+  type SeparatedStemSet,
+  type StemSeparationMode,
+  type TwoStemPcm,
+} from "./stemTypes";
 import {
   ensureStaticAssetCached,
+  inspectStaticAssetCacheStatus,
   isModelCached,
-  isStaticAssetCached,
+  prepareApprovedOrtWasmUrl,
   prepareCachedModelUrl,
   revokeActiveModelObjectUrl,
 } from "@/lib/storage/modelCache";
 import { DEMUCS_MODEL_VERSION } from "@/lib/storage/cacheKeys";
 import {
+  DEFAULT_EXTERNAL_CDN_BUDGET_BYTES,
   DEFAULT_NETWORK_BUDGET_BYTES,
+  EXTERNAL_ORT_WASM_CDN_URL,
+  ORT_RUNTIME_VERSION,
   evaluateNetworkAssetBatch,
   sharedNetworkBudgetLedger,
   type NetworkBatchEvaluation,
@@ -29,12 +40,8 @@ export const DEMUCS_SAMPLE_RATE = 44100;
 
 type SeparationBackend = "webgpu" | "wasm";
 
-type FourStemResult = {
-  vocals: { left: Float32Array; right: Float32Array };
-  drums: { left: Float32Array; right: Float32Array };
-  bass: { left: Float32Array; right: Float32Array };
-  other: { left: Float32Array; right: Float32Array };
-};
+type FourStemResult = FourStemPcm;
+type TwoStemResult = TwoStemPcm;
 
 type DemucsProcessorLike = {
   session?: { release?: () => Promise<void> | void } | null;
@@ -43,8 +50,8 @@ type DemucsProcessorLike = {
   separate: (
     left: Float32Array,
     right: Float32Array,
-    options?: { signal?: AbortSignal },
-  ) => Promise<FourStemResult>;
+    options?: { signal?: AbortSignal; mode?: StemSeparationMode },
+  ) => Promise<FourStemResult | TwoStemResult>;
   onProgress?: (value: { progress: number; currentSegment: number; totalSegments: number }) => void;
   onDownloadProgress?: (loaded: number, total: number) => void;
 };
@@ -53,7 +60,7 @@ type OrtRuntime = {
   env: {
     wasm: {
       numThreads: number;
-      wasmPaths: string;
+      wasmPaths: string | { mjs?: string; wasm?: string };
     };
   };
 };
@@ -114,50 +121,75 @@ function describeError(error: unknown): Error {
   return new Error(`音源分離失敗：${message}`);
 }
 
+const LOCAL_ORT_WASM_PATH = "/vendor/onnxruntime-web/ort-wasm-simd-threaded.asyncify.wasm";
+const LOCAL_LIGHTWEIGHT_SEPARATION_SCRIPTS = [
+  "/vendor/onnxruntime-web/ort.webgpu.bundle.min.mjs",
+  "/vendor/onnxruntime-web/ort-wasm-simd-threaded.asyncify.mjs",
+  "/vendor/demucs-web/worker.js",
+  "/vendor/demucs-web/processor.js",
+  "/vendor/demucs-web/fft.js",
+  "/vendor/demucs-web/constants.js",
+  "/vendor/demucs-web/index.js",
+] as const;
+
 export async function preflightSeparationNetworkBudget(options?: {
   budgetBytes?: number;
+  vercelStaticBudgetBytes?: number;
+  externalCdnBudgetBytes?: number;
 }): Promise<NetworkBatchEvaluation> {
-  const [modelCacheStatus, ortWasmCached, ortBundleCached, ortGlueCached] = await Promise.all([
+  const [modelCacheStatus, localWasmCheck, cdnWasmCheck, ...scriptChecks] = await Promise.all([
     isModelCached(DEFAULT_DEMUCS_MODEL_URL, DEMUCS_MODEL_VERSION),
-    isStaticAssetCached("/vendor/onnxruntime-web/ort-wasm-simd-threaded.asyncify.wasm"),
-    isStaticAssetCached("/vendor/onnxruntime-web/ort.webgpu.bundle.min.mjs"),
-    isStaticAssetCached("/vendor/onnxruntime-web/ort-wasm-simd-threaded.asyncify.mjs"),
+    inspectStaticAssetCacheStatus(LOCAL_ORT_WASM_PATH, { version: ORT_RUNTIME_VERSION }),
+    inspectStaticAssetCacheStatus(EXTERNAL_ORT_WASM_CDN_URL, { version: ORT_RUNTIME_VERSION }),
+    ...LOCAL_LIGHTWEIGHT_SEPARATION_SCRIPTS.map((url) =>
+      inspectStaticAssetCacheStatus(url, { version: ORT_RUNTIME_VERSION }),
+    ),
   ]);
+
+  const ledger = sharedNetworkBudgetLedger.getSnapshot();
+  const wasmCached = localWasmCheck.isCached || cdnWasmCheck.isCached;
+  const wasmUrlForBatch = localWasmCheck.isCached ? LOCAL_ORT_WASM_PATH : EXTERNAL_ORT_WASM_CDN_URL;
+  const wasmCacheStatus = localWasmCheck.isCached
+    ? localWasmCheck.status
+    : cdnWasmCheck.status;
 
   return evaluateNetworkAssetBatch({
     assets: [
+      ...LOCAL_LIGHTWEIGHT_SEPARATION_SCRIPTS.map((url, idx) => ({
+        url,
+        isCached: scriptChecks[idx]?.isCached ?? false,
+        cacheStatus: scriptChecks[idx]?.status ?? "uncached",
+      })),
       {
-        url: "/vendor/onnxruntime-web/ort.webgpu.bundle.min.mjs",
-        isCached: ortBundleCached,
-      },
-      {
-        url: "/vendor/onnxruntime-web/ort-wasm-simd-threaded.asyncify.mjs",
-        isCached: ortGlueCached,
-      },
-      {
-        url: "/vendor/onnxruntime-web/ort-wasm-simd-threaded.asyncify.wasm",
-        isCached: ortWasmCached,
+        url: wasmUrlForBatch,
+        isCached: wasmCached,
+        cacheStatus: wasmCacheStatus,
       },
       {
         url: DEFAULT_DEMUCS_MODEL_URL,
         isCached: modelCacheStatus.cached,
+        cacheStatus: modelCacheStatus.cached ? "cache-storage-hit" : "uncached",
         knownSizeBytes: modelCacheStatus.sizeBytes ?? undefined,
       },
     ],
-    budgetBytes: options?.budgetBytes ?? DEFAULT_NETWORK_BUDGET_BYTES,
-    sessionTransferredBytes: sharedNetworkBudgetLedger.getSnapshot().totalBytes,
+    vercelStaticBudgetBytes: options?.vercelStaticBudgetBytes ?? options?.budgetBytes ?? DEFAULT_NETWORK_BUDGET_BYTES,
+    externalCdnBudgetBytes: options?.externalCdnBudgetBytes ?? DEFAULT_EXTERNAL_CDN_BUDGET_BYTES,
+    sessionTransferredBytes: ledger.vercelStaticBytes,
+    sessionExternalTransferredBytes: ledger.externalCdnBytes,
   });
 }
 
-function syncStaticOrtAssetsToCache(): void {
-  void Promise.all([
-    ensureStaticAssetCached("/vendor/onnxruntime-web/ort.webgpu.bundle.min.mjs", { allowNetworkFetch: true }),
-    ensureStaticAssetCached("/vendor/onnxruntime-web/ort-wasm-simd-threaded.asyncify.mjs", { allowNetworkFetch: true }),
-    ensureStaticAssetCached("/vendor/onnxruntime-web/ort-wasm-simd-threaded.asyncify.wasm", { allowNetworkFetch: true }),
-  ]);
+function syncApprovedStaticScriptsFromHttpCacheOnly(): void {
+  // 僅將瀏覽器 HTTP Cache 已存在的輕量靜態模組同步至 CacheStorage（`only-if-cached` 零網路請求），
+  // 嚴禁未經准入使用 `force-cache` 發出大型請求，且不觸碰 24.6 MiB 本地靜態 WASM。
+  void Promise.all(
+    LOCAL_LIGHTWEIGHT_SEPARATION_SCRIPTS.map((url) =>
+      ensureStaticAssetCached(url, { allowApprovedNetworkFetch: false, version: ORT_RUNTIME_VERSION }).catch(() => false),
+    ),
+  );
 }
 
-async function loadRuntime(maxThreads?: number): Promise<Runtime> {
+async function loadRuntime(maxThreads?: number, wasmBinaryUrl?: string): Promise<Runtime> {
   if (!runtimePromise) {
     runtimePromise = (async () => {
       const ortUrl = "/vendor/onnxruntime-web/ort.webgpu.bundle.min.mjs";
@@ -171,13 +203,24 @@ async function loadRuntime(maxThreads?: number): Promise<Runtime> {
       const hw = typeof navigator !== "undefined" ? (navigator.hardwareConcurrency || 4) : 4;
       const capped = maxThreads && maxThreads > 0 ? Math.min(maxThreads, hw) : Math.min(8, hw);
       ort.env.wasm.numThreads = window.crossOriginIsolated ? Math.max(1, capped) : 1;
-      ort.env.wasm.wasmPaths = "/vendor/onnxruntime-web/";
-      syncStaticOrtAssetsToCache();
+      ort.env.wasm.wasmPaths = wasmBinaryUrl
+        ? {
+            mjs: "/vendor/onnxruntime-web/ort-wasm-simd-threaded.asyncify.mjs",
+            wasm: wasmBinaryUrl,
+          }
+        : "/vendor/onnxruntime-web/";
+      syncApprovedStaticScriptsFromHttpCacheOnly();
       return { ort, demucs };
     })().catch((error) => {
       runtimePromise = null;
       throw error;
     });
+  } else if (wasmBinaryUrl) {
+    const rt = await runtimePromise;
+    rt.ort.env.wasm.wasmPaths = {
+      mjs: "/vendor/onnxruntime-web/ort-wasm-simd-threaded.asyncify.mjs",
+      wasm: wasmBinaryUrl,
+    };
   }
   return runtimePromise;
 }
@@ -206,17 +249,26 @@ async function computeRmsAsync(data: Float32Array, signal?: AbortSignal): Promis
   return Math.sqrt(sumSq / data.length);
 }
 
+function isTwoStemResult(result: FourStemResult | TwoStemResult): result is TwoStemResult {
+  return "instrumental" in result && !("drums" in result);
+}
+
 async function validateSeparatedResultAsync(
-  result: FourStemResult,
+  result: FourStemResult | TwoStemResult,
   inputRms: number,
   controller: SeparationTaskController,
 ): Promise<void> {
-  const stems = [
-    ["vocals", result.vocals],
-    ["drums", result.drums],
-    ["bass", result.bass],
-    ["other", result.other],
-  ] as const;
+  const stems = isTwoStemResult(result)
+    ? ([
+        ["vocals", result.vocals],
+        ["instrumental", result.instrumental],
+      ] as const)
+    : ([
+        ["vocals", result.vocals],
+        ["drums", result.drums],
+        ["bass", result.bass],
+        ["other", result.other],
+      ] as const);
   const CHUNK_SIZE = 262_144;
 
   let combinedEnergy = 0;
@@ -328,14 +380,20 @@ function terminateActiveWorker(): void {
 async function runSeparationInWorker(params: {
   controller: SeparationTaskController;
   modelUrl: string;
+  wasmBinaryUrl: string;
+  mode: StemSeparationMode;
   left: Float32Array;
   right: Float32Array;
   preferWebGpu: boolean;
   maxThreads?: number;
   preserveInputsForFallback: boolean;
   options: StemSeparationOptions;
-}): Promise<{ backend: SeparationBackend; fourStem: FourStemResult }> {
-  const { controller, modelUrl, preferWebGpu, maxThreads, preserveInputsForFallback, options } = params;
+}): Promise<{
+  backend: SeparationBackend;
+  fourStem?: FourStemResult;
+  twoStem?: TwoStemResult;
+}> {
+  const { controller, modelUrl, wasmBinaryUrl, mode, preferWebGpu, maxThreads, preserveInputsForFallback, options } = params;
   // 僅在明確允許 fallback 到其他路徑時才複製緩衝；預設直接轉移緩衝以降低行動裝置記憶體峰值
   const workerLeft = preserveInputsForFallback ? new Float32Array(params.left) : params.left;
   const workerRight = preserveInputsForFallback ? new Float32Array(params.right) : params.right;
@@ -344,7 +402,11 @@ async function runSeparationInWorker(params: {
   const worker = new Worker("/vendor/demucs-web/worker.js", { type: "module" });
   activeWorker = worker;
 
-  return new Promise<{ backend: SeparationBackend; fourStem: FourStemResult }>((resolve, reject) => {
+  return new Promise<{
+    backend: SeparationBackend;
+    fourStem?: FourStemResult;
+    twoStem?: TwoStemResult;
+  }>((resolve, reject) => {
     let settled = false;
 
     const cleanupWorkerListeners = () => {
@@ -379,8 +441,10 @@ async function runSeparationInWorker(params: {
         progress?: number;
         message?: string;
         backend?: SeparationBackend;
+        mode?: StemSeparationMode;
         details?: { currentSegment?: number; totalSegments?: number; downloadLoadedBytes?: number; downloadTotalBytes?: number };
         fourStem?: FourStemResult;
+        twoStem?: TwoStemResult;
         errorMessage?: string;
       } | null;
       if (!data || data.taskId !== controller.taskId) return;
@@ -401,7 +465,7 @@ async function runSeparationInWorker(params: {
         return;
       }
 
-      if (data.type === "completed" && data.fourStem) {
+      if (data.type === "completed" && (data.fourStem || data.twoStem)) {
         if (settled) return;
         settled = true;
         unregister();
@@ -411,10 +475,11 @@ async function runSeparationInWorker(params: {
         } else {
           try { worker.terminate(); } catch { /* ignore */ }
         }
-        syncStaticOrtAssetsToCache();
+        syncApprovedStaticScriptsFromHttpCacheOnly();
         resolve({
           backend: data.backend ?? "wasm",
           fourStem: data.fourStem,
+          twoStem: data.twoStem,
         });
         return;
       }
@@ -472,6 +537,8 @@ async function runSeparationInWorker(params: {
         taskId: controller.taskId,
         modelUrl,
         ortBaseUrl: "/vendor/onnxruntime-web/",
+        wasmBinaryUrl,
+        mode,
         preferWebGpu,
         maxThreads,
         leftBuffer: workerLeft.buffer,
@@ -605,19 +672,25 @@ export async function separateAudio(
     sharedPerfTelemetry.endMainThreadStage("compute-input-rms");
 
     controller.throwIfAborted();
-    controller.updateProgress("downloading", 0.08, "正在準備或下載 Demucs AI 模型…");
-    options.onStatus?.("正在準備或下載 Demucs AI 模型…");
-    const modelUrl = await prepareCachedModelUrl(DEFAULT_DEMUCS_MODEL_URL, DEMUCS_MODEL_VERSION, {
-      signal: controller.signal,
-      onProgress: (progress, details) => {
-        if (!controller.isCurrent() || controller.isCancellingOrCancelled()) return;
-        controller.updateProgress("downloading", 0.08 + progress * 0.14, "正在下載 Demucs AI 模型…", {
-          downloadLoadedBytes: details?.loadedBytes,
-          downloadTotalBytes: details?.totalBytes,
-        });
-        options.onDownloadProgress?.(progress);
-      },
-    });
+    controller.updateProgress("downloading", 0.08, "正在準備或下載 Demucs AI 模型與執行期 WASM…");
+    options.onStatus?.("正在準備或下載 Demucs AI 模型與執行期 WASM…");
+    const [modelUrl, ortWasmPrep] = await Promise.all([
+      prepareCachedModelUrl(DEFAULT_DEMUCS_MODEL_URL, DEMUCS_MODEL_VERSION, {
+        signal: controller.signal,
+        onProgress: (progress, details) => {
+          if (!controller.isCurrent() || controller.isCancellingOrCancelled()) return;
+          controller.updateProgress("downloading", 0.08 + progress * 0.14, "正在下載 Demucs AI 模型…", {
+            downloadLoadedBytes: details?.loadedBytes,
+            downloadTotalBytes: details?.totalBytes,
+          });
+          options.onDownloadProgress?.(progress);
+        },
+      }),
+      prepareApprovedOrtWasmUrl({
+        version: ORT_RUNTIME_VERSION,
+        signal: controller.signal,
+      }),
+    ]);
 
     controller.throwIfAborted();
     const canUseWorker = options.preferWorker !== false && typeof Worker !== "undefined";
@@ -634,6 +707,8 @@ export async function separateAudio(
         const workerOutput = await runSeparationInWorker({
           controller,
           modelUrl,
+          wasmBinaryUrl: ortWasmPrep.wasmUrl,
+          mode: options.mode,
           left: decodedLeft,
           right: decodedRight,
           preferWebGpu: preferredBackend === "webgpu",
@@ -648,13 +723,20 @@ export async function separateAudio(
         }
         controller.throwIfAborted();
         sharedPerfTelemetry.beginMainThreadStage("validate-output");
-        await validateSeparatedResultAsync(workerOutput.fourStem, inputRms, controller);
+        const outputToValidate = workerOutput.twoStem ?? workerOutput.fourStem;
+        if (!outputToValidate) {
+          throw new Error("Worker 未回傳有效的分離音軌資料。");
+        }
+        await validateSeparatedResultAsync(outputToValidate, inputRms, controller);
         sharedPerfTelemetry.endMainThreadStage("validate-output");
         controller.throwIfAborted();
         const durationMs = (typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt;
+        const stems = isTwoStemResult(outputToValidate)
+          ? buildDirectTwoStemSet(outputToValidate, DEMUCS_SAMPLE_RATE)
+          : buildSeparatedStemSet(outputToValidate, DEMUCS_SAMPLE_RATE, options.mode);
         return {
           backend: workerOutput.backend,
-          stems: buildSeparatedStemSet(workerOutput.fourStem, DEMUCS_SAMPLE_RATE, options.mode),
+          stems,
           durationMs,
           usedWorker: true,
         };
@@ -673,7 +755,7 @@ export async function separateAudio(
       }
     }
 
-    const runtime = await loadRuntime(options.maxThreads);
+    const runtime = await loadRuntime(options.maxThreads, ortWasmPrep.wasmUrl);
     const backends: SeparationBackend[] = preferredBackend === "webgpu" ? ["webgpu", "wasm"] : ["wasm"];
     let lastError: unknown = null;
 
@@ -691,14 +773,20 @@ export async function separateAudio(
         controller.throwIfAborted();
         controller.updateProgress("processing", 0.25, `正在以 ${backend === "webgpu" ? "WebGPU" : "WASM"} 分離音源…`);
         options.onStatus?.(`正在以 ${backend === "webgpu" ? "WebGPU" : "WASM"} 分離音源…`);
-        const result = await processor.separate(decodedLeft!, decodedRight!, { signal: controller.signal });
+        const result = await processor.separate(decodedLeft!, decodedRight!, {
+          signal: controller.signal,
+          mode: options.mode,
+        });
         controller.throwIfAborted();
         await validateSeparatedResultAsync(result, inputRms, controller);
         controller.throwIfAborted();
         const durationMs = (typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt;
+        const stems = isTwoStemResult(result)
+          ? buildDirectTwoStemSet(result, runtime.demucs.CONSTANTS.SAMPLE_RATE)
+          : buildSeparatedStemSet(result, runtime.demucs.CONSTANTS.SAMPLE_RATE, options.mode);
         return {
           backend,
-          stems: buildSeparatedStemSet(result, runtime.demucs.CONSTANTS.SAMPLE_RATE, options.mode),
+          stems,
           durationMs,
           usedWorker: false,
         };
@@ -710,7 +798,7 @@ export async function separateAudio(
         lastError = error;
         await clearCachedProcessor();
         if (backend === "webgpu") {
-          options.onStatus?.("WebGPU 初始化或推論失敗，正在改用 WASM 重試…");
+          options.onStatus?.("WebGPU 初始化或推論失敗，改以單次本機 WASM 執行（不重新下載）…");
         }
       }
     }

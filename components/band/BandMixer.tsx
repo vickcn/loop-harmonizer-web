@@ -35,6 +35,7 @@ import {
   assessResourceRisk,
   collectDeviceCapabilities,
   estimateOperationFootprint,
+  estimateStereoPcmBytes,
   evaluateTaskAdmission,
   formatEstimatedMiB,
   sharedPerfTelemetry,
@@ -1825,19 +1826,20 @@ export function BandMixer() {
     }
 
     const sourceAudioHash = latestReadySong.sourceAudioHash || await hashSourceAudio(file);
-    const cacheKey = createSeparationCacheKey({
+    let effectiveMode: StemSeparationMode = mode;
+    let activeCacheKey = createSeparationCacheKey({
       sourceAudioHash,
       modelVersion: DEMUCS_MODEL_VERSION,
-      separationMode: mode,
+      separationMode: effectiveMode,
       processingVersion: SEPARATION_PROCESSING_VERSION,
     });
     const inMemoryStems = stemResultsRef.current.get(song.id) ?? null;
-    let preCached = inMemoryStems?.mode === mode
+    let preCached = inMemoryStems?.mode === effectiveMode
       ? inMemoryStems
-      : await getCachedStemSet(cacheKey).catch(() => null);
+      : await getCachedStemSet(activeCacheKey).catch(() => null);
     let preCachedMessage = "已從本機快取載入分離結果。";
 
-    if (!preCached && mode === "two_stem") {
+    if (!preCached && effectiveMode === "two_stem") {
       const fourStemCacheKey = createSeparationCacheKey({
         sourceAudioHash,
         modelVersion: DEMUCS_MODEL_VERSION,
@@ -1854,7 +1856,7 @@ export function BandMixer() {
         preCached = derivedTwoStem;
         preCachedMessage = "已直接從既有 4 Stem 本機結果合成 2 Stem（零 AI 重算與網路下載）。";
         await putCachedStemSet(createStemCacheRecord({
-          key: cacheKey,
+          key: activeCacheKey,
           sourceAudioHash,
           modelVersion: DEMUCS_MODEL_VERSION,
           processingVersion: SEPARATION_PROCESSING_VERSION,
@@ -1870,15 +1872,20 @@ export function BandMixer() {
     setResourceProfile(profileEval.profile);
     let maxThreads = profileEval.profile.maxWasmThreads;
     let userSelectedPausePlayback = false;
-    const footprint = preCached
-      ? { estimatedMemoryBytes: 0, estimatedStorageBytes: 0 }
+    // 目標曲目自身 PCM 將於階段二透過 zero-copy 轉移進 Worker（已計算在 inferencePeakBytes 内），僅將其他背景音訊計為外部並存負擔
+    const targetSongDecodedBytes = engine.hasTrack(latestReadySong.sourceAudioId)
+      ? estimateStereoPcmBytes(latestReadySong.durationSec)
+      : 0;
+    const backgroundInMemoryBytes = Math.max(0, engine.getTrackMemoryEstimateBytes() - targetSongDecodedBytes);
+    let footprint = preCached
+      ? { estimatedMemoryBytes: 0, estimatedStorageBytes: 0, stageBreakdown: null }
       : estimateOperationFootprint({
           operation: "separate",
           songName: latestReadySong.name,
           fileSizeBytes: file.size,
           durationSec: latestReadySong.durationSec,
           mimeType: file.type,
-          separationMode: mode,
+          separationMode: effectiveMode,
           capabilities: cap,
         });
 
@@ -1890,22 +1897,22 @@ export function BandMixer() {
         fileSizeBytes: file.size,
         durationSec: latestReadySong.durationSec,
         mimeType: file.type,
-        separationMode: mode,
+        separationMode: effectiveMode,
         activeSongCount: sessionRef.current.songs.length,
         playingSongCount: sessionRef.current.songs.filter((s) => s.status === "playing").length,
         activeSoundTouchTracks: engine.getActiveSoundTouchCount(),
         runningDemucsCount: sharedSeparationCoordinator.hasRunningHeavyTask() ? 1 : 0,
-        estimatedInMemoryAudioBytes: engine.getTrackMemoryEstimateBytes(),
+        estimatedInMemoryAudioBytes: backgroundInMemoryBytes,
         hasOtherIdleDecodedSongs: sessionRef.current.songs.some((s) => s.id !== song.id && s.status !== "playing" && engine.hasTrack(s.sourceAudioId)),
         profile: profileEval.profile,
         capabilities: cap,
         performanceSignals: perfSignals,
       });
 
-      if (assessment.requiresConfirmation || !networkEval.allowed) {
+      if (assessment.requiresConfirmation || !networkEval.allowed || networkEval.requiresExternalDownloadConfirmation) {
         const decision = await requestGuardConfirmation({
           title: `音源分離風險與傳輸確認：「${latestReadySong.name}」`,
-          subtitle: `目前選擇：${mode === "four_stem" ? "4 Stem（人聲／鼓／貝斯／其他）" : "2 Stem（人聲／伴奏）"}`,
+          subtitle: `目前選擇：${effectiveMode === "four_stem" ? "4 Stem（人聲／鼓／貝斯／其他）" : "2 Stem（人聲／伴奏）"}`,
           assessment,
           networkEvaluation: networkEval,
         });
@@ -1920,18 +1927,40 @@ export function BandMixer() {
         if (decision.applyLowLoadActions.includes("limit-inference-threads")) {
           maxThreads = Math.max(1, Math.min(maxThreads, 2));
         }
+        if (decision.applyLowLoadActions.includes("use-two-stem-buffers") && effectiveMode !== "two_stem") {
+          effectiveMode = "two_stem";
+          activeCacheKey = createSeparationCacheKey({
+            sourceAudioHash,
+            modelVersion: DEMUCS_MODEL_VERSION,
+            separationMode: "two_stem",
+            processingVersion: SEPARATION_PROCESSING_VERSION,
+          });
+          footprint = estimateOperationFootprint({
+            operation: "separate",
+            songName: latestReadySong.name,
+            fileSizeBytes: file.size,
+            durationSec: latestReadySong.durationSec,
+            mimeType: file.type,
+            separationMode: effectiveMode,
+            capabilities: cap,
+          });
+        }
       } else if (assessment.riskLevel === "medium") {
         showCardFeedback(song.id, `提示：本裝置估計達中等負載（${assessment.estimatedDurationLabel}）。`);
       }
     }
 
+    const postReleaseOtherBytes = Math.max(
+      0,
+      engine.getTrackMemoryEstimateBytes() - (engine.hasTrack(latestReadySong.sourceAudioId) ? estimateStereoPcmBytes(latestReadySong.durationSec) : 0),
+    );
     const focusDecision = preCached
       ? { enabled: false, reasons: [] as string[] }
       : shouldEnterSeparationFocusMode({
           profile: profileEval.profile,
           performanceSignals: sharedPerfTelemetry.getSignals(),
           estimatedSeparationMemoryBytes: footprint.estimatedMemoryBytes,
-          inMemoryAudioBytes: engine.getTrackMemoryEstimateBytes(),
+          inMemoryAudioBytes: postReleaseOtherBytes,
           activeSoundTouchTracks: engine.getActiveSoundTouchCount(),
           userSelectedPausePlayback,
         });
@@ -2012,7 +2041,7 @@ export function BandMixer() {
     patchSongMetadataOnly(song.id, {
       activeSnapshot: stableSnapshot,
       separationStatus: "processing",
-      separationMode: mode,
+      separationMode: effectiveMode,
       separationStage: "preparing",
       separationProgress: 0.02,
       separationMessage: "正在準備分離任務…",
@@ -2098,7 +2127,7 @@ export function BandMixer() {
       let message = preCachedMessage;
       if (!stems) {
         const result = await separateAudio(file, {
-          mode,
+          mode: effectiveMode,
           controller,
           maxThreads,
         });
@@ -2110,7 +2139,7 @@ export function BandMixer() {
         try {
           controller.throwIfAborted();
           await putCachedStemSet(createStemCacheRecord({
-            key: cacheKey,
+            key: activeCacheKey,
             sourceAudioHash,
             modelVersion: DEMUCS_MODEL_VERSION,
             processingVersion: SEPARATION_PROCESSING_VERSION,
@@ -2142,7 +2171,7 @@ export function BandMixer() {
       }
 
       controller.markCompleted(message);
-      const installedSong = installStemSet(latestSong, stems, cacheKey, message);
+      const installedSong = installStemSet(latestSong, stems, activeCacheKey, message);
       showCardFeedback(song.id, message);
       void refreshCacheStats();
       await finishSeparationFocus({

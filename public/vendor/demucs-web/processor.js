@@ -279,17 +279,25 @@ export class DemucsProcessor {
     }
 
     const signal = options?.signal;
+    const mode = options?.mode === 'two_stem' ? 'two_stem' : 'four_stem';
     throwIfAborted(signal);
 
     const totalSamples = leftChannel.length;
     const stride = Math.floor(TRAINING_SAMPLES * (1 - SEGMENT_OVERLAP));
     const numSegments = Math.max(1, Math.ceil((totalSamples - TRAINING_SAMPLES) / stride) + 1);
 
-    let outputs = TRACKS.map(() => ({
-      left: new Float32Array(totalSamples),
-      right: new Float32Array(totalSamples)
-    }));
-    let weights = new Float32Array(totalSamples);
+    // 2-Stem 模式在區段重疊累加時即直接合併伴奏（drums+bass+other），僅配置 2 組全曲緩衝區以節省 50% 輸出 PCM 記憶體
+    let outputs = mode === 'two_stem'
+      ? [
+          { left: new Float32Array(totalSamples), right: new Float32Array(totalSamples) }, // [0] instrumental
+          { left: new Float32Array(totalSamples), right: new Float32Array(totalSamples) }  // [1] vocals
+        ]
+      : TRACKS.map(() => ({
+          left: new Float32Array(totalSamples),
+          right: new Float32Array(totalSamples)
+        }));
+    // 使用固定單區段長度的滾動權重陣列進行分段就地正規化，省去整首歌曲長度的 weights 陣列記憶體
+    let rollingWeights = new Float32Array(TRAINING_SAMPLES);
 
     let segmentIdx = 0;
 
@@ -299,6 +307,8 @@ export class DemucsProcessor {
 
         const end = Math.min(start + TRAINING_SAMPLES, totalSamples);
         const segmentLength = end - start;
+        const isLastSegment = start + stride >= totalSamples;
+        const finalizeCount = isLastSegment ? segmentLength : Math.min(stride, segmentLength);
 
         const segLeft = new Float32Array(TRAINING_SAMPLES);
         const segRight = new Float32Array(TRAINING_SAMPLES);
@@ -384,6 +394,7 @@ export class DemucsProcessor {
           }
 
           for (let t = 0; t < numTracks; t++) {
+            const targetOut = mode === 'two_stem' ? outputs[t === 3 ? 1 : 0] : outputs[t];
             for (let i = 0; i < segmentLength && start + i < totalSamples; i++) {
               let leftVal, rightVal;
               if (combinedOutputs) {
@@ -395,13 +406,27 @@ export class DemucsProcessor {
                 leftVal = timeData[leftIdx];
                 rightVal = timeData[rightIdx];
               }
-              outputs[t].left[start + i] += leftVal * overlapWindow[i];
-              outputs[t].right[start + i] += rightVal * overlapWindow[i];
+              targetOut.left[start + i] += leftVal * overlapWindow[i];
+              targetOut.right[start + i] += rightVal * overlapWindow[i];
             }
           }
 
           for (let i = 0; i < segmentLength && start + i < totalSamples; i++) {
-            weights[start + i] += overlapWindow[i];
+            rollingWeights[i] += overlapWindow[i];
+          }
+          // 僅對不會再被下一區段重疊覆蓋的樣本就地除以滾動權重，無須配置全域 weights 陣列
+          for (let t = 0; t < outputs.length; t++) {
+            for (let i = 0; i < finalizeCount; i++) {
+              const w = rollingWeights[i];
+              if (w > 0) {
+                outputs[t].left[start + i] /= w;
+                outputs[t].right[start + i] /= w;
+              }
+            }
+          }
+          if (!isLastSegment) {
+            rollingWeights.copyWithin(0, stride);
+            rollingWeights.fill(0, TRAINING_SAMPLES - stride);
           }
           combinedOutputs = null;
         } finally {
@@ -426,16 +451,14 @@ export class DemucsProcessor {
       }
 
       throwIfAborted(signal);
+      rollingWeights = null;
 
-      for (let t = 0; t < TRACKS.length; t++) {
-        for (let i = 0; i < totalSamples; i++) {
-          if (weights[i] > 0) {
-            outputs[t].left[i] /= weights[i];
-            outputs[t].right[i] /= weights[i];
-          }
-        }
-        await yieldToEventLoop();
-        throwIfAborted(signal);
+      if (mode === 'two_stem') {
+        return {
+          mode: 'two_stem',
+          instrumental: outputs[0],
+          vocals: outputs[1]
+        };
       }
 
       return {
@@ -446,7 +469,7 @@ export class DemucsProcessor {
       };
     } catch (error) {
       outputs = null;
-      weights = null;
+      rollingWeights = null;
       throw error;
     }
   }

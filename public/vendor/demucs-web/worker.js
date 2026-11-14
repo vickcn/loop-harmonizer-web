@@ -12,12 +12,17 @@ function isAbort(error) {
   return false;
 }
 
-async function loadOrt(ortBaseUrl, maxThreads) {
+async function loadOrt(ortBaseUrl, maxThreads, wasmBinaryUrl) {
   if (!ortModulePromise) {
     ortModulePromise = import(`${ortBaseUrl}ort.webgpu.bundle.min.mjs`).then((mod) => mod.default ?? mod);
   }
   const ort = await ortModulePromise;
-  ort.env.wasm.wasmPaths = ortBaseUrl;
+  ort.env.wasm.wasmPaths = wasmBinaryUrl
+    ? {
+        mjs: `${ortBaseUrl}ort-wasm-simd-threaded.asyncify.mjs`,
+        wasm: wasmBinaryUrl,
+      }
+    : ortBaseUrl;
   const hw = typeof navigator !== "undefined" ? (navigator.hardwareConcurrency || 2) : 2;
   const threadCap = typeof maxThreads === "number" && maxThreads > 0 ? maxThreads : 4;
   ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(threadCap, hw) : 1;
@@ -78,6 +83,8 @@ self.addEventListener("message", async (event) => {
     taskId,
     modelUrl,
     ortBaseUrl = "/vendor/onnxruntime-web/",
+    wasmBinaryUrl = null,
+    mode = "four_stem",
     preferWebGpu = true,
     maxThreads = 4,
     leftBuffer,
@@ -104,7 +111,7 @@ self.addEventListener("message", async (event) => {
   };
 
   try {
-    const ort = await loadOrt(ortBaseUrl, maxThreads);
+    const ort = await loadOrt(ortBaseUrl, maxThreads, wasmBinaryUrl);
     if (abortController.signal.aborted) {
       throw Object.assign(new Error("音源分離已取消"), { name: "AbortError" });
     }
@@ -163,7 +170,7 @@ self.addEventListener("message", async (event) => {
 
     let result;
     try {
-      result = await activeProcessor.separate(left, right, { signal: abortController.signal });
+      result = await activeProcessor.separate(left, right, { signal: abortController.signal, mode });
     } catch (sepErr) {
       if (isAbort(sepErr) || abortController.signal.aborted) throw sepErr;
       if (backend === "webgpu") {
@@ -173,15 +180,41 @@ self.addEventListener("message", async (event) => {
         activeProcessor = createProcessorWithBackend("wasm");
         await activeProcessor.loadModel(modelUrl, { signal: abortController.signal });
         cachedBackend = "wasm";
-        result = await activeProcessor.separate(left, right, { signal: abortController.signal });
+        result = await activeProcessor.separate(left, right, { signal: abortController.signal, mode });
       } else {
         throw sepErr;
       }
+    } finally {
+      left = null;
+      right = null;
     }
+
+    // 推論完成後立即釋放 ONNX Session 與 Arena，避免與主執行緒重組 AudioBuffer 同時佔用高峰記憶體
+    await releaseProcessor();
 
     if (abortController.signal.aborted) {
       result = null;
       throw Object.assign(new Error("音源分離已取消"), { name: "AbortError" });
+    }
+
+    if (mode === "two_stem" && result && result.instrumental && result.vocals) {
+      const transferList = [
+        result.vocals.left.buffer,
+        result.vocals.right.buffer,
+        result.instrumental.left.buffer,
+        result.instrumental.right.buffer,
+      ];
+      self.postMessage(
+        {
+          type: "completed",
+          taskId,
+          backend,
+          mode: "two_stem",
+          twoStem: result,
+        },
+        transferList,
+      );
+      return;
     }
 
     const transferList = [
@@ -195,14 +228,12 @@ self.addEventListener("message", async (event) => {
       result.other.right.buffer,
     ];
 
-    left = null;
-    right = null;
-
     self.postMessage(
       {
         type: "completed",
         taskId,
         backend,
+        mode: "four_stem",
         fourStem: result,
       },
       transferList,
