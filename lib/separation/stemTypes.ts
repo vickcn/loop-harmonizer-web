@@ -94,6 +94,26 @@ export function buildSeparatedStemSet(
   };
 }
 
+export function deriveTwoStemFromFourStemSet(fourStemSet: SeparatedStemSet): SeparatedStemSet | null {
+  if (fourStemSet.mode !== "four_stem") return null;
+  const vocals = fourStemSet.tracks.find((track) => track.stemType === "vocals");
+  const drums = fourStemSet.tracks.find((track) => track.stemType === "drums");
+  const bass = fourStemSet.tracks.find((track) => track.stemType === "bass");
+  const other = fourStemSet.tracks.find((track) => track.stemType === "other");
+  if (!vocals || !drums || !bass || !other) return null;
+
+  return buildSeparatedStemSet(
+    {
+      vocals: { left: vocals.left.slice(), right: vocals.right.slice() },
+      drums: { left: drums.left, right: drums.right },
+      bass: { left: bass.left, right: bass.right },
+      other: { left: other.left, right: other.right },
+    },
+    fourStemSet.sampleRate,
+    "two_stem",
+  );
+}
+
 const STEM_LABELS: Record<StemType, string> = {
   vocals: "人聲",
   instrumental: "伴奏",

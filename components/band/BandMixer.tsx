@@ -48,7 +48,11 @@ import {
   sharedNetworkBudgetLedger,
   type NetworkBatchEvaluation,
 } from "@/lib/band/networkBudgetGuard";
-import type { SeparatedStemSet, StemSeparationMode } from "@/lib/separation/stemTypes";
+import {
+  deriveTwoStemFromFourStemSet,
+  type SeparatedStemSet,
+  type StemSeparationMode,
+} from "@/lib/separation/stemTypes";
 import { encodeStereoWav } from "@/lib/separation/wavEncoder";
 import { createSeparationCacheKey, SEPARATION_PROCESSING_VERSION } from "@/lib/storage/cacheKeys";
 import { clearAllCachedStemSets, createStemCacheRecord, deleteCachedStemSet, getCachedStemSet, hashSourceAudio, putCachedStemSet } from "@/lib/storage/separationCache";
@@ -1827,7 +1831,37 @@ export function BandMixer() {
       separationMode: mode,
       processingVersion: SEPARATION_PROCESSING_VERSION,
     });
-    const preCached = await getCachedStemSet(cacheKey).catch(() => null);
+    const inMemoryStems = stemResultsRef.current.get(song.id) ?? null;
+    let preCached = inMemoryStems?.mode === mode
+      ? inMemoryStems
+      : await getCachedStemSet(cacheKey).catch(() => null);
+    let preCachedMessage = "已從本機快取載入分離結果。";
+
+    if (!preCached && mode === "two_stem") {
+      const fourStemCacheKey = createSeparationCacheKey({
+        sourceAudioHash,
+        modelVersion: DEMUCS_MODEL_VERSION,
+        separationMode: "four_stem",
+        processingVersion: SEPARATION_PROCESSING_VERSION,
+      });
+      const existingFourStem = inMemoryStems?.mode === "four_stem"
+        ? inMemoryStems
+        : await getCachedStemSet(fourStemCacheKey).catch(() => null);
+      const derivedTwoStem = existingFourStem
+        ? deriveTwoStemFromFourStemSet(existingFourStem)
+        : null;
+      if (derivedTwoStem) {
+        preCached = derivedTwoStem;
+        preCachedMessage = "已直接從既有 4 Stem 本機結果合成 2 Stem（零 AI 重算與網路下載）。";
+        await putCachedStemSet(createStemCacheRecord({
+          key: cacheKey,
+          sourceAudioHash,
+          modelVersion: DEMUCS_MODEL_VERSION,
+          processingVersion: SEPARATION_PROCESSING_VERSION,
+          stems: derivedTwoStem,
+        })).catch(() => undefined);
+      }
+    }
 
     const engine = getEngine();
     const cap = await collectDeviceCapabilities();
@@ -2061,7 +2095,7 @@ export function BandMixer() {
 
     try {
       let stems = preCached;
-      let message = "已從本機快取載入分離結果。";
+      let message = preCachedMessage;
       if (!stems) {
         const result = await separateAudio(file, {
           mode,

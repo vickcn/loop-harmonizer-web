@@ -1,5 +1,16 @@
 import { evaluateNetworkTransfer, sharedNetworkBudgetLedger } from "@/lib/band/networkBudgetGuard";
 import { idbClear, idbGet, idbPut } from "./indexedDb";
+import {
+  STATIC_RUNTIME_CACHE_NAME,
+  ensureStaticAssetCached,
+  isStaticAssetCached,
+} from "./staticAssetCache";
+
+export {
+  STATIC_RUNTIME_CACHE_NAME,
+  ensureStaticAssetCached,
+  isStaticAssetCached,
+};
 
 const CACHE_NAME = "loop-harmonizer-models-v1";
 const MODEL_META_KEY = "demucs-default";
@@ -61,16 +72,6 @@ export async function isModelCached(sourceUrl: string, modelVersion: string): Pr
     return { cached: valid, sizeBytes: valid ? blob.size : null };
   } catch {
     return { cached: false, sizeBytes: null };
-  }
-}
-
-export async function isStaticAssetCached(assetUrl: string): Promise<boolean> {
-  if (typeof caches === "undefined") return false;
-  try {
-    const matched = await caches.match(assetUrl);
-    return Boolean(matched);
-  } catch {
-    return false;
   }
 }
 
@@ -248,6 +249,9 @@ export function revokeActiveModelObjectUrl(): boolean {
 
 export async function clearModelCache(): Promise<void> {
   revokeActiveModelObjectUrl();
-  if (typeof caches !== "undefined") await caches.delete(CACHE_NAME);
+  if (typeof caches !== "undefined") {
+    await caches.delete(CACHE_NAME);
+    await caches.delete(STATIC_RUNTIME_CACHE_NAME);
+  }
   await idbClear("modelMeta").catch(() => undefined);
 }

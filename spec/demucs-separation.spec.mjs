@@ -2,12 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 let buildSeparatedStemSet;
+let deriveTwoStemFromFourStemSet;
 let encodeStereoWav;
 let createStemTrackDescriptors;
 let createAudioBufferFromStem;
 
 try {
-  ({ buildSeparatedStemSet } = await import("../lib/separation/stemTypes.ts"));
+  ({ buildSeparatedStemSet, deriveTwoStemFromFourStemSet } = await import("../lib/separation/stemTypes.ts"));
   ({ createStemTrackDescriptors } = await import("../lib/separation/stemTypes.ts"));
   ({ encodeStereoWav } = await import("../lib/separation/wavEncoder.ts"));
   ({ createAudioBufferFromStem } = await import("../lib/separation/audioBuffer.ts"));
@@ -102,4 +103,17 @@ test("PCM stem data becomes a stereo AudioBuffer without a WAV round-trip", () =
   assert.equal(buffer.sampleRate, 44100);
   assertSamplesClose(copiedChannels[0], [0.1, 0.2]);
   assertSamplesClose(copiedChannels[1], [0.3, 0.4]);
+});
+
+test("derives two-stem set directly from an existing four-stem set without rerunning separation", () => {
+  const fourStem = buildSeparatedStemSet(fourStemResult, 44100, "four_stem");
+  const twoStem = deriveTwoStemFromFourStemSet(fourStem);
+
+  assert.ok(twoStem);
+  assert.equal(twoStem.mode, "two_stem");
+  assert.deepEqual(twoStem.tracks.map((track) => track.stemType), ["vocals", "instrumental"]);
+  assertSamplesClose(twoStem.tracks[0].left, [0.1, 0.2]);
+  assertSamplesClose(twoStem.tracks[1].left, [0.9, 0.6]);
+  assertSamplesClose(twoStem.tracks[1].right, [1.5, 1.2]);
+  assert.equal(deriveTwoStemFromFourStemSet(twoStem), null);
 });

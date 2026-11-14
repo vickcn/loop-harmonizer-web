@@ -11,6 +11,10 @@ import {
   KNOWN_NETWORK_ASSETS,
   NetworkBudgetLedger,
 } from "../lib/band/networkBudgetGuard.ts";
+import {
+  ensureStaticAssetCached,
+  isStaticAssetCached,
+} from "../lib/storage/staticAssetCache.ts";
 
 test("default network budget is capped at 10 MiB and static asset manifest sizes match disk files", () => {
   assert.equal(DEFAULT_NETWORK_BUDGET_BYTES, 10 * 1024 * 1024);
@@ -116,4 +120,38 @@ test("enforces strict 10 MiB cap with hardBlocked even on high-end desktop and b
   assert.equal(serverCompute.allowed, false);
   assert.equal(serverCompute.hardBlocked, true);
   assert.equal(serverCompute.reason, "server-compute-prohibited");
+});
+
+test("detects and syncs HTTP-cached vendor runtime asset into CacheStorage with zero network fetch", async () => {
+  const originalCaches = globalThis.caches;
+  const originalFetch = globalThis.fetch;
+  const stored = new Map();
+  let fetchCacheMode = null;
+
+  globalThis.caches = {
+    match: async (url) => stored.get(url),
+    open: async () => ({
+      put: async (url, response) => {
+        stored.set(url, response);
+      },
+    }),
+  };
+  globalThis.fetch = async (url, init) => {
+    fetchCacheMode = init?.cache ?? null;
+    return new Response("wasm-bytes", { status: 200 });
+  };
+
+  try {
+    const targetUrl = "/vendor/onnxruntime-web/ort-wasm-simd-threaded.asyncify.wasm";
+    const ok = await isStaticAssetCached(targetUrl);
+    assert.equal(ok, true);
+    assert.equal(fetchCacheMode, "only-if-cached");
+    assert.equal(stored.has(targetUrl), true);
+
+    const hitSecond = await ensureStaticAssetCached(targetUrl, { allowNetworkFetch: false });
+    assert.equal(hitSecond, true);
+  } finally {
+    globalThis.caches = originalCaches;
+    globalThis.fetch = originalFetch;
+  }
 });

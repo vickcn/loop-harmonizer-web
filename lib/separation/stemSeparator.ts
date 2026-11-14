@@ -2,6 +2,7 @@
 
 import { buildSeparatedStemSet, type SeparatedStemSet, type StemSeparationMode } from "./stemTypes";
 import {
+  ensureStaticAssetCached,
   isModelCached,
   isStaticAssetCached,
   prepareCachedModelUrl,
@@ -148,6 +149,14 @@ export async function preflightSeparationNetworkBudget(options?: {
   });
 }
 
+function syncStaticOrtAssetsToCache(): void {
+  void Promise.all([
+    ensureStaticAssetCached("/vendor/onnxruntime-web/ort.webgpu.bundle.min.mjs", { allowNetworkFetch: true }),
+    ensureStaticAssetCached("/vendor/onnxruntime-web/ort-wasm-simd-threaded.asyncify.mjs", { allowNetworkFetch: true }),
+    ensureStaticAssetCached("/vendor/onnxruntime-web/ort-wasm-simd-threaded.asyncify.wasm", { allowNetworkFetch: true }),
+  ]);
+}
+
 async function loadRuntime(maxThreads?: number): Promise<Runtime> {
   if (!runtimePromise) {
     runtimePromise = (async () => {
@@ -163,6 +172,7 @@ async function loadRuntime(maxThreads?: number): Promise<Runtime> {
       const capped = maxThreads && maxThreads > 0 ? Math.min(maxThreads, hw) : Math.min(8, hw);
       ort.env.wasm.numThreads = window.crossOriginIsolated ? Math.max(1, capped) : 1;
       ort.env.wasm.wasmPaths = "/vendor/onnxruntime-web/";
+      syncStaticOrtAssetsToCache();
       return { ort, demucs };
     })().catch((error) => {
       runtimePromise = null;
@@ -401,6 +411,7 @@ async function runSeparationInWorker(params: {
         } else {
           try { worker.terminate(); } catch { /* ignore */ }
         }
+        syncStaticOrtAssetsToCache();
         resolve({
           backend: data.backend ?? "wasm",
           fourStem: data.fourStem,
