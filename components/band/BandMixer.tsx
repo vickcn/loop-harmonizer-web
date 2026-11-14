@@ -1,18 +1,20 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { BandSession, BandSong, SongPlaybackSource, StemChannel } from "@/lib/band/bandTypes";
+import type { BandSession, BandSong, SeparationFocusSessionSnapshot, SongPlaybackSource, StemChannel } from "@/lib/band/bandTypes";
 import { createDefaultBandSession } from "@/lib/band/bandSession";
 import {
   applySongOperationSnapshot,
   clampBpmValue,
   createBandSong,
+  createSeparationFocusSessionSnapshot,
   createSongOperationSnapshot,
   getEffectivePlaybackRate,
   getSongPlaybackTrackIds,
   getStemAudibility,
   reorderSongList,
   restoreBandSongFromRecord,
+  restoreSongsAfterSeparationFocus,
   sanitizeSongSavedRates,
   type PersistedSongRecord,
 } from "@/lib/band/songModel";
@@ -20,20 +22,24 @@ import { MultiTrackEngine } from "@/lib/band/multiTrackEngine";
 import {
   DEMUCS_MODEL_VERSION,
   disposeStemSeparator,
+  isSeparatorWorkerActive,
   preflightSeparationNetworkBudget,
   separateAudio,
 } from "@/lib/separation/stemSeparator";
 import {
   isAbortError,
   sharedSeparationCoordinator,
+  type SeparationTaskStage,
 } from "@/lib/separation/separationTaskController";
 import {
   assessResourceRisk,
   collectDeviceCapabilities,
+  estimateOperationFootprint,
   evaluateTaskAdmission,
   formatEstimatedMiB,
   sharedPerfTelemetry,
   sharedResourceProfileManager,
+  shouldEnterSeparationFocusMode,
   type DeviceResourceProfile,
   type LowLoadActionId,
   type ResourceRiskAssessment,
@@ -105,6 +111,67 @@ const INITIAL_STORAGE_STATS: StorageStatsSummary = {
   isLowStorage: false,
 };
 
+type SeparationFocusUiState = {
+  active: boolean;
+  outcome: "running" | "cancelling" | "completed" | "cancelled" | "failed";
+  songId: string;
+  songName: string;
+  stage: SeparationTaskStage;
+  progress: number | null;
+  message: string;
+  reasons: string[];
+  pausedSongNames: string[];
+  snapshot: SeparationFocusSessionSnapshot | null;
+  diagnosticsSummary: string | null;
+};
+
+const FOCUS_BLOCKED_SONG_KEYS: ReadonlyArray<keyof BandSong> = [
+  "originalBpm",
+  "targetBpm",
+  "tempoMode",
+  "manualRate",
+  "fineRateOffset",
+  "keyShiftSemitones",
+  "playbackSource",
+  "loop",
+  "masterVolume",
+  "muted",
+  "stemChannels",
+  "savedRates",
+  "status",
+];
+
+function formatSeparationFocusStageLabel(stage: SeparationTaskStage): string {
+  switch (stage) {
+    case "preparing":
+      return "準備環境與檢查快取";
+    case "downloading":
+      return "下載模型權重（本機快取）";
+    case "processing":
+      return "Demucs AI 推論計算中";
+    case "cancelling":
+      return "正在停止 Worker 與清理暫存";
+    case "cancelled":
+      return "已中止音源分離";
+    case "completed":
+      return "音源分離完成";
+    case "failed":
+      return "音源分離失敗";
+    default:
+      return "待命";
+  }
+}
+
+function FocusAbortIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <polygon points="7.86 2 16.14 2 22 7.86 22 16.14 16.14 22 7.86 22 2 16.14 2 7.86 7.86 2" />
+      <path d="m15 9-6 6" />
+      <path d="m9 9 6 6" />
+    </svg>
+  );
+}
+
 export function BandMixer() {
   const [session, setSession] = useState<BandSession>(createDefaultBandSession);
   const [loading, setLoading] = useState(false);
@@ -124,6 +191,7 @@ export function BandMixer() {
   const [idleCleanupReport, setIdleCleanupReport] = useState<string>("");
   const [resourceProfile, setResourceProfile] = useState<DeviceResourceProfile | null>(null);
   const [profileWarning, setProfileWarning] = useState<string>("");
+  const [separationFocus, setSeparationFocus] = useState<SeparationFocusUiState | null>(null);
   const [collapsedIds, setCollapsedIds] = useState<Set<string>>(new Set());
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [selection, setSelection] = useState<MixerSelection>(EMPTY_MIXER_SELECTION);
@@ -149,6 +217,8 @@ export function BandMixer() {
   const stemResultsRef = useRef(new Map<string, SeparatedStemSet>());
   const persistedMetaBySongIdRef = useRef(new Map<string, PersistedSongRecord>());
   const separationTokensRef = useRef(new Map<string, symbol>());
+  const separationFocusRef = useRef<SeparationFocusUiState | null>(null);
+  const focusCleanupPromisesRef = useRef(new Map<string, Promise<void>>());
   const savedSettingsRef = useRef(new Map<string, SavedSongSettings>());
   const restorePromiseRef = useRef<Promise<void>>(Promise.resolve());
   const removedSongIdsRef = useRef<Set<string>>(new Set());
@@ -199,6 +269,21 @@ export function BandMixer() {
       setShortcutHint("");
     }, 3000);
   }, []);
+
+  const setSeparationFocusState = useCallback((next: SeparationFocusUiState | null) => {
+    separationFocusRef.current = next;
+    setSeparationFocus(next);
+  }, []);
+
+  const updateSeparationFocusState = useCallback((
+    updater: (prev: SeparationFocusUiState | null) => SeparationFocusUiState | null,
+  ) => {
+    const next = updater(separationFocusRef.current);
+    separationFocusRef.current = next;
+    setSeparationFocus(next);
+  }, []);
+
+  const isFocusLocked = useCallback(() => Boolean(separationFocusRef.current?.active), []);
 
   const refreshResourceProfile = useCallback(async (options?: {
     afterCleanup?: boolean;
@@ -325,7 +410,7 @@ export function BandMixer() {
     cacheKey: string,
     message: string,
     options?: { preferredSource?: SongPlaybackSource; skipPersist?: boolean },
-  ) => {
+  ): BandSong => {
     const engine = getEngine();
     song.stemIds.forEach((id) => engine.removeTrack(id));
     const stemIds: string[] = [];
@@ -378,7 +463,91 @@ export function BandMixer() {
       });
       persistSongDebounced(song.id);
     }
+    return nextSong;
   }, [applySongToEngine, getEngine, persistSongDebounced]);
+
+  const finishSeparationFocus = useCallback((params: {
+    songId: string;
+    outcome: "completed" | "cancelled" | "failed";
+    message: string;
+    completedSong?: BandSong;
+  }): Promise<void> => {
+    const existing = focusCleanupPromisesRef.current.get(params.songId);
+    if (existing) return existing;
+
+    const cleanupPromise = (async () => {
+      await disposeStemSeparator({ revokeModelUrl: false }).catch(() => undefined);
+      if (params.outcome === "cancelled") {
+        sharedPerfTelemetry.markAbortSettled();
+      }
+      const diagnostics = sharedPerfTelemetry.getDiagnosticsReport();
+      if (params.outcome === "cancelled" || params.outcome === "completed") {
+        sharedPerfTelemetry.resetStressCountersAfterCleanup();
+      }
+      const workerStillActive = isSeparatorWorkerActive();
+      const currentFocus = separationFocusRef.current;
+
+      if (currentFocus && currentFocus.songId === params.songId && currentFocus.active) {
+        const snapshot = currentFocus.snapshot;
+        if (snapshot) {
+          const engine = getEngine();
+          const songsForEngine = sessionRef.current.songs.map((item) => (
+            params.completedSong && item.id === params.completedSong.id ? params.completedSong : item
+          ));
+          const restoredForEngine = restoreSongsAfterSeparationFocus(songsForEngine, snapshot, {
+            outcome: params.outcome,
+          });
+          for (const restoredSong of restoredForEngine) {
+            // 僅還原設定與播放位置，保持暫停絕不自動播放
+            engine.pauseTracks([restoredSong.sourceAudioId, ...restoredSong.stemIds]);
+            engine.seekTracks([restoredSong.sourceAudioId, ...restoredSong.stemIds], restoredSong.playheadSec);
+            applySongToEngine(restoredSong);
+            if (restoredSong.sourceAudioHash) {
+              persistSongDebounced(restoredSong.id, 150);
+            }
+          }
+          setSession((previous) => ({
+            ...previous,
+            songs: restoreSongsAfterSeparationFocus(previous.songs, snapshot, {
+              outcome: params.outcome,
+            }),
+          }));
+        }
+
+        const workerNote = workerStillActive
+          ? "（Worker 仍在背景結束中）"
+          : "（Worker 與暫存已釋放，資源鎖已解除）";
+        updateSeparationFocusState((prev) => {
+          if (!prev || prev.songId !== params.songId) return prev;
+          return {
+            ...prev,
+            active: false,
+            outcome: params.outcome,
+            stage: params.outcome,
+            progress: params.outcome === "completed" ? 1 : 0,
+            message: `${params.message}${workerNote}`,
+            snapshot: null,
+            diagnosticsSummary: diagnostics.longTaskCount > 0 || diagnostics.lastAbortLatencyMs !== null
+              ? diagnostics.summary
+              : null,
+          };
+        });
+      }
+
+      await refreshResourceProfile({
+        afterCleanup: params.outcome === "cancelled" || params.outcome === "completed",
+        stabilityVerified:
+          !workerStillActive
+          && !sharedSeparationCoordinator.hasRunningHeavyTask()
+          && !sharedSeparationCoordinator.isBusyWaitingCleanup(),
+      }).catch(() => undefined);
+    })().finally(() => {
+      focusCleanupPromisesRef.current.delete(params.songId);
+    });
+
+    focusCleanupPromisesRef.current.set(params.songId, cleanupPromise);
+    return cleanupPromise;
+  }, [applySongToEngine, getEngine, persistSongDebounced, refreshResourceProfile, updateSeparationFocusState]);
 
   const restoreCachedStems = useCallback(async (
     song: BandSong,
@@ -525,11 +694,17 @@ export function BandMixer() {
 
   const ensureSongAudioReady = useCallback(async (
     song: BandSong,
-    options?: { skipGuard?: boolean },
+    options?: { skipGuard?: boolean; allowDuringFocus?: boolean },
   ): Promise<boolean> => {
     const engine = getEngine();
     if (engine.hasTrack(song.sourceAudioId) && song.audioLoadState !== "unloaded") {
       return true;
+    }
+    if (!options?.allowDuringFocus && isFocusLocked()) {
+      const msg = "分離專注模式啟動中，暫時鎖定解碼與載入其他音檔。";
+      showCardFeedback(song.id, msg);
+      showShortcutHint(msg);
+      return false;
     }
 
     let file = sourceFilesRef.current.get(song.id);
@@ -649,7 +824,7 @@ export function BandMixer() {
       });
       return false;
     }
-  }, [applySongToEngine, getEngine, installStemSet, patchSongMetadataOnly, releaseIdleResources, requestGuardConfirmation]);
+  }, [applySongToEngine, getEngine, installStemSet, isFocusLocked, patchSongMetadataOnly, releaseIdleResources, requestGuardConfirmation, showCardFeedback, showShortcutHint]);
 
   const hydrateOnePersistedSong = useCallback(async (
     record: PersistedSongRecord,
@@ -999,6 +1174,15 @@ export function BandMixer() {
   }, [handlePersistResult, refreshResourceProfile]);
 
   const updateSong = useCallback((songId: string, patch: Partial<BandSong>, options?: { persistDelayMs?: number }) => {
+    if (isFocusLocked()) {
+      const blockedKey = FOCUS_BLOCKED_SONG_KEYS.find((key) => key in patch);
+      if (blockedKey) {
+        const msg = "分離專注模式啟動中，已暫時鎖定變速、升降 Key 與音軌參數變更。";
+        showCardFeedback(songId, msg);
+        showShortcutHint(msg);
+        return;
+      }
+    }
     let shouldPersist = false;
     setSession((previous) => ({
       ...previous,
@@ -1017,7 +1201,7 @@ export function BandMixer() {
     if (shouldPersist) {
       persistSongDebounced(songId, options?.persistDelayMs ?? 300);
     }
-  }, [applySongToEngine, persistSongDebounced]);
+  }, [applySongToEngine, isFocusLocked, persistSongDebounced, showCardFeedback, showShortcutHint]);
 
   const persistNewOrRelinkedSong = useCallback(async (song: BandSong, file: Blob, sourceAudioHash: string, force = false) => {
     const res = await saveSongWithAudioFile({ song, file, sourceAudioHash, force });
@@ -1028,6 +1212,12 @@ export function BandMixer() {
   const handleFiles = async (fileList: File[] | FileList | null) => {
     const selectedFiles = fileList ? Array.from(fileList) : [];
     if (!selectedFiles.length) return;
+    if (isFocusLocked()) {
+      const msg = "分離專注模式啟動中，已鎖定載入新音檔與解碼，請待分離完成或中止後操作。";
+      setUploadError(msg);
+      showShortcutHint(msg);
+      return;
+    }
     setLoading(true);
     setUploadError("");
     setUploadStatus("正在等候工作階段同步完成…");
@@ -1147,6 +1337,12 @@ export function BandMixer() {
   const handleRelinkFile = async (songId: string, fileList: File[] | FileList | null) => {
     const file = fileList?.[0];
     if (!file) return;
+    if (isFocusLocked()) {
+      const msg = "分離專注模式啟動中，暫時無法重新連結並解碼音檔。";
+      showCardFeedback(songId, msg);
+      showShortcutHint(msg);
+      return;
+    }
     const target = sessionRef.current.songs.find((item) => item.id === songId);
     if (!target) return;
     const engine = getEngine();
@@ -1254,6 +1450,13 @@ export function BandMixer() {
   };
 
   const playSong = async (song: BandSong) => {
+    if (isFocusLocked()) {
+      const msg = "目前處於分離專注模式，已暫停音訊處理並鎖定啟動播放；請待分離完成或點擊「中止分離」。";
+      setPlaybackErrors((previous) => ({ ...previous, [song.id]: msg }));
+      showCardFeedback(song.id, msg);
+      showShortcutHint(msg);
+      return;
+    }
     if (song.persistenceStatus === "missing_audio" || song.persistenceStatus === "restoring") {
       const msg = song.persistenceStatus === "restoring"
         ? "正在恢復音檔，請稍候再播放。"
@@ -1274,23 +1477,113 @@ export function BandMixer() {
     try {
       const ready = await ensureSongAudioReady(song);
       if (!ready) return;
+      if (isFocusLocked()) {
+        const msg = "分離專注模式已啟動，取消本次播放。";
+        setPlaybackErrors((previous) => ({ ...previous, [song.id]: msg }));
+        showCardFeedback(song.id, msg);
+        return;
+      }
       const latestSong = sessionRef.current.songs.find((item) => item.id === song.id) ?? song;
       const trackIds = getSongPlaybackTrackIds(latestSong);
       const engine = getEngine();
       const cap = await collectDeviceCapabilities();
-      const profileEval = sharedResourceProfileManager.evaluate(cap, sharedPerfTelemetry.getSignals());
+      const perfSignals = sharedPerfTelemetry.getSignals();
+      const profileEval = sharedResourceProfileManager.evaluate(cap, perfSignals);
       setResourceProfile(profileEval.profile);
-      const projectedActiveSoundTouchTracks = engine.getActiveSoundTouchCount() + trackIds.length;
-      const admission = evaluateTaskAdmission({
+
+      let projectedActiveSoundTouchTracks = engine.getProjectedSoundTouchCount(trackIds);
+      let admission = evaluateTaskAdmission({
         operation: "soundtouch-playback",
         profile: profileEval.profile,
         capabilities: cap,
         estimatedTaskMemoryBytes: 0,
         inMemoryAudioBytes: engine.getTrackMemoryEstimateBytes(),
         projectedActiveSoundTouchTracks,
+        performanceSignals: perfSignals,
+        separationFocusActive: isFocusLocked(),
       });
+
+      if (!admission.allowed) {
+        if (admission.hardRejected) {
+          setPlaybackErrors((previous) => ({ ...previous, [latestSong.id]: admission.message }));
+          setProfileWarning(admission.message);
+          showCardFeedback(latestSong.id, admission.message);
+          showShortcutHint(admission.message);
+          return;
+        }
+
+        const otherPlayingSongs = sessionRef.current.songs.filter(
+          (candidate) => candidate.id !== latestSong.id && candidate.status === "playing",
+        );
+        const hasOtherIdleDecoded = sessionRef.current.songs.some(
+          (candidate) => candidate.id !== latestSong.id && candidate.status !== "playing" && engine.hasTrack(candidate.sourceAudioId),
+        );
+        const playbackAssessment = assessResourceRisk({
+          operation: "soundtouch-playback",
+          songName: latestSong.name,
+          durationSec: latestSong.durationSec,
+          fileSizeBytes: latestSong.fileSizeBytes,
+          mimeType: latestSong.mimeType,
+          activeSongCount: sessionRef.current.songs.length,
+          playingSongCount: otherPlayingSongs.length,
+          activeSoundTouchTracks: projectedActiveSoundTouchTracks,
+          estimatedInMemoryAudioBytes: engine.getTrackMemoryEstimateBytes(),
+          hasOtherIdleDecodedSongs: hasOtherIdleDecoded,
+          profile: profileEval.profile,
+          capabilities: cap,
+          performanceSignals: perfSignals,
+        });
+
+        if (playbackAssessment.lowLoadSuggestions.length === 0) {
+          setPlaybackErrors((previous) => ({ ...previous, [latestSong.id]: admission.message }));
+          setProfileWarning(admission.message);
+          showCardFeedback(latestSong.id, admission.message);
+          showShortcutHint(admission.message);
+          return;
+        }
+
+        const decision = await requestGuardConfirmation({
+          title: `多軌播放負載過高：「${latestSong.name}」`,
+          subtitle: `目前 ${profileEval.profile.tier} 配置建議 SoundTouch 上限為 ${profileEval.profile.maxActiveSoundTouchTracks} 軌，需先套用降載後才允許播放。`,
+          assessment: playbackAssessment,
+        });
+        if (!decision) {
+          setPlaybackErrors((previous) => ({ ...previous, [latestSong.id]: admission.message }));
+          return;
+        }
+
+        if (decision.applyLowLoadActions.includes("pause-other-songs")) {
+          for (const other of otherPlayingSongs) {
+            engine.pauseTracks(getSongPlaybackTrackIds(other));
+            patchSongMetadataOnly(other.id, { status: "paused" });
+          }
+        }
+        if (decision.applyLowLoadActions.includes("release-idle-buffers")) {
+          await releaseIdleResources({ excludeSongIds: [latestSong.id], quiet: true });
+        }
+
+        projectedActiveSoundTouchTracks = engine.getProjectedSoundTouchCount(trackIds);
+        admission = evaluateTaskAdmission({
+          operation: "soundtouch-playback",
+          profile: profileEval.profile,
+          capabilities: cap,
+          estimatedTaskMemoryBytes: 0,
+          inMemoryAudioBytes: engine.getTrackMemoryEstimateBytes(),
+          projectedActiveSoundTouchTracks,
+          performanceSignals: sharedPerfTelemetry.getSignals(),
+          separationFocusActive: isFocusLocked(),
+        });
+
+        if (!admission.allowed) {
+          setPlaybackErrors((previous) => ({ ...previous, [latestSong.id]: admission.message }));
+          setProfileWarning(admission.message);
+          showCardFeedback(latestSong.id, admission.message);
+          showShortcutHint(admission.message);
+          return;
+        }
+      }
+
       if (admission.requiresWarning) {
-        // 先預警使用者，不無提示中斷其他播放中的音軌或降低音質
         setProfileWarning(admission.message);
         showShortcutHint(admission.message);
         showCardFeedback(latestSong.id, admission.message);
@@ -1314,22 +1607,40 @@ export function BandMixer() {
   };
 
   const pauseSong = (song: BandSong) => {
+    if (isFocusLocked()) {
+      showCardFeedback(song.id, "分離專注模式啟動中，已鎖定播放控制。");
+      return;
+    }
     if (startingSongIdsRef.current.has(song.id)) return;
     getEngine().pauseTracks(getSongPlaybackTrackIds(song));
     updateSong(song.id, { status: "paused" }, { persistDelayMs: 80 });
   };
 
   const stopSong = (song: BandSong) => {
+    if (isFocusLocked()) {
+      showCardFeedback(song.id, "分離專注模式啟動中，已鎖定播放控制。");
+      return;
+    }
     getEngine().stopTracks([song.sourceAudioId, ...song.stemIds]);
     updateSong(song.id, { status: "stopped", playheadSec: 0 }, { persistDelayMs: 80 });
   };
 
   const seekSong = (song: BandSong, seconds: number) => {
+    if (isFocusLocked()) {
+      showCardFeedback(song.id, "分離專注模式啟動中，暫時鎖定調整播放位置，以確保回復原始時間點。");
+      return;
+    }
     getEngine().seekTracks([song.sourceAudioId, ...song.stemIds], seconds);
     updateSong(song.id, { playheadSec: seconds }, { persistDelayMs: 250 });
   };
 
   const toggleMuteForSelection = useCallback((targetSelection: MixerSelection) => {
+    if (isFocusLocked()) {
+      const msg = "分離專注模式啟動中，已暫停音訊處理並鎖定靜音變更。";
+      if (targetSelection.songId) showCardFeedback(targetSelection.songId, msg);
+      showShortcutHint(msg);
+      return;
+    }
     const result = toggleMuteBySelection(sessionRef.current.songs, targetSelection);
     if (result.changedSong) {
       applySongToEngine(result.changedSong);
@@ -1343,9 +1654,15 @@ export function BandMixer() {
       showCardFeedback(result.changedSong.id, result.message);
     }
     showShortcutHint(result.message);
-  }, [applySongToEngine, persistSongDebounced, showCardFeedback, showShortcutHint]);
+  }, [applySongToEngine, isFocusLocked, persistSongDebounced, showCardFeedback, showShortcutHint]);
 
   const toggleSoloForSelection = useCallback((targetSelection: MixerSelection) => {
+    if (isFocusLocked()) {
+      const msg = "分離專注模式啟動中，已暫停音訊處理並鎖定獨奏變更。";
+      if (targetSelection.songId) showCardFeedback(targetSelection.songId, msg);
+      showShortcutHint(msg);
+      return;
+    }
     const result = toggleSoloBySelection(sessionRef.current.songs, targetSelection);
     if (result.changedSong) {
       applySongToEngine(result.changedSong);
@@ -1361,19 +1678,26 @@ export function BandMixer() {
       showCardFeedback(targetSelection.songId, result.message);
     }
     showShortcutHint(result.message);
-  }, [applySongToEngine, persistSongDebounced, showCardFeedback, showShortcutHint]);
+  }, [applySongToEngine, isFocusLocked, persistSongDebounced, showCardFeedback, showShortcutHint]);
 
   const switchSource = async (song: BandSong, playbackSource: "original" | "stems") => {
+    if (isFocusLocked()) {
+      const msg = "分離專注模式啟動中，已鎖定切換播放來源。";
+      showCardFeedback(song.id, msg);
+      showShortcutHint(msg);
+      return;
+    }
     if (song.playbackSource === playbackSource || (playbackSource === "stems" && song.stemIds.length === 0)) return;
     const engine = getEngine();
     const oldIds = getSongPlaybackTrackIds(song);
     const nextSong = { ...song, playbackSource };
     const newIds = getSongPlaybackTrackIds(nextSong);
-    if (song.status === "playing" && playbackSource === "stems") {
+    if (song.status === "playing") {
       const cap = await collectDeviceCapabilities();
-      const profileEval = sharedResourceProfileManager.evaluate(cap, sharedPerfTelemetry.getSignals());
+      const perfSignals = sharedPerfTelemetry.getSignals();
+      const profileEval = sharedResourceProfileManager.evaluate(cap, perfSignals);
       setResourceProfile(profileEval.profile);
-      const projected = Math.max(0, engine.getActiveSoundTouchCount() - oldIds.length) + newIds.length;
+      const projected = Math.max(0, engine.getActiveSoundTouchCount() - 1) + 1;
       const admission = evaluateTaskAdmission({
         operation: "soundtouch-playback",
         profile: profileEval.profile,
@@ -1381,7 +1705,15 @@ export function BandMixer() {
         estimatedTaskMemoryBytes: 0,
         inMemoryAudioBytes: engine.getTrackMemoryEstimateBytes(),
         projectedActiveSoundTouchTracks: projected,
+        performanceSignals: perfSignals,
+        separationFocusActive: isFocusLocked(),
       });
+      if (!admission.allowed) {
+        setProfileWarning(admission.message);
+        showShortcutHint(admission.message);
+        showCardFeedback(song.id, admission.message);
+        return;
+      }
       if (admission.requiresWarning) {
         setProfileWarning(admission.message);
         showShortcutHint(admission.message);
@@ -1409,21 +1741,37 @@ export function BandMixer() {
   };
 
   const abortSongSeparation = async (song: BandSong) => {
+    sharedPerfTelemetry.markAbortRequested();
     patchSongMetadataOnly(song.id, {
       separationStatus: "cancelling",
       separationStage: "cancelling",
       separationMessage: "正在停止並釋放 Worker / Tensor 資源…",
     });
+    if (separationFocusRef.current?.songId === song.id && separationFocusRef.current.active) {
+      updateSeparationFocusState((prev) => (
+        prev && prev.songId === song.id
+          ? {
+              ...prev,
+              outcome: "cancelling",
+              stage: "cancelling",
+              message: "正在停止 Worker、清理 Tensor 並解除資源鎖定…",
+            }
+          : prev
+      ));
+    }
     await sharedSeparationCoordinator.cancelTask(song.id, "已中止音源分離，未改動既有設定與快取。", 80);
-    await disposeStemSeparator({ revokeModelUrl: false });
-    sharedPerfTelemetry.resetStressCountersAfterCleanup();
-    await refreshResourceProfile({
-      afterCleanup: true,
-      stabilityVerified: !sharedSeparationCoordinator.hasRunningHeavyTask() && !sharedSeparationCoordinator.isBusyWaitingCleanup(),
-    }).catch(() => undefined);
+    await finishSeparationFocus({
+      songId: song.id,
+      outcome: "cancelled",
+      message: "已中止音源分離，未改動既有設定與快取。",
+    });
   };
 
   const restoreSongSnapshot = (song: BandSong) => {
+    if (isFocusLocked()) {
+      showCardFeedback(song.id, "分離專注模式啟動中，請待分離完成或中止後再回復狀態。");
+      return;
+    }
     const snapshot = song.activeSnapshot;
     if (!snapshot) return;
     const restored = applySongOperationSnapshot(song, snapshot);
@@ -1446,6 +1794,10 @@ export function BandMixer() {
   };
 
   const separateSong = async (song: BandSong, mode: StemSeparationMode) => {
+    if (isFocusLocked()) {
+      showCardFeedback(song.id, "目前處於分離專注模式，請等待目前分離任務完成或先中止後再試。");
+      return;
+    }
     if (song.separationStatus === "processing" || song.separationStatus === "cancelling") {
       return;
     }
@@ -1459,7 +1811,7 @@ export function BandMixer() {
       return;
     }
 
-    const ready = await ensureSongAudioReady(song, { skipGuard: true });
+    const ready = await ensureSongAudioReady(song, { skipGuard: true, allowDuringFocus: true });
     if (!ready) return;
     const latestReadySong = sessionRef.current.songs.find((item) => item.id === song.id) ?? song;
     const file = sourceFilesRef.current.get(song.id);
@@ -1477,10 +1829,24 @@ export function BandMixer() {
     });
     const preCached = await getCachedStemSet(cacheKey).catch(() => null);
 
+    const engine = getEngine();
     const cap = await collectDeviceCapabilities();
-    const profileEval = sharedResourceProfileManager.evaluate(cap, sharedPerfTelemetry.getSignals());
+    const perfSignals = sharedPerfTelemetry.getSignals();
+    const profileEval = sharedResourceProfileManager.evaluate(cap, perfSignals);
     setResourceProfile(profileEval.profile);
     let maxThreads = profileEval.profile.maxWasmThreads;
+    let userSelectedPausePlayback = false;
+    const footprint = preCached
+      ? { estimatedMemoryBytes: 0, estimatedStorageBytes: 0 }
+      : estimateOperationFootprint({
+          operation: "separate",
+          songName: latestReadySong.name,
+          fileSizeBytes: file.size,
+          durationSec: latestReadySong.durationSec,
+          mimeType: file.type,
+          separationMode: mode,
+          capabilities: cap,
+        });
 
     if (!preCached) {
       const networkEval = await preflightSeparationNetworkBudget();
@@ -1493,13 +1859,13 @@ export function BandMixer() {
         separationMode: mode,
         activeSongCount: sessionRef.current.songs.length,
         playingSongCount: sessionRef.current.songs.filter((s) => s.status === "playing").length,
-        activeSoundTouchTracks: getEngine().getActiveSoundTouchCount(),
+        activeSoundTouchTracks: engine.getActiveSoundTouchCount(),
         runningDemucsCount: sharedSeparationCoordinator.hasRunningHeavyTask() ? 1 : 0,
-        estimatedInMemoryAudioBytes: getEngine().getTrackMemoryEstimateBytes(),
-        hasOtherIdleDecodedSongs: sessionRef.current.songs.some((s) => s.id !== song.id && s.status !== "playing" && getEngine().hasTrack(s.sourceAudioId)),
+        estimatedInMemoryAudioBytes: engine.getTrackMemoryEstimateBytes(),
+        hasOtherIdleDecodedSongs: sessionRef.current.songs.some((s) => s.id !== song.id && s.status !== "playing" && engine.hasTrack(s.sourceAudioId)),
         profile: profileEval.profile,
         capabilities: cap,
-        performanceSignals: sharedPerfTelemetry.getSignals(),
+        performanceSignals: perfSignals,
       });
 
       if (assessment.requiresConfirmation || !networkEval.allowed) {
@@ -1512,12 +1878,7 @@ export function BandMixer() {
         if (!decision) return;
         if (assessment.admission.hardRejected || !networkEval.allowed) return;
         if (decision.applyLowLoadActions.includes("pause-other-songs")) {
-          for (const other of sessionRef.current.songs) {
-            if (other.id !== song.id && other.status === "playing") {
-              getEngine().pauseTracks(getSongPlaybackTrackIds(other));
-              patchSongMetadataOnly(other.id, { status: "paused" });
-            }
-          }
+          userSelectedPausePlayback = true;
         }
         if (decision.applyLowLoadActions.includes("release-idle-buffers")) {
           await releaseIdleResources({ excludeSongIds: [song.id], quiet: true });
@@ -1526,11 +1887,94 @@ export function BandMixer() {
           maxThreads = Math.max(1, Math.min(maxThreads, 2));
         }
       } else if (assessment.riskLevel === "medium") {
-        showCardFeedback(song.id, `提示：本裝置估計達中等負載（${assessment.estimatedDurationLabel}），背景執行中可繼續操作其他卡片。`);
+        showCardFeedback(song.id, `提示：本裝置估計達中等負載（${assessment.estimatedDurationLabel}）。`);
       }
     }
 
-    const stableSnapshot = createSongOperationSnapshot(latestReadySong, "音源分離前穩定狀態");
+    const focusDecision = preCached
+      ? { enabled: false, reasons: [] as string[] }
+      : shouldEnterSeparationFocusMode({
+          profile: profileEval.profile,
+          performanceSignals: sharedPerfTelemetry.getSignals(),
+          estimatedSeparationMemoryBytes: footprint.estimatedMemoryBytes,
+          inMemoryAudioBytes: engine.getTrackMemoryEstimateBytes(),
+          activeSoundTouchTracks: engine.getActiveSoundTouchCount(),
+          userSelectedPausePlayback,
+        });
+
+    if (focusDecision.enabled) {
+      // 必須在啟動 Demucs 前實質暫停所有播放以停止 SoundTouch DSP（禁止僅用 Mute）
+      const pauseResult = engine.pauseAllActivePlayback();
+      const currentSongs = sessionRef.current.songs;
+      const playheadOverrides: Record<string, number> = {};
+      for (const candidate of currentSongs) {
+        const trackIds = [candidate.sourceAudioId, ...candidate.stemIds];
+        for (const tid of trackIds) {
+          const pos = pauseResult.positionsByTrackId[tid];
+          if (typeof pos === "number" && Number.isFinite(pos)) {
+            playheadOverrides[candidate.id] = pos;
+            break;
+          }
+        }
+      }
+      const focusSnapshot = createSeparationFocusSessionSnapshot(
+        currentSongs,
+        song.id,
+        focusDecision.reasons,
+        playheadOverrides,
+      );
+      const pausedIdSet = new Set(focusSnapshot.pausedSongIds);
+      const pausedSongNames = currentSongs
+        .filter((candidate) => pausedIdSet.has(candidate.id))
+        .map((candidate) => candidate.name);
+
+      setSession((previous) => ({
+        ...previous,
+        songs: previous.songs.map((candidate) => {
+          const pos = playheadOverrides[candidate.id];
+          if (pausedIdSet.has(candidate.id)) {
+            return {
+              ...candidate,
+              status: "paused",
+              playheadSec: Number.isFinite(pos) ? pos : candidate.playheadSec,
+            };
+          }
+          return candidate;
+        }),
+      }));
+
+      setSeparationFocusState({
+        active: true,
+        outcome: "running",
+        songId: song.id,
+        songName: latestReadySong.name,
+        stage: "preparing",
+        progress: 0.02,
+        message: pausedSongNames.length
+          ? `已暫停 ${pausedSongNames.length} 首播放中歌曲，準備開始分離…`
+          : "已開啟分離專注模式並鎖定高負載音訊操作，準備開始分離…",
+        reasons: focusDecision.reasons,
+        pausedSongNames,
+        snapshot: focusSnapshot,
+        diagnosticsSummary: null,
+      });
+    } else if (userSelectedPausePlayback) {
+      engine.pauseAllActivePlayback();
+      setSession((previous) => ({
+        ...previous,
+        songs: previous.songs.map((candidate) => (
+          candidate.status === "playing" ? { ...candidate, status: "paused" } : candidate
+        )),
+      }));
+    }
+
+    const postPauseSong = sessionRef.current.songs.find((item) => item.id === song.id) ?? latestReadySong;
+    const stableSnapshot = createSongOperationSnapshot(
+      focusDecision.enabled && postPauseSong.status === "playing"
+        ? { ...postPauseSong, status: "paused" }
+        : postPauseSong,
+      "音源分離前穩定狀態",
+    );
     patchSongMetadataOnly(song.id, {
       activeSnapshot: stableSnapshot,
       separationStatus: "processing",
@@ -1553,6 +1997,13 @@ export function BandMixer() {
               separationStage: "cancelling",
               separationMessage: event.message,
             });
+            if (separationFocusRef.current?.songId === song.id && separationFocusRef.current.active) {
+              updateSeparationFocusState((prev) => (
+                prev && prev.songId === song.id
+                  ? { ...prev, outcome: "cancelling", stage: "cancelling", message: event.message }
+                  : prev
+              ));
+            }
             return;
           }
           if (event.stage === "cancelled") {
@@ -1576,13 +2027,31 @@ export function BandMixer() {
               separationProgress: event.progress,
               separationMessage: event.message,
             });
+            if (separationFocusRef.current?.songId === song.id && separationFocusRef.current.active) {
+              updateSeparationFocusState((prev) => (
+                prev && prev.songId === song.id && prev.active
+                  ? {
+                      ...prev,
+                      stage: event.stage,
+                      progress: typeof event.progress === "number" ? event.progress : prev.progress,
+                      message: event.message,
+                    }
+                  : prev
+              ));
+            }
           }
         },
       });
     } catch (error) {
+      const errMsg = error instanceof Error ? error.message : "目前無法啟動分離任務。";
       patchSongMetadataOnly(song.id, {
         separationStatus: stableSnapshot.separationStatus,
-        separationMessage: error instanceof Error ? error.message : "目前無法啟動分離任務。",
+        separationMessage: errMsg,
+      });
+      await finishSeparationFocus({
+        songId: song.id,
+        outcome: "failed",
+        message: errMsg,
       });
       return;
     }
@@ -1600,7 +2069,6 @@ export function BandMixer() {
           maxThreads,
         });
         sharedPerfTelemetry.recordSeparationDuration(result.durationMs);
-        void refreshResourceProfile();
         controller.throwIfAborted();
         stems = result.stems;
         controller.updateProgress("processing", 0.98, "正在驗證並寫入本機分離快取…");
@@ -1621,17 +2089,42 @@ export function BandMixer() {
       }
 
       controller.throwIfAborted();
-      if (!controller.isCurrent() || removedSongIdsRef.current.has(song.id)) return;
+      if (!controller.isCurrent() || removedSongIdsRef.current.has(song.id)) {
+        await finishSeparationFocus({
+          songId: song.id,
+          outcome: "cancelled",
+          message: "任務已結束，已解除專注模式鎖定。",
+        });
+        return;
+      }
       const latestSong = sessionRef.current.songs.find((candidate) => candidate.id === song.id);
-      if (!latestSong) return;
+      if (!latestSong) {
+        await finishSeparationFocus({
+          songId: song.id,
+          outcome: "cancelled",
+          message: "歌曲已移除，已解除專注模式鎖定。",
+        });
+        return;
+      }
 
       controller.markCompleted(message);
-      installStemSet(latestSong, stems, cacheKey, message);
+      const installedSong = installStemSet(latestSong, stems, cacheKey, message);
       showCardFeedback(song.id, message);
       void refreshCacheStats();
+      await finishSeparationFocus({
+        songId: song.id,
+        outcome: "completed",
+        message,
+        completedSong: installedSong,
+      });
     } catch (error) {
       if (isAbortError(error) || controller.isCancellingOrCancelled()) {
         await controller.cancel("已中止音源分離，已恢復操作前穩定狀態。");
+        await finishSeparationFocus({
+          songId: song.id,
+          outcome: "cancelled",
+          message: "已中止音源分離，已恢復操作前穩定狀態。",
+        });
         return;
       }
       if (!controller.isCurrent()) return;
@@ -1644,9 +2137,25 @@ export function BandMixer() {
         playbackSource: stableSnapshot.playbackSource === "stems" && song.stemIds.length > 0 ? "stems" : "original",
         separationMessage: errMsg,
       });
+      await finishSeparationFocus({
+        songId: song.id,
+        outcome: "failed",
+        message: errMsg,
+      });
     } finally {
       if (separationTokensRef.current.get(song.id) === token) {
         separationTokensRef.current.delete(song.id);
+      }
+      if (
+        separationFocusRef.current?.active
+        && separationFocusRef.current.songId === song.id
+        && !focusCleanupPromisesRef.current.has(song.id)
+      ) {
+        await finishSeparationFocus({
+          songId: song.id,
+          outcome: "cancelled",
+          message: "分離流程結束並釋放資源鎖定。",
+        });
       }
     }
   };
@@ -1656,6 +2165,12 @@ export function BandMixer() {
   };
 
   const downloadStem = (song: BandSong, stemId: string) => {
+    if (isFocusLocked()) {
+      const msg = "分離專注模式啟動中，為避免額外記憶體尖峰已暫停大型 WAV 匯出。";
+      showCardFeedback(song.id, msg);
+      showShortcutHint(msg);
+      return;
+    }
     const stems = stemResultsRef.current.get(song.id);
     const channel = song.stemChannels.find((item) => item.id === stemId);
     const stem = stems?.tracks.find((item) => item.stemType === channel?.stemType);
@@ -1670,6 +2185,12 @@ export function BandMixer() {
   };
 
   const clearSongCache = async (song: BandSong) => {
+    if (isFocusLocked()) {
+      const msg = "分離進行中暫停清理快取，以確保既有分離快取不被誤刪。";
+      showCardFeedback(song.id, msg);
+      showShortcutHint(msg);
+      return;
+    }
     if (!song.cacheKey) {
       showCardFeedback(song.id, "目前已無本機分軌快取。");
       return;
@@ -1681,6 +2202,10 @@ export function BandMixer() {
   };
 
   const clearAllSeparationCache = async () => {
+    if (isFocusLocked()) {
+      showShortcutHint("分離專注模式啟動中，暫停清理分離快取。");
+      return;
+    }
     await clearAllCachedStemSets().catch(() => undefined);
     setSession((previous) => ({
       ...previous,
@@ -1700,6 +2225,13 @@ export function BandMixer() {
     separationTokensRef.current.delete(song.id);
     sharedSeparationCoordinator.invalidateSongGeneration(song.id);
     void sharedSeparationCoordinator.cancelTask(song.id, "歌曲已移除，中止進行中的分離任務。", 0);
+    if (separationFocusRef.current?.songId === song.id && separationFocusRef.current.active) {
+      void finishSeparationFocus({
+        songId: song.id,
+        outcome: "cancelled",
+        message: "歌曲已移除並中止分離，解除資源鎖定。",
+      });
+    }
     cancelPendingSongPersist(song.id);
     persistedMetaBySongIdRef.current.delete(song.id);
     const ids = [song.sourceAudioId, ...song.stemIds];
@@ -1782,6 +2314,11 @@ export function BandMixer() {
     const action = resolveShortcutAction(event);
     if (!action) return;
     event.preventDefault();
+
+    if (isFocusLocked()) {
+      showShortcutHint("目前處於分離專注模式，已暫停播放（Space）與所有高負載音訊快捷鍵操作。");
+      return;
+    }
 
     if (action === "open-upload") {
       if (!loading) fileInputRef.current?.click();
@@ -1868,6 +2405,20 @@ export function BandMixer() {
 
   const selectedSongs = session.songs.filter((song) => song.selected);
   const hasMultipleSelectedSongs = selectedSongs.length > 1;
+  const focusLocked = Boolean(separationFocus?.active);
+  const focusAbortSong = separationFocus
+    ? session.songs.find((song) => song.id === separationFocus.songId) ?? null
+    : null;
+  const playSelectedSongs = async () => {
+    if (isFocusLocked()) {
+      showShortcutHint("分離專注模式啟動中，已鎖定批次播放。");
+      return;
+    }
+    for (const target of selectedSongs) {
+      if (isFocusLocked()) break;
+      await playSong(target);
+    }
+  };
 
   return (
     <div className={`grid mixer-shell${hasMultipleSelectedSongs ? " has-selected" : ""}`} style={{ gap: 16 }}>
@@ -1875,9 +2426,15 @@ export function BandMixer() {
         <button
           type="button"
           className={`btn mixer-button primary${loading ? " is-loading" : ""}`}
-          disabled={loading}
+          disabled={loading || focusLocked}
           aria-busy={loading}
-          title={loading ? "正在讀取與解碼音檔，請稍候" : undefined}
+          title={
+            focusLocked
+              ? "分離專注模式啟動中，暫停載入與解碼新音檔"
+              : loading
+                ? "正在讀取與解碼音檔，請稍候"
+                : undefined
+          }
           onClick={() => fileInputRef.current?.click()}
         >
           {loading ? (
@@ -1954,6 +2511,108 @@ export function BandMixer() {
           <span>{restoringMessage || "正在恢復先前保存的歌曲…"}</span>
         </div>
       )}
+
+      {separationFocus && (() => {
+        const isRunning = separationFocus.active;
+        const isCancelling = separationFocus.outcome === "cancelling";
+        const hasDeterminate =
+          isRunning
+          && !isCancelling
+          && typeof separationFocus.progress === "number"
+          && Number.isFinite(separationFocus.progress)
+          && separationFocus.progress > 0
+          && separationFocus.progress < 1;
+        const pct = hasDeterminate ? Math.round((separationFocus.progress ?? 0) * 100) : null;
+        const bannerStateClass =
+          separationFocus.outcome === "failed"
+            ? " is-failed"
+            : separationFocus.outcome === "cancelling"
+              ? " is-cancelling"
+              : separationFocus.outcome === "completed"
+                ? " is-completed"
+                : "";
+        return (
+          <section
+            role="status"
+            aria-live="polite"
+            aria-label="音源分離專注模式狀態"
+            className={`card mixer-focus-banner${bannerStateClass}`}
+          >
+            <div className="row" style={{ gap: 12, alignItems: "center", justifyContent: "space-between", flexWrap: "wrap" }}>
+              <div className="row" style={{ gap: 10, alignItems: "center", flex: "1 1 220px", minWidth: 0 }}>
+                {isRunning && <span className="mixer-spinner" aria-hidden="true" />}
+                <div className="grid" style={{ gap: 3, minWidth: 0 }}>
+                  <strong style={{ fontSize: 14 }}>
+                    分離專注模式｜{separationFocus.songName}
+                  </strong>
+                  <span className="small" style={{ color: "#e2e8f0" }}>
+                    目前階段：{formatSeparationFocusStageLabel(separationFocus.stage)}
+                    {pct !== null ? `（${pct}%）` : ""}
+                  </span>
+                </div>
+              </div>
+              {isRunning ? (
+                <button
+                  type="button"
+                  className="btn mixer-abort-button"
+                  disabled={isCancelling || !focusAbortSong}
+                  aria-label={isCancelling ? "正在中止音源分離" : `中止「${separationFocus.songName}」音源分離`}
+                  onClick={() => {
+                    if (focusAbortSong) void abortSongSeparation(focusAbortSong);
+                  }}
+                >
+                  <FocusAbortIcon />
+                  <span>{isCancelling ? "正在停止…" : "中止分離"}</span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="btn mixer-button"
+                  style={{ minHeight: 44, padding: "6px 14px", fontSize: 13 }}
+                  onClick={() => setSeparationFocusState(null)}
+                >
+                  關閉狀態列
+                </button>
+              )}
+            </div>
+
+            {isRunning && (
+              <div
+                role="progressbar"
+                aria-label="分離專注模式進度"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={pct ?? undefined}
+                className={`mixer-progress-track${hasDeterminate ? "" : " is-indeterminate"}`}
+              >
+                <div
+                  className="mixer-progress-fill"
+                  style={pct !== null ? { width: `${pct}%` } : undefined}
+                />
+              </div>
+            )}
+
+            <p className="small" style={{ margin: 0, color: "#cbd5e1" }}>
+              {separationFocus.message}
+            </p>
+
+            {isRunning && (
+              <p className="small" style={{ margin: 0, color: "#bae6fd" }}>
+                已暫停音訊播放以降低資源負擔，並鎖定變速、升降 Key、匯出 WAV 與啟動新播放；原有設定與播放位置將於結束後完整保留（維持暫停，不會自動發聲）。
+                {separationFocus.pausedSongNames.length > 0
+                  ? ` 已暫停：${separationFocus.pausedSongNames.join("、")}。`
+                  : ""}
+              </p>
+            )}
+
+            {separationFocus.diagnosticsSummary && (
+              <p className="small" style={{ margin: 0, color: "#94a3b8" }}>
+                效能診斷：{separationFocus.diagnosticsSummary}
+              </p>
+            )}
+          </section>
+        );
+      })()}
 
       {restoreError && (
         <div role="alert" className="card card-error-banner">
@@ -2032,10 +2691,10 @@ export function BandMixer() {
                 啟用持久儲存保護
               </button>
             )}
-            <button type="button" className="btn mixer-button" onClick={() => void releaseIdleResources()}>🧹 釋放閒置資源</button>
-            <button type="button" className="btn mixer-button" onClick={() => void handleClearUnusedSeparationCaches()}>清除未使用快取</button>
-            <button type="button" className="btn mixer-button" onClick={() => void clearAllSeparationCache()}>清理分離結果</button>
-            <button type="button" className="btn mixer-button" onClick={() => void clearModelCache().then(refreshCacheStats)}>清理模型快取</button>
+            <button type="button" className="btn mixer-button" disabled={focusLocked} onClick={() => void releaseIdleResources()}>🧹 釋放閒置資源</button>
+            <button type="button" className="btn mixer-button" disabled={focusLocked} onClick={() => void handleClearUnusedSeparationCaches()}>清除未使用快取</button>
+            <button type="button" className="btn mixer-button" disabled={focusLocked} onClick={() => void clearAllSeparationCache()}>清理分離結果</button>
+            <button type="button" className="btn mixer-button" disabled={focusLocked} onClick={() => void clearModelCache().then(refreshCacheStats)}>清理模型快取</button>
             <button type="button" className="btn mixer-button" onClick={() => void refreshCacheStats()}>重新整理</button>
           </div>
           <div className="small" style={{ opacity: 0.78, marginTop: 8 }}>
@@ -2069,24 +2728,42 @@ export function BandMixer() {
             icon="▶"
             label="播放所選歌曲"
             primary={selectedSongs.length > 0}
-            disabled={!selectedSongs.length}
-            disabledReason={!selectedSongs.length ? "請先勾選至少一首歌曲" : undefined}
+            disabled={!selectedSongs.length || focusLocked}
+            disabledReason={
+              focusLocked
+                ? "分離專注模式啟動中，已暫停播放與批次啟動"
+                : !selectedSongs.length
+                  ? "請先勾選至少一首歌曲"
+                  : undefined
+            }
             className="is-compact"
-            onClick={() => void Promise.all(selectedSongs.map(playSong))}
+            onClick={() => void playSelectedSongs()}
           />
           <IconActionButton
             icon="⏸"
             label="暫停所選歌曲"
-            disabled={!selectedSongs.length}
-            disabledReason={!selectedSongs.length ? "請先勾選至少一首歌曲" : undefined}
+            disabled={!selectedSongs.length || focusLocked}
+            disabledReason={
+              focusLocked
+                ? "分離專注模式啟動中，所有歌曲皆已暫停"
+                : !selectedSongs.length
+                  ? "請先勾選至少一首歌曲"
+                  : undefined
+            }
             className="is-compact"
             onClick={() => selectedSongs.forEach(pauseSong)}
           />
           <IconActionButton
             icon="■"
             label="停止所選歌曲"
-            disabled={!selectedSongs.length}
-            disabledReason={!selectedSongs.length ? "請先勾選至少一首歌曲" : undefined}
+            disabled={!selectedSongs.length || focusLocked}
+            disabledReason={
+              focusLocked
+                ? "分離專注模式啟動中，已鎖定停止以保留還原位置"
+                : !selectedSongs.length
+                  ? "請先勾選至少一首歌曲"
+                  : undefined
+            }
             className="is-compact"
             onClick={() => selectedSongs.forEach(stopSong)}
           />
@@ -2126,6 +2803,7 @@ export function BandMixer() {
                 isDragging={draggingId === song.id}
                 isActive={selection.songId === song.id}
                 isStartingPlayback={startingSongIds.has(song.id)}
+                separationFocusLocked={focusLocked}
                 playbackError={playbackErrors[song.id] ?? null}
                 actionFeedback={cardFeedbacks[song.id] ?? null}
                 selectedStemId={selection.songId === song.id ? selection.stemId : null}

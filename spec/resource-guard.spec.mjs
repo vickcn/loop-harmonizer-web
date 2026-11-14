@@ -9,8 +9,15 @@ import {
   PerformanceTelemetryTracker,
   ResourceProfileStateManager,
   selectDeviceResourceProfile,
+  shouldEnterSeparationFocusMode,
 } from "../lib/band/resourceGuard.ts";
-import { restoreBandSongFromRecord, serializePersistedSong, createBandSong } from "../lib/band/songModel.ts";
+import {
+  createBandSong,
+  createSeparationFocusSessionSnapshot,
+  restoreBandSongFromRecord,
+  restoreSongsAfterSeparationFocus,
+  serializePersistedSong,
+} from "../lib/band/songModel.ts";
 
 function makeCap(overrides = {}) {
   return {
@@ -289,10 +296,40 @@ test("enforces worker availability, global Demucs concurrency = 1, memory budget
     estimatedTaskMemoryBytes: 0,
     projectedActiveSoundTouchTracks: constrainedProfile.maxActiveSoundTouchTracks + 2,
   });
-  assert.equal(soundtouchOverload.allowed, true);
+  assert.equal(soundtouchOverload.allowed, false);
   assert.equal(soundtouchOverload.requiresWarning, true);
   assert.equal(soundtouchOverload.hardRejected, false);
   assert.equal(soundtouchOverload.rejectionReason, "soundtouch-track-pressure");
+
+  const soundtouchFocusLocked = evaluateTaskAdmission({
+    operation: "soundtouch-playback",
+    profile: desktopProfile,
+    capabilities: perfCap,
+    estimatedTaskMemoryBytes: 0,
+    projectedActiveSoundTouchTracks: 1,
+    separationFocusActive: true,
+  });
+  assert.equal(soundtouchFocusLocked.allowed, false);
+  assert.equal(soundtouchFocusLocked.hardRejected, true);
+  assert.equal(soundtouchFocusLocked.rejectionReason, "separation-focus-locked");
+
+  const soundtouchStressBlocked = evaluateTaskAdmission({
+    operation: "soundtouch-playback",
+    profile: desktopProfile,
+    capabilities: perfCap,
+    estimatedTaskMemoryBytes: 0,
+    projectedActiveSoundTouchTracks: 2,
+    performanceSignals: {
+      longTaskSupported: true,
+      longTaskCount: 4,
+      maxLongTaskDurationMs: 180,
+      lastSeparationDurationMs: null,
+      lastDecodeDurationMs: null,
+      audioUnderrunCount: 2,
+    },
+  });
+  assert.equal(soundtouchStressBlocked.allowed, false);
+  assert.equal(soundtouchStressBlocked.rejectionReason, "soundtouch-track-pressure");
 });
 
 test("profile state manager degrades on stress, blocks unverified auto-upgrade, and reevaluates after cleanup", () => {
@@ -368,4 +405,86 @@ test("profile state manager degrades on stress, blocks unverified auto-upgrade, 
   });
   assert.equal(verifiedCleanup.upgraded, true);
   assert.equal(verifiedCleanup.profile.tier, "performance");
+});
+
+test("separation focus mode triggers on constrained devices, stress, budget overflow, or user opt-in without forcing high-end desktop pause", () => {
+  const androidConstrained = selectDeviceResourceProfile({
+    capabilities: makeCap({ deviceMemoryGb: 3, hardwareConcurrency: 4, formFactorHint: "mobile", supportsWebGpu: false }),
+  });
+  const desktopPerf = selectDeviceResourceProfile({
+    capabilities: makeCap({ deviceMemoryGb: 16, hardwareConcurrency: 12, formFactorHint: "desktop", supportsWebGpu: true }),
+  });
+
+  const onAndroid = shouldEnterSeparationFocusMode({
+    profile: androidConstrained,
+    estimatedSeparationMemoryBytes: 320 * 1024 * 1024,
+    activeSoundTouchTracks: 0,
+  });
+  assert.equal(onAndroid.enabled, true);
+
+  const onHealthyDesktop = shouldEnterSeparationFocusMode({
+    profile: desktopPerf,
+    estimatedSeparationMemoryBytes: 360 * 1024 * 1024,
+    inMemoryAudioBytes: 80 * 1024 * 1024,
+    activeSoundTouchTracks: 1,
+    performanceSignals: {
+      longTaskSupported: true,
+      longTaskCount: 0,
+      maxLongTaskDurationMs: 0,
+      lastSeparationDurationMs: null,
+      lastDecodeDurationMs: null,
+      audioUnderrunCount: 0,
+    },
+  });
+  assert.equal(onHealthyDesktop.enabled, false);
+
+  const onDesktopStress = shouldEnterSeparationFocusMode({
+    profile: desktopPerf,
+    estimatedSeparationMemoryBytes: 300 * 1024 * 1024,
+    performanceSignals: {
+      longTaskSupported: true,
+      longTaskCount: 3,
+      maxLongTaskDurationMs: 220,
+      lastSeparationDurationMs: null,
+      lastDecodeDurationMs: null,
+      audioUnderrunCount: 1,
+    },
+  });
+  assert.equal(onDesktopStress.enabled, true);
+
+  const onDesktopBudgetExceeded = shouldEnterSeparationFocusMode({
+    profile: desktopPerf,
+    estimatedSeparationMemoryBytes: desktopPerf.workingMemoryBudgetBytes + 32 * 1024 * 1024,
+    inMemoryAudioBytes: 0,
+    activeSoundTouchTracks: 1,
+  });
+  assert.equal(onDesktopBudgetExceeded.enabled, true);
+
+  const onDesktopUserOptIn = shouldEnterSeparationFocusMode({
+    profile: desktopPerf,
+    estimatedSeparationMemoryBytes: 280 * 1024 * 1024,
+    userSelectedPausePlayback: true,
+  });
+  assert.equal(onDesktopUserOptIn.enabled, true);
+});
+
+test("telemetry tracker records main-thread stages, long tasks, and abort latency diagnostics", async () => {
+  const tracker = new PerformanceTelemetryTracker();
+  tracker.beginMainThreadStage("compute-input-rms");
+  tracker.recordLongTaskEntry(245, "self");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  tracker.endMainThreadStage("compute-input-rms");
+  tracker.markAbortRequested();
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  const latency = tracker.markAbortSettled();
+  assert.ok(latency !== null && latency >= 0);
+
+  const report = tracker.getDiagnosticsReport();
+  assert.equal(report.longTaskCount, 1);
+  assert.equal(report.maxLongTaskDurationMs, 245);
+  assert.equal(report.recentLongTasks[0].stage, "compute-input-rms");
+  assert.equal(report.recentStages[0].stage, "compute-input-rms");
+  assert.equal(report.lastAbortLatencyMs, latency);
+  assert.ok(report.summary.includes("245 ms"));
+  assert.ok(report.summary.includes("最近中止回應延遲"));
 });

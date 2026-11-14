@@ -1,5 +1,7 @@
 import type {
   BandSong,
+  SeparationFocusSessionSnapshot,
+  SeparationFocusSongEntry,
   SongAudioLoadState,
   SongOperationSnapshot,
   SongPlaybackSource,
@@ -378,6 +380,95 @@ export function applySongOperationSnapshot(
     separationProgress: 0,
     separationStage: "idle",
   };
+}
+
+export function createSeparationFocusSessionSnapshot(
+  songs: readonly BandSong[],
+  targetSongId: string,
+  reasons: readonly string[],
+  playheadOverrides?: Record<string, number>,
+): SeparationFocusSessionSnapshot {
+  const target = songs.find((item) => item.id === targetSongId);
+  const pausedSongIds: string[] = [];
+  const entries: SeparationFocusSongEntry[] = songs.map((song) => {
+    const playhead = playheadOverrides && Number.isFinite(playheadOverrides[song.id])
+      ? Math.max(0, playheadOverrides[song.id])
+      : song.playheadSec;
+    const wasPlaying = song.status === "playing";
+    if (wasPlaying) {
+      pausedSongIds.push(song.id);
+    }
+    const baseSnapshot = createSongOperationSnapshot(song, "分離專注模式前工作階段快照");
+    return {
+      songId: song.id,
+      songName: song.name,
+      wasPlaying,
+      previousStatus: song.status,
+      playheadSec: playhead,
+      snapshot: {
+        ...baseSnapshot,
+        playheadSec: playhead,
+      },
+    };
+  });
+
+  return {
+    focusId: `focus_${targetSongId}_${Date.now()}`,
+    targetSongId,
+    targetSongName: target?.name ?? "",
+    createdAt: Date.now(),
+    reasons: [...reasons],
+    pausedSongIds,
+    entries,
+  };
+}
+
+export function restoreSongsAfterSeparationFocus(
+  songs: readonly BandSong[],
+  focusSnapshot: SeparationFocusSessionSnapshot,
+  options: { outcome: "completed" | "cancelled" | "failed" },
+): BandSong[] {
+  const entryMap = new Map(focusSnapshot.entries.map((entry) => [entry.songId, entry]));
+
+  return songs.map((song) => {
+    const entry = entryMap.get(song.id);
+    if (!entry) {
+      return song.status === "playing" ? { ...song, status: "paused" } : song;
+    }
+
+    const safeStatus = entry.wasPlaying || entry.previousStatus === "playing"
+      ? "paused"
+      : entry.previousStatus;
+
+    if (song.id === focusSnapshot.targetSongId && (options.outcome === "cancelled" || options.outcome === "failed")) {
+      const reverted = applySongOperationSnapshot(song, entry.snapshot);
+      return {
+        ...reverted,
+        status: safeStatus,
+        playheadSec: entry.playheadSec,
+        separationStatus: options.outcome,
+        separationStage: options.outcome,
+        separationProgress: 0,
+        separationMessage: song.separationMessage,
+      };
+    }
+
+    return {
+      ...song,
+      status: safeStatus,
+      playheadSec: entry.playheadSec,
+      targetBpm: entry.snapshot.targetBpm,
+      tempoMode: entry.snapshot.tempoMode,
+      manualRate: entry.snapshot.manualRate,
+      fineRateOffset: entry.snapshot.fineRateOffset,
+      keyShiftSemitones: entry.snapshot.keyShiftSemitones,
+      masterVolume: entry.snapshot.masterVolume,
+      stemChannels:
+        song.id === focusSnapshot.targetSongId && options.outcome === "completed"
+          ? song.stemChannels
+          : entry.snapshot.stemChannels.map((ch) => ({ ...ch })),
+    };
+  });
 }
 
 export function findUnusedSeparationRecordKeys(

@@ -16,6 +16,8 @@ const STEM_LABELS: Record<string, string> = {
 type Props = {
   channels: StemChannel[];
   selectedStemId?: string | null;
+  exportLocked?: boolean;
+  exportDisabledReason?: string;
   onSelectStem?: (id: string) => void;
   onToggleMute?: (id: string) => void;
   onToggleSolo?: (id: string) => void;
@@ -26,6 +28,8 @@ type Props = {
 export const StemMixer = memo(function StemMixer({
   channels,
   selectedStemId,
+  exportLocked = false,
+  exportDisabledReason,
   onSelectStem,
   onToggleMute,
   onToggleSolo,
@@ -118,11 +122,15 @@ export const StemMixer = memo(function StemMixer({
                 {
                   key: "download",
                   label: `下載 ${label} WAV`,
+                  disabled: exportLocked,
+                  disabledReason: exportLocked ? exportDisabledReason : undefined,
                   onSelect: () => onDownload(channel.id),
                   renderInline: () => (
                     <IconActionButton
                       icon="↓"
                       label={`下載 ${label} WAV`}
+                      disabled={exportLocked}
+                      disabledReason={exportLocked ? exportDisabledReason : undefined}
                       className="is-compact"
                       onClick={() => onDownload(channel.id)}
                     />

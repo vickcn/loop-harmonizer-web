@@ -63,6 +63,8 @@ export type TaskAdmissionInput = {
   runningDemucsCount?: number;
   projectedActiveSoundTouchTracks?: number;
   requireWorkerForSeparation?: boolean;
+  separationFocusActive?: boolean;
+  performanceSignals?: PerformanceSignals;
 };
 
 export type TaskAdmissionDecision = {
@@ -70,6 +72,7 @@ export type TaskAdmissionDecision = {
   requiresWarning: boolean;
   hardRejected: boolean;
   rejectionReason:
+    | "separation-focus-locked"
     | "worker-unavailable"
     | "demucs-concurrency-limit"
     | "exceeds-working-memory-budget"
@@ -77,6 +80,38 @@ export type TaskAdmissionDecision = {
     | "soundtouch-track-pressure"
     | null;
   message: string;
+};
+
+export type SeparationFocusCheckInput = {
+  profile: DeviceResourceProfile;
+  performanceSignals?: PerformanceSignals;
+  estimatedSeparationMemoryBytes: number;
+  inMemoryAudioBytes?: number;
+  activeSoundTouchTracks?: number;
+  userSelectedPausePlayback?: boolean;
+};
+
+export type SeparationFocusDecision = {
+  enabled: boolean;
+  reasons: string[];
+};
+
+export type LongTaskDiagnosticEntry = {
+  at: number;
+  durationMs: number;
+  name: string;
+  stage: string | null;
+};
+
+export type PerformanceDiagnosticsReport = {
+  longTaskCount: number;
+  maxLongTaskDurationMs: number;
+  audioUnderrunCount: number;
+  activeMainThreadStage: string | null;
+  lastAbortLatencyMs: number | null;
+  recentLongTasks: LongTaskDiagnosticEntry[];
+  recentStages: Array<{ stage: string; durationMs: number; endedAt: number }>;
+  summary: string;
 };
 
 export type LowLoadActionId =
@@ -492,10 +527,59 @@ export class ResourceProfileStateManager {
 
 export const sharedResourceProfileManager = new ResourceProfileStateManager();
 
+export function shouldEnterSeparationFocusMode(input: SeparationFocusCheckInput): SeparationFocusDecision {
+  const reasons: string[] = [];
+  const signals = input.performanceSignals;
+
+  if (input.profile.tier === "constrained") {
+    reasons.push("目前裝置資源配置為 constrained，分離期間必須暫停背景 SoundTouch 播放以防止尖銳雜音與卡頓。");
+  }
+
+  if (
+    signals
+    && (signals.longTaskCount >= 3 || signals.maxLongTaskDurationMs >= 200 || (signals.audioUnderrunCount ?? 0) >= 1)
+  ) {
+    reasons.push(
+      `已偵測到主執行緒阻塞或音訊欠載（Long Tasks: ${signals.longTaskCount}, max: ${Math.round(signals.maxLongTaskDurationMs)} ms, Underruns: ${signals.audioUnderrunCount ?? 0}），啟用分離專注模式保護播放品質。`,
+    );
+  }
+
+  const activeStTracks = Math.max(0, input.activeSoundTouchTracks ?? 0);
+  const projectedWorkingSet =
+    Math.max(0, input.inMemoryAudioBytes ?? 0)
+    + Math.max(0, input.estimatedSeparationMemoryBytes)
+    + activeStTracks * 16 * BYTES_PER_MB;
+
+  if (projectedWorkingSet > input.profile.workingMemoryBudgetBytes) {
+    reasons.push(
+      `預估 Demucs 與活躍 SoundTouch 總負載（${formatEstimatedMiB(projectedWorkingSet)}）超出目前 ${input.profile.tier} 預算（${formatEstimatedMiB(input.profile.workingMemoryBudgetBytes)}）。`,
+    );
+  }
+
+  if (input.userSelectedPausePlayback) {
+    reasons.push("使用者已選擇於音源分離期間暫停背景播放。");
+  }
+
+  return {
+    enabled: reasons.length > 0,
+    reasons,
+  };
+}
+
 export function evaluateTaskAdmission(input: TaskAdmissionInput): TaskAdmissionDecision {
   const { profile, capabilities, operation } = input;
   const projectedMem = Math.max(0, input.inMemoryAudioBytes ?? 0) + Math.max(0, input.estimatedTaskMemoryBytes);
   const estStorage = Math.max(0, input.estimatedTaskStorageBytes ?? 0);
+
+  if (input.separationFocusActive) {
+    return {
+      allowed: false,
+      requiresWarning: true,
+      hardRejected: true,
+      rejectionReason: "separation-focus-locked",
+      message: "目前處於分離專注模式，已暫停音訊處理並鎖定高負載操作；請等待分離完成或點擊「中止分離」。",
+    };
+  }
 
   if (operation === "separate") {
     if ((input.runningDemucsCount ?? 0) >= profile.demucsConcurrency) {
@@ -533,11 +617,22 @@ export function evaluateTaskAdmission(input: TaskAdmissionInput): TaskAdmissionD
     const projectedTracks = input.projectedActiveSoundTouchTracks ?? 1;
     if (projectedTracks > profile.maxActiveSoundTouchTracks) {
       return {
-        allowed: true,
+        allowed: false,
         requiresWarning: true,
         hardRejected: false,
         rejectionReason: "soundtouch-track-pressure",
-        message: `同時活躍 SoundTouch 軌道（${projectedTracks} 軌）超出目前 ${profile.tier} 配置建議上限（${profile.maxActiveSoundTouchTracks} 軌），可能發生破音或 CPU 過載；系統將先預警，不會擅自中斷播放中的歌曲。`,
+        message: `同時活躍 SoundTouch 軌道（${projectedTracks} 軌）超出目前 ${profile.tier} 配置建議上限（${profile.maxActiveSoundTouchTracks} 軌），請先暫停其他播放中歌曲後再播放。`,
+      };
+    }
+
+    const sig = input.performanceSignals;
+    if (sig && ((sig.audioUnderrunCount ?? 0) >= 2 || sig.longTaskCount >= 4) && projectedTracks > 1) {
+      return {
+        allowed: false,
+        requiresWarning: true,
+        hardRejected: false,
+        rejectionReason: "soundtouch-track-pressure",
+        message: `裝置目前偵測到嚴重音訊欠載或主執行緒阻塞（Underruns: ${sig.audioUnderrunCount ?? 0}, Long Tasks: ${sig.longTaskCount}），禁止同時開啟多軌 SoundTouch 播放，請先降載或暫停其他歌曲。`,
       };
     }
   }
@@ -546,9 +641,9 @@ export function evaluateTaskAdmission(input: TaskAdmissionInput): TaskAdmissionD
     const isConstrainedHardBlock =
       profile.tier === "constrained"
       && projectedMem > profile.workingMemoryBudgetBytes * 1.35
-      && (operation === "separate" || operation === "decode");
+      && (operation === "separate" || operation === "decode" || operation === "soundtouch-playback");
     return {
-      allowed: !isConstrainedHardBlock,
+      allowed: operation === "soundtouch-playback" ? false : !isConstrainedHardBlock,
       requiresWarning: true,
       hardRejected: isConstrainedHardBlock,
       rejectionReason: "exceeds-working-memory-budget",
@@ -645,6 +740,7 @@ export function assessResourceRisk(input: ResourceRiskAssessmentInput): Resource
     inMemoryAudioBytes: input.estimatedInMemoryAudioBytes,
     runningDemucsCount: input.runningDemucsCount,
     projectedActiveSoundTouchTracks: input.activeSoundTouchTracks,
+    performanceSignals: input.performanceSignals,
   });
   const reasons: string[] = [];
   let score = 0;
@@ -803,6 +899,12 @@ export class PerformanceTelemetryTracker {
   private lastAudioUnderrunAt: number | null = null;
   private longTaskSupported = false;
   private observer: PerformanceObserver | null = null;
+  private recentLongTasks: LongTaskDiagnosticEntry[] = [];
+  private activeMainThreadStage: string | null = null;
+  private activeStageStartedAt: number | null = null;
+  private stageTimings: Array<{ stage: string; durationMs: number; endedAt: number }> = [];
+  private abortRequestedAt: number | null = null;
+  private lastAbortLatencyMs: number | null = null;
 
   startObservingLongTasks(): void {
     if (this.observer) return;
@@ -814,10 +916,7 @@ export class PerformanceTelemetryTracker {
       }
       const obs = new PerformanceObserver((list) => {
         for (const entry of list.getEntries()) {
-          this.longTaskCount += 1;
-          if (entry.duration > this.maxLongTaskDurationMs) {
-            this.maxLongTaskDurationMs = entry.duration;
-          }
+          this.recordLongTaskEntry(entry.duration, entry.name || "self");
         }
       });
       obs.observe({ entryTypes: ["longtask"] });
@@ -833,6 +932,53 @@ export class PerformanceTelemetryTracker {
       try { this.observer.disconnect(); } catch { /* ignore */ }
       this.observer = null;
     }
+  }
+
+  beginMainThreadStage(stage: string): void {
+    this.activeMainThreadStage = stage;
+    this.activeStageStartedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+  }
+
+  endMainThreadStage(stage: string): void {
+    const nowPerf = typeof performance !== "undefined" ? performance.now() : Date.now();
+    if (this.activeMainThreadStage === stage && this.activeStageStartedAt !== null) {
+      const durationMs = Math.max(0, nowPerf - this.activeStageStartedAt);
+      this.stageTimings.push({ stage, durationMs, endedAt: Date.now() });
+      if (this.stageTimings.length > 20) {
+        this.stageTimings.shift();
+      }
+      this.activeMainThreadStage = null;
+      this.activeStageStartedAt = null;
+    }
+  }
+
+  recordLongTaskEntry(durationMs: number, name = "self"): void {
+    if (!Number.isFinite(durationMs) || durationMs < 0) return;
+    this.longTaskCount += 1;
+    if (durationMs > this.maxLongTaskDurationMs) {
+      this.maxLongTaskDurationMs = durationMs;
+    }
+    this.recentLongTasks.push({
+      at: Date.now(),
+      durationMs,
+      name,
+      stage: this.activeMainThreadStage,
+    });
+    if (this.recentLongTasks.length > 20) {
+      this.recentLongTasks.shift();
+    }
+  }
+
+  markAbortRequested(): void {
+    this.abortRequestedAt = Date.now();
+  }
+
+  markAbortSettled(): number | null {
+    if (this.abortRequestedAt === null) return this.lastAbortLatencyMs;
+    const latency = Math.max(0, Date.now() - this.abortRequestedAt);
+    this.lastAbortLatencyMs = latency;
+    this.abortRequestedAt = null;
+    return latency;
   }
 
   recordSeparationDuration(ms: number): void {
@@ -856,6 +1002,39 @@ export class PerformanceTelemetryTracker {
     this.longTaskCount = 0;
     this.maxLongTaskDurationMs = 0;
     this.audioUnderrunCount = 0;
+    this.recentLongTasks = [];
+  }
+
+  getDiagnosticsReport(): PerformanceDiagnosticsReport {
+    const longestStage = this.stageTimings.reduce<{ stage: string; durationMs: number; endedAt: number } | null>(
+      (best, cur) => (!best || cur.durationMs > best.durationMs ? cur : best),
+      null,
+    );
+    const taggedLongTask = [...this.recentLongTasks].reverse().find((item) => Boolean(item.stage));
+    const parts = [
+      `Long Tasks: ${this.longTaskCount}（最長 ${Math.round(this.maxLongTaskDurationMs)} ms）`,
+      `Underruns: ${this.audioUnderrunCount}`,
+    ];
+    if (this.activeMainThreadStage) {
+      parts.push(`卡頓進行中階段：${this.activeMainThreadStage}`);
+    } else if (taggedLongTask?.stage) {
+      parts.push(`最近卡頓階段：${taggedLongTask.stage}（${Math.round(taggedLongTask.durationMs)} ms）`);
+    } else if (longestStage) {
+      parts.push(`最耗時主執行緒階段：${longestStage.stage}（${Math.round(longestStage.durationMs)} ms）`);
+    }
+    if (this.lastAbortLatencyMs !== null) {
+      parts.push(`最近中止回應延遲：${Math.round(this.lastAbortLatencyMs)} ms`);
+    }
+    return {
+      longTaskCount: this.longTaskCount,
+      maxLongTaskDurationMs: this.maxLongTaskDurationMs,
+      audioUnderrunCount: this.audioUnderrunCount,
+      activeMainThreadStage: this.activeMainThreadStage,
+      lastAbortLatencyMs: this.lastAbortLatencyMs,
+      recentLongTasks: [...this.recentLongTasks],
+      recentStages: [...this.stageTimings],
+      summary: parts.join(" ｜ "),
+    };
   }
 
   getSignals(): PerformanceSignals {

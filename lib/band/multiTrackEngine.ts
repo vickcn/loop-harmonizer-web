@@ -270,13 +270,76 @@ export class MultiTrackEngine {
     for (const bus of this.stemMixBuses.values()) {
       if (bus.isPlaying) count += 1;
     }
-    for (const track of this.tracks.values()) {
+    for (const [trackId, track] of this.tracks.entries()) {
       if (track.isPlaying && track.playbackMode === "soundtouch") {
-        const groupId = [...this.trackToMixGroup.entries()].find(([, gid]) => this.stemMixBuses.get(gid)?.trackIds.some((id) => this.tracks.get(id) === track));
-        if (!groupId) count += 1;
+        const groupId = this.trackToMixGroup.get(trackId);
+        if (!groupId || !this.stemMixBuses.get(groupId)) count += 1;
       }
     }
     return count;
+  }
+
+  hasActivePlayback(): boolean {
+    for (const bus of this.stemMixBuses.values()) {
+      if (bus.isPlaying) return true;
+    }
+    for (const track of this.tracks.values()) {
+      if (track.isPlaying) return true;
+    }
+    return false;
+  }
+
+  getProjectedSoundTouchCount(additionalTrackIds: string[]): number {
+    const activeBuses = new Set<string>();
+    const activeStandalone = new Set<string>();
+    for (const [groupId, bus] of this.stemMixBuses.entries()) {
+      if (bus.isPlaying) activeBuses.add(groupId);
+    }
+    for (const [trackId, track] of this.tracks.entries()) {
+      if (track.isPlaying && track.playbackMode === "soundtouch") {
+        const groupId = this.trackToMixGroup.get(trackId);
+        if (!groupId || !this.stemMixBuses.get(groupId)) {
+          activeStandalone.add(trackId);
+        }
+      }
+    }
+    const { buses, standalone } = this._resolvePlaybackTargets(additionalTrackIds);
+    for (const bus of buses) {
+      activeBuses.add(bus.groupId);
+    }
+    for (const { id, track } of standalone) {
+      if (track.playbackMode === "soundtouch") {
+        activeStandalone.add(id);
+      }
+    }
+    return activeBuses.size + activeStandalone.size;
+  }
+
+  /**
+   * 真正暫停所有播放中的匯流排與獨立音軌（斷開 SoundTouch ScriptProcessorNode，不使用 mute 代替 pause）。
+   */
+  pauseAllActivePlayback(): { pausedTrackIds: string[]; positionsByTrackId: Record<string, number> } {
+    const activeIds = new Set<string>();
+    const positionsByTrackId: Record<string, number> = {};
+
+    for (const bus of this.stemMixBuses.values()) {
+      if (!bus.isPlaying) continue;
+      for (const id of bus.trackIds) {
+        activeIds.add(id);
+        positionsByTrackId[id] = this.getTrackPosition(id);
+      }
+    }
+    for (const [trackId, track] of this.tracks.entries()) {
+      if (!track.isPlaying) continue;
+      activeIds.add(trackId);
+      positionsByTrackId[trackId] = this.getTrackPosition(trackId);
+    }
+
+    const pausedTrackIds = [...activeIds];
+    if (pausedTrackIds.length > 0) {
+      this.pauseTracks(pausedTrackIds);
+    }
+    return { pausedTrackIds, positionsByTrackId };
   }
 
   /**

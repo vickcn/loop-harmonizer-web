@@ -69,7 +69,8 @@ export function ResourceGuardModal({
   const hasSuggestions = (assessment?.lowLoadSuggestions.length ?? 0) > 0;
   const networkBlocked = Boolean(networkEvaluation && !networkEvaluation.allowed);
   const admissionHardBlocked = Boolean(assessment?.admission.hardRejected);
-  const hardBlocked = networkBlocked || admissionHardBlocked;
+  const canBypassWithoutReduction = assessment ? assessment.admission.allowed : true;
+  const hardBlocked = networkBlocked || admissionHardBlocked || (!canBypassWithoutReduction && !hasSuggestions);
 
   const toggleSuggestion = (id: LowLoadActionId) => {
     setSelectedLowLoad((prev) => {
@@ -208,17 +209,19 @@ export function ResourceGuardModal({
           </button>
           {!hardBlocked && (
             <>
-              <button
-                type="button"
-                className="btn mixer-button"
-                onClick={() =>
-                  onConfirm({
-                    applyLowLoadActions: [],
-                  })
-                }
-              >
-                直接繼續執行
-              </button>
+              {canBypassWithoutReduction && (
+                <button
+                  type="button"
+                  className="btn mixer-button"
+                  onClick={() =>
+                    onConfirm({
+                      applyLowLoadActions: [],
+                    })
+                  }
+                >
+                  直接繼續執行
+                </button>
+              )}
               {hasSuggestions && (
                 <button
                   type="button"

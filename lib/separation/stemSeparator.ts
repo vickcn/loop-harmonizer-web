@@ -14,6 +14,7 @@ import {
   sharedNetworkBudgetLedger,
   type NetworkBatchEvaluation,
 } from "@/lib/band/networkBudgetGuard";
+import { sharedPerfTelemetry } from "@/lib/band/resourceGuard";
 import {
   isAbortError,
   SeparationAbortError,
@@ -171,47 +172,68 @@ async function loadRuntime(maxThreads?: number): Promise<Runtime> {
   return runtimePromise;
 }
 
-function computeRms(data: Float32Array): number {
+async function yieldToMainThread(): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, 0);
+  });
+}
+
+async function computeRmsAsync(data: Float32Array, signal?: AbortSignal): Promise<number> {
   if (data.length === 0) return 0;
+  const CHUNK_SIZE = 262_144;
   let sumSq = 0;
-  for (let i = 0; i < data.length; i += 1) {
-    const v = data[i];
-    sumSq += v * v;
+  for (let offset = 0; offset < data.length; offset += CHUNK_SIZE) {
+    if (signal?.aborted) throw new SeparationAbortError();
+    const end = Math.min(data.length, offset + CHUNK_SIZE);
+    for (let i = offset; i < end; i += 1) {
+      const v = data[i];
+      sumSq += v * v;
+    }
+    if (end < data.length) {
+      await yieldToMainThread();
+    }
   }
   return Math.sqrt(sumSq / data.length);
 }
 
-function validateSeparatedResult(
+async function validateSeparatedResultAsync(
   result: FourStemResult,
-  inputLeft: Float32Array,
-  inputRight: Float32Array,
-): void {
+  inputRms: number,
+  controller: SeparationTaskController,
+): Promise<void> {
   const stems = [
     ["vocals", result.vocals],
     ["drums", result.drums],
     ["bass", result.bass],
     ["other", result.other],
   ] as const;
+  const CHUNK_SIZE = 262_144;
 
   let combinedEnergy = 0;
   for (const [name, stem] of stems) {
     for (const ch of [stem.left, stem.right]) {
       let chSumSq = 0;
-      for (let i = 0; i < ch.length; i += 1) {
-        const v = ch[i];
-        if (!Number.isFinite(v)) {
-          throw new Error(`分離輸出（${name}）包含無效數值 (NaN/Infinity)。`);
+      for (let offset = 0; offset < ch.length; offset += CHUNK_SIZE) {
+        controller.throwIfAborted();
+        const end = Math.min(ch.length, offset + CHUNK_SIZE);
+        for (let i = offset; i < end; i += 1) {
+          const v = ch[i];
+          if (!Number.isFinite(v)) {
+            throw new Error(`分離輸出（${name}）包含無效數值 (NaN/Infinity)。`);
+          }
+          if (Math.abs(v) > 4.0) {
+            throw new Error(`分離輸出（${name}）峰值異常 (${Math.abs(v).toFixed(2)})。`);
+          }
+          chSumSq += v * v;
         }
-        if (Math.abs(v) > 4.0) {
-          throw new Error(`分離輸出（${name}）峰值異常 (${Math.abs(v).toFixed(2)})。`);
+        if (end < ch.length) {
+          await yieldToMainThread();
         }
-        chSumSq += v * v;
       }
       combinedEnergy += ch.length > 0 ? chSumSq / ch.length : 0;
     }
   }
 
-  const inputRms = Math.max(computeRms(inputLeft), computeRms(inputRight));
   const combinedRms = Math.sqrt(combinedEnergy);
   if (inputRms > 1e-4 && combinedRms < 1e-5) {
     throw new Error("分離輸出幾乎為靜音，推論結果無效。");
@@ -300,12 +322,13 @@ async function runSeparationInWorker(params: {
   right: Float32Array;
   preferWebGpu: boolean;
   maxThreads?: number;
+  preserveInputsForFallback: boolean;
   options: StemSeparationOptions;
 }): Promise<{ backend: SeparationBackend; fourStem: FourStemResult }> {
-  const { controller, modelUrl, preferWebGpu, maxThreads, options } = params;
-  // 預先複製輸入緩衝以便失敗或中止時不依賴已轉移的原始陣列進行能量檢查
-  const workerLeft = new Float32Array(params.left);
-  const workerRight = new Float32Array(params.right);
+  const { controller, modelUrl, preferWebGpu, maxThreads, preserveInputsForFallback, options } = params;
+  // 僅在明確允許 fallback 到其他路徑時才複製緩衝；預設直接轉移緩衝以降低行動裝置記憶體峰值
+  const workerLeft = preserveInputsForFallback ? new Float32Array(params.left) : params.left;
+  const workerRight = preserveInputsForFallback ? new Float32Array(params.right) : params.right;
 
   terminateActiveWorker();
   const worker = new Worker("/vendor/demucs-web/worker.js", { type: "module" });
@@ -556,9 +579,19 @@ export async function separateAudio(
     controller.throwIfAborted();
     controller.updateProgress("preparing", 0.05, "正在將音訊解碼為 44.1 kHz 立體聲…");
     options.onStatus?.("正在將音訊解碼為 44.1 kHz 立體聲…");
-    const decoded = await decodeAudio(file, DEMUCS_SAMPLE_RATE, controller.signal);
+    sharedPerfTelemetry.beginMainThreadStage("decode-audio");
+    const decoded = await decodeAudio(file, DEMUCS_SAMPLE_RATE, controller.signal).finally(() => {
+      sharedPerfTelemetry.endMainThreadStage("decode-audio");
+    });
     decodedLeft = decoded.left;
     decodedRight = decoded.right;
+
+    sharedPerfTelemetry.beginMainThreadStage("compute-input-rms");
+    const inputRms = Math.max(
+      await computeRmsAsync(decodedLeft, controller.signal),
+      await computeRmsAsync(decodedRight, controller.signal),
+    );
+    sharedPerfTelemetry.endMainThreadStage("compute-input-rms");
 
     controller.throwIfAborted();
     controller.updateProgress("downloading", 0.08, "正在準備或下載 Demucs AI 模型…");
@@ -586,6 +619,7 @@ export async function separateAudio(
 
     if (canUseWorker) {
       try {
+        sharedPerfTelemetry.beginMainThreadStage("worker-transfer-and-inference");
         const workerOutput = await runSeparationInWorker({
           controller,
           modelUrl,
@@ -593,10 +627,18 @@ export async function separateAudio(
           right: decodedRight,
           preferWebGpu: preferredBackend === "webgpu",
           maxThreads: options.maxThreads,
+          preserveInputsForFallback: allowMainThread,
           options,
         });
+        sharedPerfTelemetry.endMainThreadStage("worker-transfer-and-inference");
+        if (!allowMainThread) {
+          decodedLeft = null;
+          decodedRight = null;
+        }
         controller.throwIfAborted();
-        validateSeparatedResult(workerOutput.fourStem, decodedLeft, decodedRight);
+        sharedPerfTelemetry.beginMainThreadStage("validate-output");
+        await validateSeparatedResultAsync(workerOutput.fourStem, inputRms, controller);
+        sharedPerfTelemetry.endMainThreadStage("validate-output");
         controller.throwIfAborted();
         const durationMs = (typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt;
         return {
@@ -606,6 +648,8 @@ export async function separateAudio(
           usedWorker: true,
         };
       } catch (workerError) {
+        sharedPerfTelemetry.endMainThreadStage("worker-transfer-and-inference");
+        sharedPerfTelemetry.endMainThreadStage("validate-output");
         if (isAbortError(workerError) || controller.isCancellingOrCancelled()) {
           throw workerError;
         }
@@ -636,9 +680,9 @@ export async function separateAudio(
         controller.throwIfAborted();
         controller.updateProgress("processing", 0.25, `正在以 ${backend === "webgpu" ? "WebGPU" : "WASM"} 分離音源…`);
         options.onStatus?.(`正在以 ${backend === "webgpu" ? "WebGPU" : "WASM"} 分離音源…`);
-        const result = await processor.separate(decodedLeft, decodedRight, { signal: controller.signal });
+        const result = await processor.separate(decodedLeft!, decodedRight!, { signal: controller.signal });
         controller.throwIfAborted();
-        validateSeparatedResult(result, decodedLeft, decodedRight);
+        await validateSeparatedResultAsync(result, inputRms, controller);
         controller.throwIfAborted();
         const durationMs = (typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt;
         return {
@@ -667,12 +711,16 @@ export async function separateAudio(
     decodedLeft = null;
     decodedRight = null;
     separationInProgress = false;
+    terminateActiveWorker();
     if (disposeWhenIdle) {
       disposeWhenIdle = false;
-      terminateActiveWorker();
       await clearCachedProcessor();
     }
   }
+}
+
+export function isSeparatorWorkerActive(): boolean {
+  return activeWorker !== null;
 }
 
 export async function disposeStemSeparator(options?: { revokeModelUrl?: boolean }): Promise<void> {

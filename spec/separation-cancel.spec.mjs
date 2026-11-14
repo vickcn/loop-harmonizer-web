@@ -9,8 +9,10 @@ import {
 import {
   applySongOperationSnapshot,
   createBandSong,
+  createSeparationFocusSessionSnapshot,
   createSongOperationSnapshot,
   findUnusedSeparationRecordKeys,
+  restoreSongsAfterSeparationFocus,
 } from "../lib/band/songModel.ts";
 import { DemucsProcessor } from "../public/vendor/demucs-web/processor.js";
 import { CONSTANTS } from "../public/vendor/demucs-web/constants.js";
@@ -329,4 +331,89 @@ test("operation snapshot restores previous stable source/controls and protects r
   assert.equal(restored.masterVolume, 0.85);
   assert.equal(restored.cacheKey, snapshot.cacheKey);
   assert.equal(restored.stemChannels[0].solo, true);
+});
+
+test("separation focus snapshot restores settings & playhead paused without auto-play and keeps cache intact", () => {
+  const songPlaying = createBandSong({
+    id: "song_a",
+    name: "Track A",
+    sourceAudioId: "song_a_orig",
+    originalBpm: 120,
+    sourceAudioHash: "hash-a",
+  });
+  songPlaying.status = "playing";
+  songPlaying.playheadSec = 41.25;
+  songPlaying.targetBpm = 108;
+  songPlaying.keyShiftSemitones = -2;
+  songPlaying.masterVolume = 0.72;
+
+  const songTarget = createBandSong({
+    id: "song_b",
+    name: "Track B",
+    sourceAudioId: "song_b_orig",
+    originalBpm: 96,
+    sourceAudioHash: "hash-b",
+  });
+  songTarget.status = "playing";
+  songTarget.playheadSec = 18.5;
+  songTarget.playbackSource = "stems";
+  songTarget.separationStatus = "completed";
+  songTarget.cacheKey = "hash-b:browser-demucs-v1:four_stem:v2";
+  songTarget.stemIds = ["song_b_stem_vocals"];
+  songTarget.stemChannels = [
+    { id: "song_b_stem_vocals", songId: "song_b", stemType: "vocals", volume: 0.9, muted: false, solo: false },
+  ];
+
+  const focusSnapshot = createSeparationFocusSessionSnapshot(
+    [songPlaying, songTarget],
+    "song_b",
+    ["constrained tier"],
+    { song_a: 42.5, song_b: 19.0 },
+  );
+  assert.deepEqual(focusSnapshot.pausedSongIds, ["song_a", "song_b"]);
+
+  const dirtyDuringFocus = [
+    { ...songPlaying, status: "paused", targetBpm: 120, keyShiftSemitones: 0, playheadSec: 0 },
+    {
+      ...songTarget,
+      status: "paused",
+      playbackSource: "original",
+      separationStatus: "cancelling",
+      separationMessage: "已中止音源分離，未改動既有設定與快取。",
+    },
+  ];
+
+  const afterCancel = restoreSongsAfterSeparationFocus(dirtyDuringFocus, focusSnapshot, { outcome: "cancelled" });
+  assert.equal(afterCancel[0].status, "paused");
+  assert.equal(afterCancel[0].playheadSec, 42.5);
+  assert.equal(afterCancel[0].targetBpm, 108);
+  assert.equal(afterCancel[0].keyShiftSemitones, -2);
+  assert.equal(afterCancel[0].masterVolume, 0.72);
+
+  assert.equal(afterCancel[1].status, "paused");
+  assert.equal(afterCancel[1].playheadSec, 19.0);
+  assert.equal(afterCancel[1].playbackSource, "stems");
+  assert.equal(afterCancel[1].cacheKey, "hash-b:browser-demucs-v1:four_stem:v2");
+  assert.equal(afterCancel[1].separationStatus, "cancelled");
+  assert.equal(afterCancel[1].separationProgress, 0);
+
+  const afterCompleted = restoreSongsAfterSeparationFocus(
+    [
+      dirtyDuringFocus[0],
+      {
+        ...songTarget,
+        status: "paused",
+        separationStatus: "completed",
+        stemChannels: [
+          { id: "song_b_stem_vocals", songId: "song_b", stemType: "vocals", volume: 1, muted: false, solo: false },
+        ],
+      },
+    ],
+    focusSnapshot,
+    { outcome: "completed" },
+  );
+  assert.equal(afterCompleted[0].status, "paused");
+  assert.equal(afterCompleted[1].status, "paused");
+  assert.equal(afterCompleted[1].playheadSec, 19.0);
+  assert.equal(afterCompleted[1].stemChannels[0].volume, 1);
 });

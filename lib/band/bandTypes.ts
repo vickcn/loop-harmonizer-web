@@ -126,6 +126,25 @@ export type BandTrack = {
   stemMetadata?: StemMetadata;
 };
 
+export type SeparationFocusSongEntry = {
+  songId: string;
+  songName: string;
+  wasPlaying: boolean;
+  previousStatus: TrackStatus;
+  playheadSec: number;
+  snapshot: SongOperationSnapshot;
+};
+
+export type SeparationFocusSessionSnapshot = {
+  focusId: string;
+  targetSongId: string;
+  targetSongName: string;
+  createdAt: number;
+  reasons: string[];
+  pausedSongIds: string[];
+  entries: SeparationFocusSongEntry[];
+};
+
 export type BandSession = {
   id: string;
   songs: BandSong[];
