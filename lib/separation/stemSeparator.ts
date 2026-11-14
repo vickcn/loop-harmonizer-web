@@ -7,7 +7,7 @@ import {
   type SeparatedStemSet,
   type StemSeparationMode,
   type TwoStemPcm,
-} from "./stemTypes";
+} from "./stemTypes.ts";
 import {
   ensureStaticAssetCached,
   inspectStaticAssetCacheStatus,
@@ -15,8 +15,20 @@ import {
   prepareApprovedOrtWasmUrl,
   prepareCachedModelUrl,
   revokeActiveModelObjectUrl,
-} from "@/lib/storage/modelCache";
-import { DEMUCS_MODEL_VERSION } from "@/lib/storage/cacheKeys";
+} from "../storage/modelCache.ts";
+import { DEMUCS_MODEL_VERSION, SEPARATION_PROCESSING_VERSION } from "../storage/cacheKeys.ts";
+import {
+  type SeparationCheckpoint,
+  type SeparationLeaseInfo,
+  buildInitialCheckpoint,
+  createCheckpointTaskId,
+  deleteCheckpointAndChunks,
+  getCheckpoint,
+  saveCheckpoint,
+  updateCheckpointStatus,
+} from "../storage/separationCheckpointStore.ts";
+import { commitChunkAndCheckpointAtomically } from "../storage/separationCheckpointStore.ts";
+import { DEMUCS_STRIDE_SAMPLES, computeTotalChunks } from "../storage/separationChunkStore.ts";
 import {
   DEFAULT_EXTERNAL_CDN_BUDGET_BYTES,
   DEFAULT_NETWORK_BUDGET_BYTES,
@@ -25,14 +37,21 @@ import {
   evaluateNetworkAssetBatch,
   sharedNetworkBudgetLedger,
   type NetworkBatchEvaluation,
-} from "@/lib/band/networkBudgetGuard";
-import { sharedPerfTelemetry } from "@/lib/band/resourceGuard";
+} from "../band/networkBudgetGuard.ts";
+import { sharedPerfTelemetry } from "../band/resourceGuard.ts";
+import {
+  DEFAULT_JOB_HEARTBEAT_MS,
+  getOrCreateTabId,
+  sharedSeparationLeaseManager,
+  validateAndPrepareResume,
+} from "./separationResumeController.ts";
 import {
   isAbortError,
+  isPauseError,
   SeparationAbortError,
   SeparationTaskController,
-} from "./separationTaskController";
-export { DEMUCS_MODEL_VERSION } from "@/lib/storage/cacheKeys";
+} from "./separationTaskController.ts";
+export { DEMUCS_MODEL_VERSION } from "../storage/cacheKeys.ts";
 
 export const DEFAULT_DEMUCS_MODEL_URL =
   "https://huggingface.co/timcsy/demucs-web-onnx/resolve/main/htdemucs_embedded.onnx";
@@ -43,6 +62,23 @@ type SeparationBackend = "webgpu" | "wasm";
 type FourStemResult = FourStemPcm;
 type TwoStemResult = TwoStemPcm;
 
+interface ProcessorChunkEmission {
+  chunkIndex: number;
+  startSample: number;
+  endSample: number;
+  frameCount: number;
+  totalSegments: number;
+  payloadBuffer: ArrayBuffer;
+  overlapCarryBuffer: ArrayBuffer | null;
+}
+
+interface ProcessorStreamResult {
+  streamed: true;
+  paused: boolean;
+  completedChunks: number;
+  totalSegments: number;
+}
+
 type DemucsProcessorLike = {
   session?: { release?: () => Promise<void> | void } | null;
   loadModel: (modelPath: string, options?: { signal?: AbortSignal }) => Promise<void>;
@@ -50,8 +86,17 @@ type DemucsProcessorLike = {
   separate: (
     left: Float32Array,
     right: Float32Array,
-    options?: { signal?: AbortSignal; mode?: StemSeparationMode },
-  ) => Promise<FourStemResult | TwoStemResult>;
+    options?: {
+      signal?: AbortSignal;
+      mode?: StemSeparationMode;
+      startChunkIndex?: number;
+      inputOffsetSample?: number;
+      totalSamples?: number;
+      initialOverlapCarryBuffer?: ArrayBuffer | null;
+      shouldPause?: () => boolean;
+      onChunk?: (chunk: ProcessorChunkEmission) => Promise<void> | void;
+    },
+  ) => Promise<FourStemResult | TwoStemResult | ProcessorStreamResult>;
   onProgress?: (value: { progress: number; currentSegment: number; totalSegments: number }) => void;
   onDownloadProgress?: (loaded: number, total: number) => void;
 };
@@ -83,23 +128,53 @@ type CachedProcessor = {
   processor: DemucsProcessorLike;
 };
 
+export type ChunkCommittedInfo = {
+  checkpoint: SeparationCheckpoint;
+  chunkIndex: number;
+  totalChunks: number;
+};
+
+export type ChunkedSeparationSummary = {
+  taskId: string;
+  mode: StemSeparationMode;
+  sampleRate: number;
+  totalSamples: number;
+  totalChunks: number;
+  committedBytes: number;
+  durationSeconds: number;
+};
+
 export type StemSeparationOptions = {
   mode: StemSeparationMode;
   controller?: SeparationTaskController;
+  songId?: string;
+  sourceAudioHash?: string;
+  checkpointTaskId?: string;
+  userAuthorized?: boolean;
+  forceRecompute?: boolean;
+  preferChunkStreaming?: boolean;
   maxThreads?: number;
   preferWorker?: boolean;
   allowMainThreadLargeInference?: boolean;
   onStatus?: (message: string) => void;
   onDownloadProgress?: (progress: number) => void;
   onProgress?: (progress: number, currentSegment: number, totalSegments: number) => void;
+  onChunkCommitted?: (info: ChunkCommittedInfo) => void;
 };
 
 export type StemSeparationResult = {
   backend: SeparationBackend;
-  stems: SeparatedStemSet;
+  stems?: SeparatedStemSet;
+  chunkedTask?: ChunkedSeparationSummary;
+  paused?: boolean;
+  checkpoint?: SeparationCheckpoint;
   durationMs: number;
   usedWorker: boolean;
 };
+
+function isStreamResult(value: unknown): value is ProcessorStreamResult {
+  return Boolean(value && typeof value === "object" && (value as ProcessorStreamResult).streamed === true);
+}
 
 let runtimePromise: Promise<Runtime> | null = null;
 let cachedProcessor: CachedProcessor | null = null;
@@ -387,16 +462,47 @@ async function runSeparationInWorker(params: {
   preferWebGpu: boolean;
   maxThreads?: number;
   preserveInputsForFallback: boolean;
+  streamChunks: boolean;
+  checkpointTaskId?: string;
+  lease?: SeparationLeaseInfo;
+  startChunkIndex?: number;
+  inputOffsetSample?: number;
+  totalSamples?: number;
+  initialOverlapCarryBuffer?: ArrayBuffer | null;
   options: StemSeparationOptions;
 }): Promise<{
   backend: SeparationBackend;
   fourStem?: FourStemResult;
   twoStem?: TwoStemResult;
+  streamed?: boolean;
+  paused?: boolean;
+  nextChunkIndex?: number;
+  latestCheckpoint?: SeparationCheckpoint;
 }> {
-  const { controller, modelUrl, wasmBinaryUrl, mode, preferWebGpu, maxThreads, preserveInputsForFallback, options } = params;
+  const {
+    controller,
+    modelUrl,
+    wasmBinaryUrl,
+    mode,
+    preferWebGpu,
+    maxThreads,
+    preserveInputsForFallback,
+    streamChunks,
+    checkpointTaskId,
+    lease,
+    startChunkIndex = 0,
+    inputOffsetSample = 0,
+    totalSamples,
+    initialOverlapCarryBuffer = null,
+    options,
+  } = params;
   // 僅在明確允許 fallback 到其他路徑時才複製緩衝；預設直接轉移緩衝以降低行動裝置記憶體峰值
-  const workerLeft = preserveInputsForFallback ? new Float32Array(params.left) : params.left;
-  const workerRight = preserveInputsForFallback ? new Float32Array(params.right) : params.right;
+  let workerLeft: Float32Array | null = preserveInputsForFallback
+    ? new Float32Array(params.left)
+    : params.left;
+  let workerRight: Float32Array | null = preserveInputsForFallback
+    ? new Float32Array(params.right)
+    : params.right;
 
   terminateActiveWorker();
   const worker = new Worker("/vendor/demucs-web/worker.js", { type: "module" });
@@ -406,8 +512,14 @@ async function runSeparationInWorker(params: {
     backend: SeparationBackend;
     fourStem?: FourStemResult;
     twoStem?: TwoStemResult;
+    streamed?: boolean;
+    paused?: boolean;
+    nextChunkIndex?: number;
+    latestCheckpoint?: SeparationCheckpoint;
   }>((resolve, reject) => {
     let settled = false;
+    let latestCheckpoint: SeparationCheckpoint | undefined;
+    let commitChain: Promise<void> = Promise.resolve();
 
     const cleanupWorkerListeners = () => {
       worker.onmessage = null;
@@ -415,7 +527,16 @@ async function runSeparationInWorker(params: {
       worker.onmessageerror = null;
     };
 
+    const unregisterPause = controller.onPauseRequested(() => {
+      try {
+        worker.postMessage({ type: "pause", taskId: controller.taskId });
+      } catch {
+        // ignore pause signal failure
+      }
+    });
+
     const unregister = controller.registerCleanup(async () => {
+      unregisterPause();
       if (!settled) {
         settled = true;
         cleanupWorkerListeners();
@@ -442,20 +563,52 @@ async function runSeparationInWorker(params: {
         message?: string;
         backend?: SeparationBackend;
         mode?: StemSeparationMode;
-        details?: { currentSegment?: number; totalSegments?: number; downloadLoadedBytes?: number; downloadTotalBytes?: number };
+        details?: {
+          currentSegment?: number;
+          totalSegments?: number;
+          committedBytes?: number;
+          checkpointTaskId?: string;
+          downloadLoadedBytes?: number;
+          downloadTotalBytes?: number;
+        };
+        chunkIndex?: number;
+        startSample?: number;
+        endSample?: number;
+        frameCount?: number;
+        totalSegments?: number;
+        payloadBuffer?: ArrayBuffer;
+        overlapCarryBuffer?: ArrayBuffer | null;
+        streamed?: boolean;
+        nextChunkIndex?: number;
         fourStem?: FourStemResult;
         twoStem?: TwoStemResult;
         errorMessage?: string;
       } | null;
       if (!data || data.taskId !== controller.taskId) return;
       if (!controller.isCurrent() || controller.isCancellingOrCancelled()) {
+        if (data.type === "chunk" && typeof data.chunkIndex === "number") {
+          try {
+            worker.postMessage({
+              type: "chunk-ack",
+              taskId: controller.taskId,
+              chunkIndex: data.chunkIndex,
+              ok: false,
+              errorMessage: "任務已取消",
+            });
+          } catch {
+            // ignore
+          }
+        }
         return;
       }
 
       if (data.type === "progress") {
         if (data.backend) controller.setBackend(data.backend);
         if (data.stage && typeof data.progress === "number" && data.message) {
-          controller.updateProgress(data.stage, data.progress, data.message, data.details);
+          controller.updateProgress(data.stage, data.progress, data.message, {
+            ...data.details,
+            checkpointTaskId,
+          });
         }
         if (data.message) options.onStatus?.(data.message);
         if (data.stage === "processing" && data.details?.currentSegment && data.details?.totalSegments) {
@@ -465,28 +618,144 @@ async function runSeparationInWorker(params: {
         return;
       }
 
-      if (data.type === "completed" && (data.fourStem || data.twoStem)) {
-        if (settled) return;
-        settled = true;
-        unregister();
-        cleanupWorkerListeners();
-        if (activeWorker === worker) {
-          terminateActiveWorker();
-        } else {
-          try { worker.terminate(); } catch { /* ignore */ }
+      if (data.type === "chunk" && streamChunks && checkpointTaskId) {
+        const chunkIndex = data.chunkIndex ?? 0;
+        const startSample = data.startSample ?? 0;
+        const endSample = data.endSample ?? 0;
+        const payloadBuffer = data.payloadBuffer;
+        const overlapCarryBuffer = data.overlapCarryBuffer ?? null;
+        if (!payloadBuffer) {
+          try {
+            worker.postMessage({
+              type: "chunk-ack",
+              taskId: controller.taskId,
+              chunkIndex,
+              ok: false,
+              errorMessage: "Worker 未提供 Chunk payload",
+            });
+          } catch {
+            // ignore
+          }
+          return;
         }
-        syncApprovedStaticScriptsFromHttpCacheOnly();
-        resolve({
-          backend: data.backend ?? "wasm",
-          fourStem: data.fourStem,
-          twoStem: data.twoStem,
+
+        commitChain = commitChain.then(async () => {
+          if (settled || controller.isCancellingOrCancelled() || !controller.isCurrent()) {
+            try {
+              worker.postMessage({
+                type: "chunk-ack",
+                taskId: controller.taskId,
+                chunkIndex,
+                ok: false,
+                errorMessage: "任務已取消",
+              });
+            } catch {
+              // ignore
+            }
+            return;
+          }
+          try {
+            const committed = await commitChunkAndCheckpointAtomically({
+              taskId: checkpointTaskId,
+              chunkIndex,
+              startSample,
+              endSample,
+              payload: payloadBuffer,
+              overlapCarryBuffer,
+              expectedLease: lease,
+            });
+            latestCheckpoint = committed.checkpoint;
+            options.onChunkCommitted?.({
+              checkpoint: committed.checkpoint,
+              chunkIndex,
+              totalChunks: committed.checkpoint.totalChunks,
+            });
+            worker.postMessage({
+              type: "chunk-ack",
+              taskId: controller.taskId,
+              chunkIndex,
+              ok: true,
+            });
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            try {
+              worker.postMessage({
+                type: "chunk-ack",
+                taskId: controller.taskId,
+                chunkIndex,
+                ok: false,
+                errorMessage: msg,
+              });
+            } catch {
+              // ignore
+            }
+            throw err;
+          }
         });
+        commitChain.catch((err) => {
+          if (settled) return;
+          settled = true;
+          unregisterPause();
+          unregister();
+          cleanupWorkerListeners();
+          terminateActiveWorker();
+          reject(err instanceof Error ? err : new Error(String(err)));
+        });
+        return;
+      }
+
+      if (data.type === "paused") {
+        void commitChain
+          .then(() => {
+            if (settled) return;
+            settled = true;
+            unregisterPause();
+            unregister();
+            cleanupWorkerListeners();
+            terminateActiveWorker();
+            syncApprovedStaticScriptsFromHttpCacheOnly();
+            resolve({
+              backend: data.backend ?? "wasm",
+              streamed: true,
+              paused: true,
+              nextChunkIndex: data.nextChunkIndex ?? latestCheckpoint?.nextChunkIndex,
+              latestCheckpoint,
+            });
+          })
+          .catch(() => undefined);
+        return;
+      }
+
+      if (data.type === "completed" && (data.streamed || data.fourStem || data.twoStem)) {
+        void commitChain
+          .then(() => {
+            if (settled) return;
+            settled = true;
+            unregisterPause();
+            unregister();
+            cleanupWorkerListeners();
+            if (activeWorker === worker) {
+              terminateActiveWorker();
+            } else {
+              try { worker.terminate(); } catch { /* ignore */ }
+            }
+            syncApprovedStaticScriptsFromHttpCacheOnly();
+            resolve({
+              backend: data.backend ?? "wasm",
+              streamed: Boolean(data.streamed),
+              fourStem: data.fourStem,
+              twoStem: data.twoStem,
+              latestCheckpoint,
+            });
+          })
+          .catch(() => undefined);
         return;
       }
 
       if (data.type === "cancelled") {
         if (settled) return;
         settled = true;
+        unregisterPause();
         unregister();
         cleanupWorkerListeners();
         terminateActiveWorker();
@@ -497,6 +766,7 @@ async function runSeparationInWorker(params: {
       if (data.type === "failed") {
         if (settled) return;
         settled = true;
+        unregisterPause();
         unregister();
         cleanupWorkerListeners();
         terminateActiveWorker();
@@ -507,6 +777,7 @@ async function runSeparationInWorker(params: {
     worker.onerror = (event) => {
       if (settled) return;
       settled = true;
+      unregisterPause();
       unregister();
       cleanupWorkerListeners();
       terminateActiveWorker();
@@ -516,6 +787,7 @@ async function runSeparationInWorker(params: {
     worker.onmessageerror = () => {
       if (settled) return;
       settled = true;
+      unregisterPause();
       unregister();
       cleanupWorkerListeners();
       terminateActiveWorker();
@@ -524,11 +796,35 @@ async function runSeparationInWorker(params: {
 
     if (controller.signal.aborted) {
       settled = true;
+      unregisterPause();
       unregister();
       cleanupWorkerListeners();
       terminateActiveWorker();
       reject(new SeparationAbortError());
       return;
+    }
+
+    if (!workerLeft || !workerRight) {
+      settled = true;
+      unregisterPause();
+      unregister();
+      cleanupWorkerListeners();
+      terminateActiveWorker();
+      reject(new Error("音源輸入緩衝區已釋放。"));
+      return;
+    }
+
+    const leftBuf = workerLeft.buffer as ArrayBuffer;
+    const rightBuf = workerRight.buffer as ArrayBuffer;
+    workerLeft = null;
+    workerRight = null;
+    const transferList: Transferable[] = [leftBuf, rightBuf];
+    const carryCopy =
+      initialOverlapCarryBuffer instanceof ArrayBuffer
+        ? initialOverlapCarryBuffer.slice(0)
+        : null;
+    if (carryCopy) {
+      transferList.push(carryCopy);
     }
 
     worker.postMessage(
@@ -541,10 +837,15 @@ async function runSeparationInWorker(params: {
         mode,
         preferWebGpu,
         maxThreads,
-        leftBuffer: workerLeft.buffer,
-        rightBuffer: workerRight.buffer,
+        streamChunks,
+        startChunkIndex,
+        inputOffsetSample,
+        totalSamples,
+        initialOverlapCarryBuffer: carryCopy,
+        leftBuffer: leftBuf,
+        rightBuffer: rightBuf,
       },
-      [workerLeft.buffer, workerRight.buffer],
+      transferList,
     );
   });
 }
@@ -636,13 +937,58 @@ export async function separateAudio(
   const controller =
     options.controller
     ?? new SeparationTaskController({
-      songId: "standalone",
+      songId: options.songId ?? "standalone",
       generation: 1,
     });
+
+  const streamChunks = Boolean(
+    (options.preferChunkStreaming ?? Boolean(options.songId && options.sourceAudioHash)) &&
+      options.sourceAudioHash,
+  );
+  const effectiveSongId = options.songId ?? controller.songId;
+  const checkpointTaskId = streamChunks
+    ? options.checkpointTaskId ??
+      createCheckpointTaskId(
+        effectiveSongId,
+        options.sourceAudioHash!,
+        DEMUCS_MODEL_VERSION,
+        SEPARATION_PROCESSING_VERSION,
+      )
+    : undefined;
 
   separationInProgress = true;
   let decodedLeft: Float32Array | null = null;
   let decodedRight: Float32Array | null = null;
+  let activeLease: SeparationLeaseInfo | null = null;
+  let leaseReleased = false;
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+  const stopLeaseHeartbeat = () => {
+    if (heartbeatTimer !== null) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+  };
+
+  const releaseActiveLease = async (
+    nextStatus: "completed" | "paused" | "cancelled" | "failed" | "interrupted",
+    lastError?: string,
+  ) => {
+    stopLeaseHeartbeat();
+    if (!checkpointTaskId || !activeLease || leaseReleased) return;
+    leaseReleased = true;
+    try {
+      await sharedSeparationLeaseManager.releaseLease(checkpointTaskId, activeLease, nextStatus);
+      if (lastError !== undefined) {
+        await updateCheckpointStatus(checkpointTaskId, {
+          status: nextStatus,
+          lastError,
+        });
+      }
+    } catch {
+      // 釋放鎖失敗不覆蓋原始錯誤
+    }
+  };
 
   try {
     controller.throwIfAborted();
@@ -663,13 +1009,125 @@ export async function separateAudio(
     });
     decodedLeft = decoded.left;
     decodedRight = decoded.right;
+    const totalSamples = decodedLeft.length;
 
-    sharedPerfTelemetry.beginMainThreadStage("compute-input-rms");
-    const inputRms = Math.max(
-      await computeRmsAsync(decodedLeft, controller.signal),
-      await computeRmsAsync(decodedRight, controller.signal),
-    );
-    sharedPerfTelemetry.endMainThreadStage("compute-input-rms");
+    let startChunkIndex = 0;
+    let initialOverlapCarryBuffer: ArrayBuffer | null = null;
+    let sliceStartSample = 0;
+
+    if (streamChunks && checkpointTaskId && options.sourceAudioHash) {
+      if (options.forceRecompute) {
+        await deleteCheckpointAndChunks(checkpointTaskId);
+      }
+
+      const validation = await validateAndPrepareResume(checkpointTaskId, {
+        sourceAudioAvailable: true,
+        sourceAudioHash: options.sourceAudioHash,
+        totalSamples,
+        sampleRate: DEMUCS_SAMPLE_RATE,
+      });
+
+      if (validation.action === "already_completed" && !options.forceRecompute && validation.checkpoint) {
+        decodedLeft = null;
+        decodedRight = null;
+        if (validation.checkpoint.requestedMode !== options.mode) {
+          await updateCheckpointStatus(checkpointTaskId, {
+            status: "completed",
+            requestedMode: options.mode,
+          });
+        }
+        const finalCp = (await getCheckpoint(checkpointTaskId)) ?? validation.checkpoint;
+        const durationMs =
+          (typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt;
+        controller.markCompleted("已從本機分段 Checkpoint 驗證並還原完成狀態");
+        return {
+          backend: "wasm",
+          chunkedTask: {
+            taskId: checkpointTaskId,
+            mode: options.mode,
+            sampleRate: finalCp.sampleRate,
+            totalSamples: finalCp.totalSamples,
+            totalChunks: finalCp.totalChunks,
+            committedBytes: finalCp.committedBytes,
+            durationSeconds: finalCp.totalSamples / finalCp.sampleRate,
+          },
+          checkpoint: finalCp,
+          durationMs,
+          usedWorker: false,
+        };
+      }
+
+      if (!validation.checkpoint || validation.action === "recompute_from_scratch") {
+        if (validation.checkpoint) {
+          await deleteCheckpointAndChunks(checkpointTaskId);
+        }
+        const initCp = buildInitialCheckpoint({
+          taskId: checkpointTaskId,
+          songId: effectiveSongId,
+          sourceAudioHash: options.sourceAudioHash,
+          requestedMode: options.mode,
+          totalSamples,
+          sampleRate: DEMUCS_SAMPLE_RATE,
+          userAuthorized: options.userAuthorized ?? true,
+          status: "queued",
+        });
+        await saveCheckpoint(initCp);
+      } else {
+        await updateCheckpointStatus(checkpointTaskId, {
+          status: "running",
+          requestedMode: options.mode,
+          userAuthorized: options.userAuthorized ?? true,
+        });
+      }
+
+      const leaseResult = await sharedSeparationLeaseManager.acquireLease(
+        checkpointTaskId,
+        getOrCreateTabId(),
+      );
+      if (!leaseResult.acquired) {
+        throw new Error(leaseResult.reason);
+      }
+      activeLease = leaseResult.lease;
+
+      heartbeatTimer = setInterval(() => {
+        if (!checkpointTaskId || !activeLease || controller.isTerminal()) return;
+        void sharedSeparationLeaseManager
+          .renewLease(checkpointTaskId, activeLease)
+          .then((ok) => {
+            if (!ok && !controller.isTerminal() && !controller.isCancellingOrCancelled()) {
+              void controller.cancel("其他分頁已接手或執行權已失效，已安全停止分離");
+            }
+          })
+          .catch(() => undefined);
+      }, DEFAULT_JOB_HEARTBEAT_MS);
+
+      startChunkIndex =
+        validation.action === "resume" ? validation.resumeFromChunkIndex : 0;
+      initialOverlapCarryBuffer =
+        validation.action === "resume" && !validation.needsOverlapWarmup
+          ? (leaseResult.checkpoint.overlapCarryBuffer ?? null)
+          : null;
+      const warmupChunkOffset =
+        validation.action === "resume" && validation.needsOverlapWarmup ? 1 : 0;
+      sliceStartSample = Math.max(0, (startChunkIndex - warmupChunkOffset) * DEMUCS_STRIDE_SAMPLES);
+
+      const totalChunks = computeTotalChunks(totalSamples, DEMUCS_STRIDE_SAMPLES);
+      if (startChunkIndex > 0) {
+        options.onStatus?.(
+          `正在驗證 Checkpoint 並從第 ${startChunkIndex + 1} / ${totalChunks} 段接續分離…`,
+        );
+      }
+    }
+
+    let inputRms = 0;
+    if (!streamChunks) {
+      sharedPerfTelemetry.beginMainThreadStage("compute-input-rms");
+      inputRms = Math.max(
+        await computeRmsAsync(decodedLeft, controller.signal),
+        await computeRmsAsync(decodedRight, controller.signal),
+      );
+      sharedPerfTelemetry.endMainThreadStage("compute-input-rms");
+    }
 
     controller.throwIfAborted();
     controller.updateProgress("downloading", 0.08, "正在準備或下載 Demucs AI 模型與執行期 WASM…");
@@ -701,6 +1159,16 @@ export async function separateAudio(
       throw new Error("目前環境不支援背景 Web Worker，預設拒絕在主執行緒進行大型 Demucs 推論，以避免操作介面完全失去反應。");
     }
 
+    const inputLeftForRun =
+      sliceStartSample > 0 ? new Float32Array(decodedLeft.subarray(sliceStartSample)) : decodedLeft;
+    const inputRightForRun =
+      sliceStartSample > 0 ? new Float32Array(decodedRight.subarray(sliceStartSample)) : decodedRight;
+    if (sliceStartSample > 0 && !allowMainThread) {
+      // 續跑時僅需傳送剩餘切片給 Worker，立刻釋放完整前置已算完的 PCM 參考
+      decodedLeft = null;
+      decodedRight = null;
+    }
+
     if (canUseWorker) {
       try {
         sharedPerfTelemetry.beginMainThreadStage("worker-transfer-and-inference");
@@ -709,11 +1177,18 @@ export async function separateAudio(
           modelUrl,
           wasmBinaryUrl: ortWasmPrep.wasmUrl,
           mode: options.mode,
-          left: decodedLeft,
-          right: decodedRight,
+          left: inputLeftForRun,
+          right: inputRightForRun,
           preferWebGpu: preferredBackend === "webgpu",
           maxThreads: options.maxThreads,
           preserveInputsForFallback: allowMainThread,
+          streamChunks,
+          checkpointTaskId,
+          lease: activeLease ?? undefined,
+          startChunkIndex,
+          inputOffsetSample: sliceStartSample,
+          totalSamples,
+          initialOverlapCarryBuffer,
           options,
         });
         sharedPerfTelemetry.endMainThreadStage("worker-transfer-and-inference");
@@ -721,7 +1196,47 @@ export async function separateAudio(
           decodedLeft = null;
           decodedRight = null;
         }
+        initialOverlapCarryBuffer = null;
         controller.throwIfAborted();
+
+        if (streamChunks && checkpointTaskId) {
+          const durationMs =
+            (typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt;
+          if (workerOutput.paused) {
+            await releaseActiveLease("paused");
+            const pausedCp = await getCheckpoint(checkpointTaskId);
+            controller.markPaused("已於安全 Chunk 邊界暫停，可隨時繼續分離");
+            return {
+              backend: workerOutput.backend,
+              paused: true,
+              checkpoint: pausedCp ?? workerOutput.latestCheckpoint,
+              durationMs,
+              usedWorker: true,
+            };
+          }
+
+          await releaseActiveLease("completed");
+          const finalCp =
+            (await getCheckpoint(checkpointTaskId)) ?? workerOutput.latestCheckpoint;
+          const totalChunks =
+            finalCp?.totalChunks ?? computeTotalChunks(totalSamples, DEMUCS_STRIDE_SAMPLES);
+          return {
+            backend: workerOutput.backend,
+            chunkedTask: {
+              taskId: checkpointTaskId,
+              mode: options.mode,
+              sampleRate: finalCp?.sampleRate ?? DEMUCS_SAMPLE_RATE,
+              totalSamples: finalCp?.totalSamples ?? totalSamples,
+              totalChunks,
+              committedBytes: finalCp?.committedBytes ?? 0,
+              durationSeconds: totalSamples / DEMUCS_SAMPLE_RATE,
+            },
+            checkpoint: finalCp,
+            durationMs,
+            usedWorker: true,
+          };
+        }
+
         sharedPerfTelemetry.beginMainThreadStage("validate-output");
         const outputToValidate = workerOutput.twoStem ?? workerOutput.fourStem;
         if (!outputToValidate) {
@@ -773,11 +1288,80 @@ export async function separateAudio(
         controller.throwIfAborted();
         controller.updateProgress("processing", 0.25, `正在以 ${backend === "webgpu" ? "WebGPU" : "WASM"} 分離音源…`);
         options.onStatus?.(`正在以 ${backend === "webgpu" ? "WebGPU" : "WASM"} 分離音源…`);
+
+        if (streamChunks && checkpointTaskId && decodedLeft && decodedRight) {
+          const freshCp = await getCheckpoint(checkpointTaskId);
+          const resumeFrom = freshCp?.nextChunkIndex ?? startChunkIndex;
+          const carry =
+            resumeFrom > 0 ? (freshCp?.overlapCarryBuffer ?? initialOverlapCarryBuffer) : null;
+          const result = await processor.separate(decodedLeft, decodedRight, {
+            signal: controller.signal,
+            mode: options.mode,
+            startChunkIndex: resumeFrom,
+            inputOffsetSample: 0,
+            totalSamples,
+            initialOverlapCarryBuffer: carry,
+            shouldPause: () => controller.isPausingOrPaused(),
+            onChunk: async (chunk) => {
+              const committed = await commitChunkAndCheckpointAtomically({
+                taskId: checkpointTaskId,
+                chunkIndex: chunk.chunkIndex,
+                startSample: chunk.startSample,
+                endSample: chunk.endSample,
+                payload: chunk.payloadBuffer,
+                overlapCarryBuffer: chunk.overlapCarryBuffer,
+                expectedLease: activeLease ?? undefined,
+              });
+              options.onChunkCommitted?.({
+                checkpoint: committed.checkpoint,
+                chunkIndex: chunk.chunkIndex,
+                totalChunks: committed.checkpoint.totalChunks,
+              });
+            },
+          });
+          controller.throwIfAborted();
+          const durationMs =
+            (typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt;
+          if (isStreamResult(result) && result.paused) {
+            await releaseActiveLease("paused");
+            const pausedCp = await getCheckpoint(checkpointTaskId);
+            controller.markPaused("已於安全 Chunk 邊界暫停，可隨時繼續分離");
+            return {
+              backend,
+              paused: true,
+              checkpoint: pausedCp ?? undefined,
+              durationMs,
+              usedWorker: false,
+            };
+          }
+          await releaseActiveLease("completed");
+          const finalCp = await getCheckpoint(checkpointTaskId);
+          return {
+            backend,
+            chunkedTask: {
+              taskId: checkpointTaskId,
+              mode: options.mode,
+              sampleRate: finalCp?.sampleRate ?? DEMUCS_SAMPLE_RATE,
+              totalSamples: finalCp?.totalSamples ?? totalSamples,
+              totalChunks:
+                finalCp?.totalChunks ?? computeTotalChunks(totalSamples, DEMUCS_STRIDE_SAMPLES),
+              committedBytes: finalCp?.committedBytes ?? 0,
+              durationSeconds: totalSamples / DEMUCS_SAMPLE_RATE,
+            },
+            checkpoint: finalCp ?? undefined,
+            durationMs,
+            usedWorker: false,
+          };
+        }
+
         const result = await processor.separate(decodedLeft!, decodedRight!, {
           signal: controller.signal,
           mode: options.mode,
         });
         controller.throwIfAborted();
+        if (isStreamResult(result)) {
+          throw new Error("非串流呼叫收到非預期之串流結果");
+        }
         await validateSeparatedResultAsync(result, inputRms, controller);
         controller.throwIfAborted();
         const durationMs = (typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt;
@@ -805,8 +1389,18 @@ export async function separateAudio(
 
     throw describeError(lastError);
   } catch (error) {
+    if (isAbortError(error) || controller.isCancellingOrCancelled()) {
+      await releaseActiveLease("cancelled");
+    } else if (!isPauseError(error)) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await releaseActiveLease("failed", msg);
+    }
     throw describeError(error);
   } finally {
+    stopLeaseHeartbeat();
+    if (!leaseReleased && checkpointTaskId && activeLease) {
+      await releaseActiveLease(controller.isCancellingOrCancelled() ? "cancelled" : "interrupted");
+    }
     decodedLeft = null;
     decodedRight = null;
     separationInProgress = false;

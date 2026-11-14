@@ -84,7 +84,7 @@ export const KNOWN_NETWORK_ASSETS: readonly KnownNetworkAssetEntry[] = [
     label: "Demucs 分離處理器（processor.js）",
     matchPathOrUrl: "/vendor/demucs-web/processor.js",
     origin: "vercel-static",
-    sizeBytes: 16482,
+    sizeBytes: 23952,
     sizeSource: "exact-static-file",
   },
   {
@@ -116,7 +116,7 @@ export const KNOWN_NETWORK_ASSETS: readonly KnownNetworkAssetEntry[] = [
     label: "Demucs 背景 Worker（worker.js）",
     matchPathOrUrl: "/vendor/demucs-web/worker.js",
     origin: "vercel-static",
-    sizeBytes: 8062,
+    sizeBytes: 11554,
     sizeSource: "exact-static-file",
   },
   {

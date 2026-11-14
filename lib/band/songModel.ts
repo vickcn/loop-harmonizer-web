@@ -2,6 +2,7 @@ import type {
   BandSong,
   SeparationFocusSessionSnapshot,
   SeparationFocusSongEntry,
+  SeparationStatus,
   SongAudioLoadState,
   SongOperationSnapshot,
   SongPlaybackSource,
@@ -43,6 +44,12 @@ export type PersistedSongRecord = {
   playheadSec: number;
   playbackSource: SongPlaybackSource;
   separationMode: "two_stem" | "four_stem" | null;
+  separationStatus?: SeparationStatus;
+  separationTaskId?: string | null;
+  separationCompletedChunks?: number;
+  separationTotalChunks?: number;
+  separationCommittedBytes?: number;
+  separationUserAuthorized?: boolean;
   cacheKey: string | null;
   modelVersion: string;
   processingVersion: string;
@@ -223,6 +230,12 @@ export function serializePersistedSong(
     playheadSec: Math.max(0, Number.isFinite(song.playheadSec) ? song.playheadSec : 0),
     playbackSource: song.playbackSource === "stems" ? "stems" : "original",
     separationMode: song.separationMode ?? null,
+    separationStatus: song.separationStatus,
+    separationTaskId: song.separationTaskId ?? null,
+    separationCompletedChunks: song.separationCompletedChunks ?? 0,
+    separationTotalChunks: song.separationTotalChunks ?? 0,
+    separationCommittedBytes: song.separationCommittedBytes ?? 0,
+    separationUserAuthorized: Boolean(song.separationUserAuthorized),
     cacheKey: song.cacheKey ?? null,
     modelVersion: meta.modelVersion,
     processingVersion: meta.processingVersion,
@@ -298,6 +311,16 @@ export function restoreBandSongFromRecord(
     // 在分軌 AudioBuffer 實際掛載前先保持 original，待分離快取載入成功再切換為紀錄中的來源
     playbackSource: "original",
     separationMode: record.separationMode ?? null,
+    // 若頁面重整或瀏覽器中止前尚處於 processing/cancelling，恢復時轉為 interrupted 避免誤顯示進行中
+    separationStatus:
+      record.separationStatus === "processing" || record.separationStatus === "cancelling"
+        ? "interrupted"
+        : (record.separationStatus ?? "not_started"),
+    separationTaskId: record.separationTaskId ?? null,
+    separationCompletedChunks: record.separationCompletedChunks ?? 0,
+    separationTotalChunks: record.separationTotalChunks ?? 0,
+    separationCommittedBytes: record.separationCommittedBytes ?? 0,
+    separationUserAuthorized: Boolean(record.separationUserAuthorized),
     cacheKey: record.cacheKey ?? null,
     stemChannels: restoredChannels,
   };
@@ -426,7 +449,7 @@ export function createSeparationFocusSessionSnapshot(
 export function restoreSongsAfterSeparationFocus(
   songs: readonly BandSong[],
   focusSnapshot: SeparationFocusSessionSnapshot,
-  options: { outcome: "completed" | "cancelled" | "failed" },
+  options: { outcome: "completed" | "paused" | "cancelled" | "failed" },
 ): BandSong[] {
   const entryMap = new Map(focusSnapshot.entries.map((entry) => [entry.songId, entry]));
 
@@ -440,16 +463,29 @@ export function restoreSongsAfterSeparationFocus(
       ? "paused"
       : entry.previousStatus;
 
-    if (song.id === focusSnapshot.targetSongId && (options.outcome === "cancelled" || options.outcome === "failed")) {
+    if (
+      song.id === focusSnapshot.targetSongId &&
+      (options.outcome === "cancelled" || options.outcome === "paused" || options.outcome === "failed")
+    ) {
       const reverted = applySongOperationSnapshot(song, entry.snapshot);
+      const hasChunks = (song.separationCompletedChunks ?? 0) > 0 && (song.separationTotalChunks ?? 0) > 0;
+      const chunkProgress = hasChunks
+        ? (song.separationCompletedChunks ?? 0) / Math.max(1, song.separationTotalChunks ?? 1)
+        : 0;
       return {
         ...reverted,
         status: safeStatus,
         playheadSec: entry.playheadSec,
         separationStatus: options.outcome,
         separationStage: options.outcome,
-        separationProgress: 0,
+        separationProgress: hasChunks ? chunkProgress : 0,
         separationMessage: song.separationMessage,
+        separationTaskId: song.separationTaskId,
+        separationCompletedChunks: song.separationCompletedChunks,
+        separationTotalChunks: song.separationTotalChunks,
+        separationCommittedBytes: song.separationCommittedBytes,
+        separationUserAuthorized:
+          options.outcome === "cancelled" ? false : song.separationUserAuthorized,
       };
     }
 

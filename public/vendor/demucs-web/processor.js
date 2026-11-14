@@ -280,42 +280,109 @@ export class DemucsProcessor {
 
     const signal = options?.signal;
     const mode = options?.mode === 'two_stem' ? 'two_stem' : 'four_stem';
+    const onChunk = typeof options?.onChunk === 'function' ? options.onChunk : null;
+    const shouldPause = typeof options?.shouldPause === 'function' ? options.shouldPause : null;
+    const inputOffsetSample = Math.max(0, Math.floor(options?.inputOffsetSample ?? 0));
+    const totalSamples = Math.max(
+      leftChannel.length + inputOffsetSample,
+      Math.floor(options?.totalSamples ?? leftChannel.length + inputOffsetSample),
+    );
+    const startChunkIndex = Math.max(0, Math.floor(options?.startChunkIndex ?? 0));
     throwIfAborted(signal);
 
-    const totalSamples = leftChannel.length;
     const stride = Math.floor(TRAINING_SAMPLES * (1 - SEGMENT_OVERLAP));
-    const numSegments = Math.max(1, Math.ceil((totalSamples - TRAINING_SAMPLES) / stride) + 1);
+    const overlapSamples = TRAINING_SAMPLES - stride;
+    const numSegments = totalSamples > 0 ? Math.max(1, Math.ceil(totalSamples / stride)) : 0;
 
-    // 2-Stem 模式在區段重疊累加時即直接合併伴奏（drums+bass+other），僅配置 2 組全曲緩衝區以節省 50% 輸出 PCM 記憶體
-    let outputs = mode === 'two_stem'
-      ? [
-          { left: new Float32Array(totalSamples), right: new Float32Array(totalSamples) }, // [0] instrumental
-          { left: new Float32Array(totalSamples), right: new Float32Array(totalSamples) }  // [1] vocals
-        ]
-      : TRACKS.map(() => ({
-          left: new Float32Array(totalSamples),
-          right: new Float32Array(totalSamples)
-        }));
-    // 使用固定單區段長度的滾動權重陣列進行分段就地正規化，省去整首歌曲長度的 weights 陣列記憶體
+    if (numSegments === 0) {
+      if (onChunk) {
+        return { streamed: true, paused: false, completedChunks: 0, totalSegments: 0 };
+      }
+      return mode === 'two_stem'
+        ? { mode: 'two_stem', instrumental: { left: new Float32Array(0), right: new Float32Array(0) }, vocals: { left: new Float32Array(0), right: new Float32Array(0) } }
+        : { drums: { left: new Float32Array(0), right: new Float32Array(0) }, bass: { left: new Float32Array(0), right: new Float32Array(0) }, other: { left: new Float32Array(0), right: new Float32Array(0) }, vocals: { left: new Float32Array(0), right: new Float32Array(0) } };
+    }
+
+    // 串流 Chunk 模式：僅配置固定單區段長度（343,980 samples ≈ 12.4 MiB）滾動緩衝區，徹底移除全曲 4 軌 PCM 配置
+    // TRACKS 順序：[0: drums, 1: bass, 2: other, 3: vocals]
+    // Chunk payload 固定順序：[vocals, drums, bass, other] => TRACKS 索引 [3, 0, 1, 2]
+    const PACK_ORDER_FROM_TRACKS = [3, 0, 1, 2];
+
+    let rollingTracks = onChunk
+      ? TRACKS.map(() => ({
+          left: new Float32Array(TRAINING_SAMPLES),
+          right: new Float32Array(TRAINING_SAMPLES),
+        }))
+      : null;
+
+    let outputs = onChunk
+      ? null
+      : mode === 'two_stem'
+        ? [
+            { left: new Float32Array(totalSamples), right: new Float32Array(totalSamples) }, // [0] instrumental
+            { left: new Float32Array(totalSamples), right: new Float32Array(totalSamples) }, // [1] vocals
+          ]
+        : TRACKS.map(() => ({
+            left: new Float32Array(totalSamples),
+            right: new Float32Array(totalSamples),
+          }));
+
     let rollingWeights = new Float32Array(TRAINING_SAMPLES);
+    let segLeft = new Float32Array(TRAINING_SAMPLES);
+    let segRight = new Float32Array(TRAINING_SAMPLES);
 
-    let segmentIdx = 0;
+    let hasRestoredCarry = false;
+    if (onChunk && startChunkIndex > 0 && options?.initialOverlapCarryBuffer instanceof ArrayBuffer) {
+      const expectedCarryBytes = (4 * 2 + 1) * overlapSamples * Float32Array.BYTES_PER_ELEMENT;
+      if (options.initialOverlapCarryBuffer.byteLength === expectedCarryBytes) {
+        const carryView = new Float32Array(options.initialOverlapCarryBuffer);
+        for (let t = 0; t < 4; t++) {
+          const base = t * 2 * overlapSamples;
+          rollingTracks[t].left.set(carryView.subarray(base, base + overlapSamples), 0);
+          rollingTracks[t].right.set(carryView.subarray(base + overlapSamples, base + overlapSamples * 2), 0);
+        }
+        rollingWeights.set(carryView.subarray(8 * overlapSamples, 9 * overlapSamples), 0);
+        hasRestoredCarry = true;
+      }
+    }
+
+    const firstLoopIdx =
+      onChunk && startChunkIndex > 0 && !hasRestoredCarry
+        ? startChunkIndex - 1
+        : onChunk
+          ? startChunkIndex
+          : 0;
+
+    let completedChunks = startChunkIndex;
 
     try {
-      for (let start = 0; start < totalSamples; start += stride) {
+      for (let idx = firstLoopIdx; idx < numSegments; idx++) {
         throwIfAborted(signal);
+        if (onChunk && idx >= startChunkIndex && shouldPause?.()) {
+          return {
+            streamed: true,
+            paused: true,
+            completedChunks,
+            totalSegments: numSegments,
+          };
+        }
 
+        const start = idx * stride;
         const end = Math.min(start + TRAINING_SAMPLES, totalSamples);
         const segmentLength = end - start;
         const isLastSegment = start + stride >= totalSamples;
         const finalizeCount = isLastSegment ? segmentLength : Math.min(stride, segmentLength);
+        const isWarmup = onChunk && idx < startChunkIndex;
 
-        const segLeft = new Float32Array(TRAINING_SAMPLES);
-        const segRight = new Float32Array(TRAINING_SAMPLES);
-
+        segLeft.fill(0);
+        segRight.fill(0);
         for (let i = 0; i < segmentLength; i++) {
-          segLeft[i] = leftChannel[start + i];
-          segRight[i] = rightChannel[start + i];
+          const localIdx = start + i - inputOffsetSample;
+          if (localIdx < 0 || localIdx >= leftChannel.length) {
+            throw new Error(`音訊片段樣本超出可用輸入範圍：${start + i}`);
+          }
+          segLeft[i] = leftChannel[localIdx];
+          segRight[i] = rightChannel[localIdx];
         }
 
         const input = prepareModelInput(segLeft, segRight);
@@ -331,6 +398,9 @@ export class DemucsProcessor {
         }
 
         let inferResults = null;
+        let payloadBuffer = null;
+        let overlapCarryBuffer = null;
+
         try {
           inferResults = await this.session.run(feeds);
           throwIfAborted(signal);
@@ -393,40 +463,110 @@ export class DemucsProcessor {
             overlapWindow[i] = Math.min(fadeIn, fadeOut);
           }
 
-          for (let t = 0; t < numTracks; t++) {
-            const targetOut = mode === 'two_stem' ? outputs[t === 3 ? 1 : 0] : outputs[t];
-            for (let i = 0; i < segmentLength && start + i < totalSamples; i++) {
-              let leftVal, rightVal;
-              if (combinedOutputs) {
-                leftVal = combinedOutputs[t].left[i];
-                rightVal = combinedOutputs[t].right[i];
-              } else {
-                const leftIdx = t * numChannels * samples + 0 * samples + i;
-                const rightIdx = t * numChannels * samples + 1 * samples + i;
-                leftVal = timeData[leftIdx];
-                rightVal = timeData[rightIdx];
+          if (onChunk) {
+            for (let t = 0; t < numTracks; t++) {
+              const targetRolling = rollingTracks[t];
+              for (let i = 0; i < segmentLength; i++) {
+                let leftVal, rightVal;
+                if (combinedOutputs) {
+                  leftVal = combinedOutputs[t].left[i];
+                  rightVal = combinedOutputs[t].right[i];
+                } else {
+                  const leftIdx = t * numChannels * samples + 0 * samples + i;
+                  const rightIdx = t * numChannels * samples + 1 * samples + i;
+                  leftVal = timeData[leftIdx];
+                  rightVal = timeData[rightIdx];
+                }
+                targetRolling.left[i] += leftVal * overlapWindow[i];
+                targetRolling.right[i] += rightVal * overlapWindow[i];
               }
-              targetOut.left[start + i] += leftVal * overlapWindow[i];
-              targetOut.right[start + i] += rightVal * overlapWindow[i];
             }
-          }
+            for (let i = 0; i < segmentLength; i++) {
+              rollingWeights[i] += overlapWindow[i];
+            }
 
-          for (let i = 0; i < segmentLength && start + i < totalSamples; i++) {
-            rollingWeights[i] += overlapWindow[i];
-          }
-          // 僅對不會再被下一區段重疊覆蓋的樣本就地除以滾動權重，無須配置全域 weights 陣列
-          for (let t = 0; t < outputs.length; t++) {
-            for (let i = 0; i < finalizeCount; i++) {
-              const w = rollingWeights[i];
-              if (w > 0) {
-                outputs[t].left[start + i] /= w;
-                outputs[t].right[start + i] /= w;
+            if (!isWarmup) {
+              for (let t = 0; t < 4; t++) {
+                for (let i = 0; i < finalizeCount; i++) {
+                  const w = rollingWeights[i];
+                  if (w > 0) {
+                    rollingTracks[t].left[i] /= w;
+                    rollingTracks[t].right[i] /= w;
+                  }
+                }
+              }
+              payloadBuffer = new ArrayBuffer(4 * 2 * finalizeCount * Float32Array.BYTES_PER_ELEMENT);
+              const payloadView = new Float32Array(payloadBuffer);
+              for (let s = 0; s < PACK_ORDER_FROM_TRACKS.length; s++) {
+                const trackIdx = PACK_ORDER_FROM_TRACKS[s];
+                const base = s * 2 * finalizeCount;
+                payloadView.set(rollingTracks[trackIdx].left.subarray(0, finalizeCount), base);
+                payloadView.set(rollingTracks[trackIdx].right.subarray(0, finalizeCount), base + finalizeCount);
               }
             }
-          }
-          if (!isLastSegment) {
-            rollingWeights.copyWithin(0, stride);
-            rollingWeights.fill(0, TRAINING_SAMPLES - stride);
+
+            if (!isLastSegment) {
+              for (let t = 0; t < 4; t++) {
+                rollingTracks[t].left.copyWithin(0, stride);
+                rollingTracks[t].left.fill(0, TRAINING_SAMPLES - stride);
+                rollingTracks[t].right.copyWithin(0, stride);
+                rollingTracks[t].right.fill(0, TRAINING_SAMPLES - stride);
+              }
+              rollingWeights.copyWithin(0, stride);
+              rollingWeights.fill(0, TRAINING_SAMPLES - stride);
+
+              if (!isWarmup) {
+                overlapCarryBuffer = new ArrayBuffer((4 * 2 + 1) * overlapSamples * Float32Array.BYTES_PER_ELEMENT);
+                const carryView = new Float32Array(overlapCarryBuffer);
+                for (let t = 0; t < 4; t++) {
+                  const base = t * 2 * overlapSamples;
+                  carryView.set(rollingTracks[t].left.subarray(0, overlapSamples), base);
+                  carryView.set(rollingTracks[t].right.subarray(0, overlapSamples), base + overlapSamples);
+                }
+                carryView.set(rollingWeights.subarray(0, overlapSamples), 8 * overlapSamples);
+              }
+            } else {
+              rollingWeights.fill(0);
+              for (let t = 0; t < 4; t++) {
+                rollingTracks[t].left.fill(0);
+                rollingTracks[t].right.fill(0);
+              }
+            }
+          } else {
+            for (let t = 0; t < numTracks; t++) {
+              const targetOut = mode === 'two_stem' ? outputs[t === 3 ? 1 : 0] : outputs[t];
+              for (let i = 0; i < segmentLength && start + i < totalSamples; i++) {
+                let leftVal, rightVal;
+                if (combinedOutputs) {
+                  leftVal = combinedOutputs[t].left[i];
+                  rightVal = combinedOutputs[t].right[i];
+                } else {
+                  const leftIdx = t * numChannels * samples + 0 * samples + i;
+                  const rightIdx = t * numChannels * samples + 1 * samples + i;
+                  leftVal = timeData[leftIdx];
+                  rightVal = timeData[rightIdx];
+                }
+                targetOut.left[start + i] += leftVal * overlapWindow[i];
+                targetOut.right[start + i] += rightVal * overlapWindow[i];
+              }
+            }
+
+            for (let i = 0; i < segmentLength && start + i < totalSamples; i++) {
+              rollingWeights[i] += overlapWindow[i];
+            }
+            for (let t = 0; t < outputs.length; t++) {
+              for (let i = 0; i < finalizeCount; i++) {
+                const w = rollingWeights[i];
+                if (w > 0) {
+                  outputs[t].left[start + i] /= w;
+                  outputs[t].right[start + i] /= w;
+                }
+              }
+            }
+            if (!isLastSegment) {
+              rollingWeights.copyWithin(0, stride);
+              rollingWeights.fill(0, TRAINING_SAMPLES - stride);
+            }
           }
           combinedOutputs = null;
         } finally {
@@ -440,18 +580,53 @@ export class DemucsProcessor {
           }
         }
 
-        segmentIdx++;
-        this.onProgress({
-          progress: segmentIdx / numSegments,
-          currentSegment: segmentIdx,
-          totalSegments: numSegments
-        });
+        if (!isWarmup) {
+          if (onChunk && payloadBuffer) {
+            await onChunk({
+              chunkIndex: idx,
+              startSample: start,
+              endSample: start + finalizeCount,
+              frameCount: finalizeCount,
+              totalSegments: numSegments,
+              payloadBuffer,
+              overlapCarryBuffer,
+            });
+            payloadBuffer = null;
+            overlapCarryBuffer = null;
+          }
+          completedChunks = idx + 1;
+          this.onProgress({
+            progress: completedChunks / numSegments,
+            currentSegment: completedChunks,
+            totalSegments: numSegments,
+          });
+          if (onChunk && !isLastSegment && shouldPause?.()) {
+            return {
+              streamed: true,
+              paused: true,
+              completedChunks,
+              totalSegments: numSegments,
+            };
+          }
+        }
 
         await yieldToEventLoop();
       }
 
       throwIfAborted(signal);
       rollingWeights = null;
+      rollingTracks = null;
+      segLeft = null;
+      segRight = null;
+
+      if (onChunk) {
+        return {
+          streamed: true,
+          paused: false,
+          completedChunks,
+          totalSegments: numSegments,
+        };
+      }
 
       if (mode === 'two_stem') {
         return {
@@ -469,7 +644,10 @@ export class DemucsProcessor {
       };
     } catch (error) {
       outputs = null;
+      rollingTracks = null;
       rollingWeights = null;
+      segLeft = null;
+      segRight = null;
       throw error;
     }
   }

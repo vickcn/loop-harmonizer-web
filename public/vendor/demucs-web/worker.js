@@ -1,9 +1,19 @@
 import { DemucsProcessor } from "./processor.js";
 
 let currentAbortController = null;
+let currentTaskId = null;
+let pauseRequested = false;
 let activeProcessor = null;
 let cachedBackend = null;
 let ortModulePromise = null;
+const pendingChunkAcks = new Map();
+
+function rejectAllPendingAcks(reason) {
+  for (const [, pending] of pendingChunkAcks.entries()) {
+    pending.reject(reason);
+  }
+  pendingChunkAcks.clear();
+}
 
 function isAbort(error) {
   if (!error) return false;
@@ -63,6 +73,7 @@ self.addEventListener("message", async (event) => {
 
   if (msg.type === "dispose") {
     if (currentAbortController) currentAbortController.abort();
+    rejectAllPendingAcks(Object.assign(new Error("音源分離已停止"), { name: "AbortError" }));
     await releaseProcessor();
     self.postMessage({ type: "disposed" });
     return;
@@ -72,8 +83,30 @@ self.addEventListener("message", async (event) => {
     if (currentAbortController) {
       currentAbortController.abort();
     }
+    rejectAllPendingAcks(Object.assign(new Error("音源分離已取消"), { name: "AbortError" }));
     await releaseProcessor();
     self.postMessage({ type: "cancelled", taskId: msg.taskId ?? null });
+    return;
+  }
+
+  if (msg.type === "pause") {
+    if (!currentTaskId || !msg.taskId || msg.taskId === currentTaskId) {
+      pauseRequested = true;
+    }
+    return;
+  }
+
+  if (msg.type === "chunk-ack") {
+    const key = `${msg.taskId}:${msg.chunkIndex}`;
+    const pending = pendingChunkAcks.get(key);
+    if (pending) {
+      pendingChunkAcks.delete(key);
+      if (msg.ok === false) {
+        pending.reject(new Error(msg.errorMessage || `Chunk ${msg.chunkIndex} 保存失敗`));
+      } else {
+        pending.resolve();
+      }
+    }
     return;
   }
 
@@ -87,6 +120,11 @@ self.addEventListener("message", async (event) => {
     mode = "four_stem",
     preferWebGpu = true,
     maxThreads = 4,
+    streamChunks = false,
+    startChunkIndex = 0,
+    inputOffsetSample = 0,
+    totalSamples,
+    initialOverlapCarryBuffer = null,
     leftBuffer,
     rightBuffer,
   } = msg;
@@ -96,6 +134,8 @@ self.addEventListener("message", async (event) => {
 
   const abortController = new AbortController();
   currentAbortController = abortController;
+  currentTaskId = taskId;
+  pauseRequested = false;
 
   const postProgress = (stage, progress, message, backend, details) => {
     if (abortController.signal.aborted) return;
@@ -168,9 +208,58 @@ self.addEventListener("message", async (event) => {
 
     postProgress("processing", 0.25, `正在執行本機 AI 分離（${backend === "webgpu" ? "WebGPU" : "WASM"}）…`, backend);
 
+    let activeStartChunkIndex = Math.max(0, Math.floor(startChunkIndex));
+    let activeCarryBuffer = initialOverlapCarryBuffer;
+
+    const createChunkSender = () => {
+      if (!streamChunks) return null;
+      return async (chunk) => {
+        if (abortController.signal.aborted) {
+          throw Object.assign(new Error("音源分離已取消"), { name: "AbortError" });
+        }
+        const ackKey = `${taskId}:${chunk.chunkIndex}`;
+        const ackPromise = new Promise((resolve, reject) => {
+          pendingChunkAcks.set(ackKey, { resolve, reject });
+        });
+        const transferList = [chunk.payloadBuffer];
+        if (chunk.overlapCarryBuffer) {
+          transferList.push(chunk.overlapCarryBuffer);
+        }
+        // 更新下一次（若 WebGPU fallback 重試）可銜接的游標，並立刻轉移權限至主執行緒提交 IndexedDB
+        activeStartChunkIndex = chunk.chunkIndex + 1;
+        activeCarryBuffer = null;
+        self.postMessage(
+          {
+            type: "chunk",
+            taskId,
+            chunkIndex: chunk.chunkIndex,
+            startSample: chunk.startSample,
+            endSample: chunk.endSample,
+            frameCount: chunk.frameCount,
+            totalSegments: chunk.totalSegments,
+            payloadBuffer: chunk.payloadBuffer,
+            overlapCarryBuffer: chunk.overlapCarryBuffer,
+          },
+          transferList,
+        );
+        await ackPromise;
+      };
+    };
+
+    const runSeparateOptions = () => ({
+      signal: abortController.signal,
+      mode,
+      startChunkIndex: activeStartChunkIndex,
+      inputOffsetSample,
+      totalSamples,
+      initialOverlapCarryBuffer: activeCarryBuffer,
+      shouldPause: () => pauseRequested,
+      onChunk: createChunkSender(),
+    });
+
     let result;
     try {
-      result = await activeProcessor.separate(left, right, { signal: abortController.signal, mode });
+      result = await activeProcessor.separate(left, right, runSeparateOptions());
     } catch (sepErr) {
       if (isAbort(sepErr) || abortController.signal.aborted) throw sepErr;
       if (backend === "webgpu") {
@@ -180,21 +269,43 @@ self.addEventListener("message", async (event) => {
         activeProcessor = createProcessorWithBackend("wasm");
         await activeProcessor.loadModel(modelUrl, { signal: abortController.signal });
         cachedBackend = "wasm";
-        result = await activeProcessor.separate(left, right, { signal: abortController.signal, mode });
+        result = await activeProcessor.separate(left, right, runSeparateOptions());
       } else {
         throw sepErr;
       }
     } finally {
       left = null;
       right = null;
+      activeCarryBuffer = null;
     }
 
-    // 推論完成後立即釋放 ONNX Session 與 Arena，避免與主執行緒重組 AudioBuffer 同時佔用高峰記憶體
+    // 推論完成或安全暫停後立即釋放 ONNX Session 與 Arena
     await releaseProcessor();
 
     if (abortController.signal.aborted) {
       result = null;
       throw Object.assign(new Error("音源分離已取消"), { name: "AbortError" });
+    }
+
+    if (streamChunks) {
+      if (result && result.paused) {
+        self.postMessage({
+          type: "paused",
+          taskId,
+          backend,
+          nextChunkIndex: result.completedChunks,
+          totalSegments: result.totalSegments,
+        });
+        return;
+      }
+      self.postMessage({
+        type: "completed",
+        taskId,
+        backend,
+        streamed: true,
+        totalSegments: result?.totalSegments ?? 0,
+      });
+      return;
     }
 
     if (mode === "two_stem" && result && result.instrumental && result.vocals) {
@@ -241,6 +352,7 @@ self.addEventListener("message", async (event) => {
   } catch (error) {
     left = null;
     right = null;
+    rejectAllPendingAcks(error);
     if (isAbort(error) || abortController.signal.aborted) {
       await releaseProcessor();
       self.postMessage({
@@ -259,5 +371,9 @@ self.addEventListener("message", async (event) => {
     if (currentAbortController === abortController) {
       currentAbortController = null;
     }
+    if (currentTaskId === taskId) {
+      currentTaskId = null;
+    }
+    pauseRequested = false;
   }
 });

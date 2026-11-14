@@ -3,6 +3,8 @@ export type SeparationTaskStage =
   | "preparing"
   | "downloading"
   | "processing"
+  | "pausing"
+  | "paused"
   | "cancelling"
   | "cancelled"
   | "completed"
@@ -19,6 +21,8 @@ export type SeparationProgressEvent = {
   details?: {
     currentSegment?: number;
     totalSegments?: number;
+    committedBytes?: number;
+    checkpointTaskId?: string;
     downloadLoadedBytes?: number;
     downloadTotalBytes?: number;
   };
@@ -33,6 +37,15 @@ export class SeparationAbortError extends Error {
   }
 }
 
+export class SeparationPauseError extends Error {
+  readonly isSeparationPause = true;
+
+  constructor(message = "音源分離已於安全 Chunk 邊界暫停") {
+    super(message);
+    this.name = "PauseError";
+  }
+}
+
 export function isAbortError(error: unknown): boolean {
   if (!error) return false;
   if (error instanceof SeparationAbortError) return true;
@@ -42,6 +55,16 @@ export function isAbortError(error: unknown): boolean {
   if (error instanceof Error) {
     if (error.name === "AbortError") return true;
     if ((error as { isSeparationAbort?: boolean }).isSeparationAbort) return true;
+  }
+  return false;
+}
+
+export function isPauseError(error: unknown): boolean {
+  if (!error) return false;
+  if (error instanceof SeparationPauseError) return true;
+  if (error instanceof Error) {
+    if (error.name === "PauseError") return true;
+    if ((error as { isSeparationPause?: boolean }).isSeparationPause) return true;
   }
   return false;
 }
@@ -59,7 +82,12 @@ export type SeparationTaskOptions = {
   now?: () => number;
 };
 
-const TERMINAL_STAGES = new Set<SeparationTaskStage>(["cancelled", "completed", "failed"]);
+const TERMINAL_STAGES = new Set<SeparationTaskStage>([
+  "paused",
+  "cancelled",
+  "completed",
+  "failed",
+]);
 
 export class SeparationTaskController {
   readonly taskId: string;
@@ -69,6 +97,7 @@ export class SeparationTaskController {
 
   private readonly abortController = new AbortController();
   private readonly cleanups: CleanupCallback[] = [];
+  private readonly pauseListeners: Array<() => void> = [];
   private readonly throttleMs: number;
   private readonly cooldownMs: number;
   private readonly onProgress?: (event: SeparationProgressEvent) => void;
@@ -82,6 +111,8 @@ export class SeparationTaskController {
   private lastEmitProgress = -1;
   private backend: "webgpu" | "wasm" | undefined;
   private cancelPromise: Promise<void> | null = null;
+  private pausePromise: Promise<void> | null = null;
+  private pauseRequested = false;
   private settled = false;
 
   constructor(options: SeparationTaskOptions) {
@@ -107,6 +138,22 @@ export class SeparationTaskController {
 
   isCancellingOrCancelled(): boolean {
     return this.stage === "cancelling" || this.stage === "cancelled" || this.signal.aborted;
+  }
+
+  isPausingOrPaused(): boolean {
+    return this.pauseRequested || this.stage === "pausing" || this.stage === "paused";
+  }
+
+  onPauseRequested(listener: () => void): () => void {
+    if (this.isPausingOrPaused()) {
+      queueMicrotask(() => listener());
+      return () => undefined;
+    }
+    this.pauseListeners.push(listener);
+    return () => {
+      const idx = this.pauseListeners.indexOf(listener);
+      if (idx >= 0) this.pauseListeners.splice(idx, 1);
+    };
   }
 
   /** 確認目前仍為該歌曲的有效世代，避免過期非同步 callback 覆寫 UI。 */
@@ -143,12 +190,20 @@ export class SeparationTaskController {
   }
 
   updateProgress(
-    stage: Exclude<SeparationTaskStage, "idle" | "cancelling" | "cancelled" | "completed" | "failed">,
+    stage: Exclude<
+      SeparationTaskStage,
+      "idle" | "pausing" | "paused" | "cancelling" | "cancelled" | "completed" | "failed"
+    >,
     progress: number,
     message: string,
     details?: SeparationProgressEvent["details"],
   ): void {
-    if (!this.isCurrent() || this.isTerminal() || this.isCancellingOrCancelled()) {
+    if (
+      !this.isCurrent() ||
+      this.isTerminal() ||
+      this.isCancellingOrCancelled() ||
+      this.stage === "pausing"
+    ) {
       return;
     }
 
@@ -181,8 +236,18 @@ export class SeparationTaskController {
     this.onSettled?.("completed");
   }
 
+  markPaused(message = "已於安全 Chunk 邊界暫停，可隨時續跑"): void {
+    if (!this.isCurrent() || this.settled || this.isCancellingOrCancelled()) {
+      return;
+    }
+    this.stage = "paused";
+    this.settled = true;
+    this.emit("paused", this.lastEmitProgress >= 0 ? this.lastEmitProgress : 0, message);
+    this.onSettled?.("paused");
+  }
+
   markFailed(message: string): void {
-    if (!this.isCurrent() || this.settled || this.stage === "cancelled") {
+    if (!this.isCurrent() || this.settled || this.stage === "cancelled" || this.stage === "paused") {
       return;
     }
     if (this.stage === "cancelling") {
@@ -192,6 +257,51 @@ export class SeparationTaskController {
     this.settled = true;
     this.emit("failed", this.lastEmitProgress >= 0 ? this.lastEmitProgress : 0, message);
     this.onSettled?.("failed");
+  }
+
+  /**
+   * 要求於下一個安全 Chunk 提交邊界暫停：
+   * - 不立即 abort 正在寫入 IndexedDB 的原子交易；
+   * - Worker 完成當前 Chunk 並 commit 後，停止並保留 Checkpoint 供後續續跑。
+   */
+  pause(reason = "已暫停分離，已完成進度已安全保存", overrideCooldownMs?: number): Promise<void> {
+    if (this.pausePromise) return this.pausePromise;
+    if (
+      this.stage === "completed" ||
+      this.stage === "failed" ||
+      this.stage === "cancelled" ||
+      this.stage === "paused" ||
+      this.stage === "cancelling"
+    ) {
+      return Promise.resolve();
+    }
+    this.pauseRequested = true;
+    this.stage = "pausing";
+    if (this.isCurrent()) {
+      this.emit(
+        "pausing",
+        this.lastEmitProgress >= 0 ? this.lastEmitProgress : 0,
+        "正在等待當前 Chunk 提交完成後暫停…",
+      );
+    }
+    for (const listener of [...this.pauseListeners]) {
+      try {
+        listener();
+      } catch {
+        // 忽略單一 listener 例外
+      }
+    }
+    const waitMs = overrideCooldownMs ?? this.cooldownMs;
+    this.pausePromise = (async () => {
+      // 若任務尚未註冊 worker 或未在推論中，清理並進入 paused
+      if (this.cleanups.length === 0) {
+        if (waitMs > 0) {
+          await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
+        }
+        this.markPaused(reason);
+      }
+    })();
+    return this.pausePromise;
   }
 
   /**
@@ -272,7 +382,8 @@ export class SeparationTaskCoordinator {
   }
 
   isBusyWaitingCleanup(): boolean {
-    return Boolean(this.globalBusyTask && this.globalBusyTask.getStage() === "cancelling");
+    const stage = this.globalBusyTask?.getStage();
+    return Boolean(this.globalBusyTask && (stage === "cancelling" || stage === "pausing"));
   }
 
   hasRunningHeavyTask(excludeSongId?: string): boolean {
@@ -290,17 +401,19 @@ export class SeparationTaskCoordinator {
 
   /**
    * 啟動歌曲分離任務前取得有效 Controller；
-   * 若上一個重型分離仍在 `cancelling` 釋放資源，或已有其他歌曲正在執行推論，拒絕立即疊加執行。
+   * 若上一個重型分離仍在 `cancelling`/`pausing` 釋放資源，或已有其他歌曲正在執行推論，拒絕立即疊加執行。
    */
   startTask(options: Omit<SeparationTaskOptions, "generation" | "isGenerationCurrent" | "onSettled">): SeparationTaskController {
-    if (this.globalBusyTask && this.globalBusyTask.getStage() === "cancelling") {
-      throw new Error("上一個音源分離任務仍在停止並釋放 WebGPU/WASM 資源，請稍候片刻再試。");
+    const globalStage = this.globalBusyTask?.getStage();
+    if (this.globalBusyTask && (globalStage === "cancelling" || globalStage === "pausing")) {
+      throw new Error("上一個音源分離任務仍在停止並釋放資源，請稍候片刻再試。");
     }
 
     const existingForSong = this.activeControllers.get(options.songId);
     if (existingForSong && !existingForSong.isTerminal()) {
-      if (existingForSong.getStage() === "cancelling") {
-        throw new Error("此歌曲仍在停止分離並清理暫存資源，請稍候片刻再重試。");
+      const stage = existingForSong.getStage();
+      if (stage === "cancelling" || stage === "pausing") {
+        throw new Error("此歌曲仍在停止或暫停分離並提交進度，請稍候片刻再重試。");
       }
       throw new Error("此歌曲已有進行中的音源分離任務。");
     }
@@ -329,6 +442,15 @@ export class SeparationTaskCoordinator {
     this.activeControllers.set(options.songId, controller);
     this.globalBusyTask = controller;
     return controller;
+  }
+
+  async pauseTask(songId: string, reason?: string, cooldownMs?: number): Promise<boolean> {
+    const controller = this.activeControllers.get(songId) ?? (
+      this.globalBusyTask?.songId === songId ? this.globalBusyTask : null
+    );
+    if (!controller) return false;
+    await controller.pause(reason, cooldownMs);
+    return true;
   }
 
   async cancelTask(songId: string, reason?: string, cooldownMs?: number): Promise<boolean> {

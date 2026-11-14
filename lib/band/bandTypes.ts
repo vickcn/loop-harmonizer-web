@@ -14,6 +14,8 @@ export type SongPlaybackSource = "original" | "stems";
 export type SeparationStatus =
   | "not_started"
   | "processing"
+  | "paused"
+  | "interrupted"
   | "cancelling"
   | "cancelled"
   | "completed"
@@ -83,6 +85,12 @@ export type BandSong = {
   separationMode: "two_stem" | "four_stem" | null;
   separationProgress: number;
   separationMessage: string;
+  separationTaskId?: string | null;
+  separationCompletedChunks?: number;
+  separationTotalChunks?: number;
+  separationCommittedBytes?: number;
+  separationUserAuthorized?: boolean;
+  separationUsesChunkPlayback?: boolean;
   playbackSource: SongPlaybackSource;
   cacheKey: string | null;
   sourceAudioHash?: string | null;

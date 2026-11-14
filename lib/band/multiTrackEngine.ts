@@ -15,6 +15,11 @@
 import { FastRateAdapter } from "./playbackAdapters/FastRateAdapter";
 import { PitchPreserveAdapter } from "./playbackAdapters/PitchPreserveAdapter";
 import { SoundTouchAdapter, type SoundTouchBufferLike } from "./playbackAdapters/SoundTouchAdapter";
+import {
+  ChunkedStemMixBuffer,
+  type ChunkMixStemRole,
+  type ChunkMixTrackEntry,
+} from "./playbackAdapters/ChunkPlaybackAdapter";
 import type { TrackPlaybackAdapter } from "./playbackAdapters/types";
 import { createAudioBufferFromStem } from "@/lib/separation/audioBuffer";
 import type { StereoPcm } from "@/lib/separation/stemTypes";
@@ -73,10 +78,17 @@ class StemMixBuffer implements SoundTouchBufferLike {
   }
 }
 
+type StemMixEntryState = {
+  trackId: string;
+  gain: number;
+  muted: boolean;
+};
+
 type StemMixBus = {
   groupId: string;
   trackIds: string[];
-  entriesByTrackId: Map<string, StemMixEntry>;
+  entriesByTrackId: Map<string, StemMixEntryState>;
+  chunkedBuffer?: ChunkedStemMixBuffer;
   gainNode: GainNode;
   adapter: SoundTouchAdapter;
   pausedAt: number;
@@ -87,7 +99,7 @@ type StemMixBus = {
 };
 
 type InternalTrack = {
-  buffer: AudioBuffer;
+  buffer: AudioBuffer | null;
   gainNode: GainNode;
   adapter: TrackPlaybackAdapter;
   pausedAt: number;
@@ -202,7 +214,7 @@ export class MultiTrackEngine {
 
     for (const trackId of trackIds) {
       const track = this.tracks.get(trackId);
-      if (!track) continue;
+      if (!track || !track.buffer) continue;
       if (!firstTrack) firstTrack = track;
       const left = track.buffer.getChannelData(0);
       const right = track.buffer.numberOfChannels > 1 ? track.buffer.getChannelData(1) : left;
@@ -217,7 +229,7 @@ export class MultiTrackEngine {
       this.trackToMixGroup.set(trackId, groupId);
     }
 
-    if (!validIds.length || !firstTrack) return;
+    if (!validIds.length || !firstTrack || !firstTrack.buffer) return;
 
     const mixBuffer = new StemMixBuffer(entries, firstTrack.buffer.sampleRate);
     const gainNode = ctx.createGain();
@@ -244,6 +256,113 @@ export class MultiTrackEngine {
     this.stemMixBuses.set(groupId, bus);
   }
 
+  /**
+   * 載入 IndexedDB 分段保存的分離分軌（不將全曲 4 軌 PCM 載入記憶體），
+   * 透過 ChunkedStemMixBuffer 僅常駐滑動視窗內的數個 Chunk 並接入單一 SoundTouchAdapter。
+   */
+  async loadChunkedStemGroup(params: {
+    groupId: string;
+    taskId: string;
+    totalSamples: number;
+    sampleRate: number;
+    tracks: Array<{
+      trackId: string;
+      role: ChunkMixStemRole;
+      volume?: number;
+      muted?: boolean;
+    }>;
+    playbackRate?: number;
+    keyShiftSemitones?: number;
+    loop?: boolean;
+    initialPositionSec?: number;
+  }): Promise<number> {
+    this._disposeMixBus(params.groupId);
+    const ctx = this.ensureCtx();
+    const initialRate = Math.max(0.1, Math.min(4, params.playbackRate ?? 1));
+    const initialPitch = params.keyShiftSemitones ?? 0;
+    const initialPos = Math.max(0, params.initialPositionSec ?? 0);
+
+    const entries: ChunkMixTrackEntry[] = [];
+    const trackIds: string[] = [];
+
+    for (const spec of params.tracks) {
+      const existing = this.tracks.get(spec.trackId);
+      if (existing) {
+        existing.adapter.dispose();
+        try { existing.gainNode.disconnect(); } catch { /* ok */ }
+        this.tracks.delete(spec.trackId);
+      }
+      const entry: ChunkMixTrackEntry = {
+        trackId: spec.trackId,
+        role: spec.role,
+        gain: spec.volume ?? 1,
+        muted: Boolean(spec.muted),
+      };
+      entries.push(entry);
+      trackIds.push(spec.trackId);
+      this.trackToMixGroup.set(spec.trackId, params.groupId);
+
+      // 輕量虛擬軌道紀錄：不持有整曲 AudioBuffer
+      const dummyGain = ctx.createGain();
+      const dummyAdapter = new SoundTouchAdapter();
+      this.tracks.set(spec.trackId, {
+        buffer: null,
+        gainNode: dummyGain,
+        adapter: dummyAdapter,
+        pausedAt: initialPos,
+        isPlaying: false,
+        playbackRate: initialRate,
+        volume: entry.gain,
+        muted: entry.muted,
+        loop: Boolean(params.loop),
+        playbackMode: "soundtouch",
+        keyShiftSemitones: initialPitch,
+      });
+    }
+
+    const chunkedBuffer = new ChunkedStemMixBuffer({
+      taskId: params.taskId,
+      totalSamples: params.totalSamples,
+      sampleRate: params.sampleRate,
+      entries,
+      loop: params.loop,
+    });
+    await chunkedBuffer.warmUpAroundSample(Math.floor(initialPos * chunkedBuffer.sampleRate));
+
+    const gainNode = ctx.createGain();
+    gainNode.gain.value = 1;
+    gainNode.connect(ctx.destination);
+
+    const adapter = new SoundTouchAdapter();
+    adapter.load(chunkedBuffer, gainNode, ctx);
+    adapter.setPlaybackRate(initialRate, ctx, 0);
+    adapter.setPitchSemitones(initialPitch, ctx);
+
+    const bus: StemMixBus = {
+      groupId: params.groupId,
+      trackIds,
+      entriesByTrackId: new Map(entries.map((entry) => [entry.trackId, entry])),
+      chunkedBuffer,
+      gainNode,
+      adapter,
+      pausedAt: initialPos,
+      isPlaying: false,
+      playbackRate: initialRate,
+      keyShiftSemitones: initialPitch,
+      loop: Boolean(params.loop),
+    };
+    this.stemMixBuses.set(params.groupId, bus);
+    return chunkedBuffer.duration;
+  }
+
+  async warmupChunkedStemGroup(groupId: string, positionSec = 0): Promise<void> {
+    const bus = this.stemMixBuses.get(groupId);
+    if (!bus?.chunkedBuffer) return;
+    await bus.chunkedBuffer.warmUpAroundSample(
+      Math.floor(Math.max(0, positionSec) * bus.chunkedBuffer.sampleRate),
+    );
+  }
+
   hasTrack(trackId: string): boolean {
     return this.tracks.has(trackId);
   }
@@ -259,7 +378,13 @@ export class MultiTrackEngine {
 
   getTrackMemoryEstimateBytes(): number {
     let total = 0;
+    for (const bus of this.stemMixBuses.values()) {
+      if (bus.chunkedBuffer) {
+        total += bus.chunkedBuffer.getEstimatedResidentBytes();
+      }
+    }
     for (const track of this.tracks.values()) {
+      if (!track.buffer) continue;
       total += track.buffer.length * track.buffer.numberOfChannels * 4;
     }
     return total;
@@ -355,7 +480,9 @@ export class MultiTrackEngine {
       if (this.isTrackPlaying(trackId)) continue;
       const track = this.tracks.get(trackId);
       if (!track) continue;
-      estimatedFreedBytes += track.buffer.length * track.buffer.numberOfChannels * 4;
+      if (track.buffer) {
+        estimatedFreedBytes += track.buffer.length * track.buffer.numberOfChannels * 4;
+      }
       this.removeTrack(trackId);
       releasedTrackIds.push(trackId);
     }
@@ -411,6 +538,11 @@ export class MultiTrackEngine {
         const member = this.tracks.get(id);
         if (member) member.pausedAt = offset;
       }
+      if (bus.chunkedBuffer) {
+        void bus.chunkedBuffer.warmUpAroundSample(
+          Math.floor(offset * bus.chunkedBuffer.sampleRate),
+        );
+      }
       if (bus.isPlaying) this._startMixBusAt(bus, ctx.currentTime);
     }
 
@@ -428,7 +560,14 @@ export class MultiTrackEngine {
     await ctx.resume();
     const { buses, standalone } = this._resolvePlaybackTargets(trackIds);
     await Promise.all([
-      ...buses.map((bus) => bus.adapter.prepare?.()),
+      ...buses.map(async (bus) => {
+        if (bus.chunkedBuffer) {
+          await bus.chunkedBuffer.warmUpAroundSample(
+            Math.floor(Math.max(0, bus.pausedAt) * bus.chunkedBuffer.sampleRate),
+          );
+        }
+        await bus.adapter.prepare?.();
+      }),
       ...standalone.map(({ track }) => track.adapter.prepare?.()),
     ]);
     // SoundTouch 的模組先共同預載，再於同一 JavaScript tick 啟動，避免每軌各自 setTimeout。
@@ -495,7 +634,7 @@ export class MultiTrackEngine {
    */
   setPlaybackMode(trackId: string, mode: EnginePlaybackMode): void {
     const t = this.tracks.get(trackId);
-    if (!t || t.playbackMode === mode) return;
+    if (!t || !t.buffer || t.playbackMode === mode) return;
 
     const ctx = this.ensureCtx();
     const wasPlaying = t.isPlaying;
@@ -538,6 +677,7 @@ export class MultiTrackEngine {
           const bus = this.stemMixBuses.get(groupId);
           if (bus) {
             bus.loop = loop;
+            bus.chunkedBuffer?.setLoopEnabled(loop);
             bus.adapter.setLoop(loop, loop ? null : () => this._handleMixBusEnded(bus));
           }
         }
@@ -699,6 +839,7 @@ export class MultiTrackEngine {
     const bus = this.stemMixBuses.get(groupId);
     if (!bus) return;
     bus.adapter.dispose();
+    bus.chunkedBuffer?.dispose();
     try { bus.gainNode.disconnect(); } catch { /* ok */ }
     for (const id of bus.trackIds) {
       if (this.trackToMixGroup.get(id) === groupId) {

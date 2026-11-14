@@ -90,7 +90,10 @@ export function StemSeparationDialog({ open, onClose, onAddStems }: Props) {
         },
       });
       resultRef.current = result;
-      setResultSummary({ backend: result.backend, stemTypes: result.stems.tracks.map((track) => track.stemType) });
+      setResultSummary({
+        backend: result.backend,
+        stemTypes: result.stems?.tracks.map((track) => track.stemType) ?? [],
+      });
       setStatus("分離完成。可先下載 WAV，或將全部分軌加入 Band Mixer。");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "音源分離失敗，請稍後重試。");
@@ -211,11 +214,11 @@ export function StemSeparationDialog({ open, onClose, onAddStems }: Props) {
               <button className="btn primary" onClick={() => void addStems()} disabled={adding}>
                 {adding ? "加入中…" : "＋ 將全部分軌加入 Band Mixer"}
               </button>
-              {result.stems.tracks.map((stem) => (
+              {result.stems?.tracks.map((stem) => (
                 <button
                   className="btn"
                   key={stem.stemType}
-                  onClick={() => downloadStem(fileName, stem.stemType, stem.left, stem.right, result.stems.sampleRate)}
+                  onClick={() => downloadStem(fileName, stem.stemType, stem.left, stem.right, result.stems!.sampleRate)}
                 >
                   ↓ {STEM_LABELS[stem.stemType]} WAV
                 </button>

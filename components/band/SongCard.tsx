@@ -22,6 +22,9 @@ type Props = {
   onStemChange: (id: string, patch: Partial<StemChannel>) => void;
   onDownloadStem: (id: string) => void;
   onClearSongCache: () => void;
+  onPauseSeparation?: () => void;
+  onResumeSeparation?: () => void;
+  onClearSeparationData?: () => void;
   onAbortSeparation?: () => void;
   onRestoreSnapshot?: () => void;
   onLoadAudio?: () => void;
@@ -150,6 +153,23 @@ function UndoSnapshotIcon() {
   );
 }
 
+function PauseBoundaryIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="6" y="4" width="4" height="16" rx="1" />
+      <rect x="14" y="4" width="4" height="16" rx="1" />
+    </svg>
+  );
+}
+
+function ResumePlayIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <polygon points="6 4 20 12 6 20 6 4" />
+    </svg>
+  );
+}
+
 const STATUS_COLOR = { stopped: "var(--muted)", playing: "#22c55e", paused: "#f59e0b" };
 const STATUS_LABEL = { stopped: "停止", playing: "播放中", paused: "暫停" };
 const PERSISTENCE_BADGE = {
@@ -184,6 +204,14 @@ export const SongCard = memo(function SongCard(props: Props) {
     prevSeparationStatusRef.current = song.separationStatus;
   }, [song.separationStatus, song.stemIds.length]);
   const isSeparating = song.separationStatus === "processing" || song.separationStatus === "cancelling";
+  const isPausingStage = isSeparating && (song.separationStage as string) === "pausing";
+  const completedChunks = song.separationCompletedChunks ?? 0;
+  const totalChunks = song.separationTotalChunks ?? 0;
+  const hasSavedChunks = completedChunks > 0 && totalChunks > 0;
+  const committedMiB = ((song.separationCommittedBytes ?? 0) / (1024 * 1024)).toFixed(1);
+  const chunkResumePct = totalChunks > 0
+    ? Math.round((completedChunks / totalChunks) * 100)
+    : Math.round((song.separationProgress || 0) * 100);
   const focusLocked = Boolean(props.separationFocusLocked);
   const focusLockReason = "分離專注模式執行中，已暫停音訊處理並鎖定高負載操作（可隨時中止分離）";
   const stageLabel =
@@ -192,10 +220,12 @@ export const SongCard = memo(function SongCard(props: Props) {
       : song.separationStage === "downloading"
         ? "下載或讀取模型權重"
         : song.separationStage === "cancelling"
-          ? "正在停止 Worker 並釋放資源"
-          : song.separationStage === "processing"
-            ? "AI 音源分離運算中"
-            : "處理中";
+          ? "正在停止 Worker 並保留已完成段落"
+          : (song.separationStage as string) === "pausing"
+            ? "正在安全邊界暫停並寫入 Checkpoint"
+            : song.separationStage === "processing"
+              ? "AI 音源分離運算中"
+              : "處理中";
   const isDecodingAudio = song.audioLoadState === "decoding";
   const audioUnavailable =
     song.persistenceStatus === "restoring"
@@ -206,7 +236,7 @@ export const SongCard = memo(function SongCard(props: Props) {
       ? "正在停…"
       : song.separationStatus === "processing"
         ? "分離中…"
-        : song.separationStatus === "cancelled" || song.separationStatus === "completed"
+        : song.separationStatus === "cancelled" || song.separationStatus === "completed" || song.separationStatus === "paused" || song.separationStatus === "interrupted"
           ? "重新分離音源"
           : song.separationStatus === "failed"
             ? "重試分離音源"
@@ -713,7 +743,7 @@ export const SongCard = memo(function SongCard(props: Props) {
                       icon={
                         isSeparating
                           ? <span className="mixer-spinner" aria-hidden="true" />
-                          : <SplitStemsIcon refresh={song.separationStatus === "completed" || song.separationStatus === "cancelled"} />
+                          : <SplitStemsIcon refresh={song.separationStatus === "completed" || song.separationStatus === "cancelled" || song.separationStatus === "paused" || song.separationStatus === "interrupted"} />
                       }
                       label={separateActionLabel}
                       primary
@@ -778,18 +808,18 @@ export const SongCard = memo(function SongCard(props: Props) {
                       },
                       {
                         key: "clear-cache",
-                        label: song.cacheKey ? "清除此歌分離快取" : "目前已無本機快取",
-                        disabled: focusLocked || !song.cacheKey || isSeparating,
-                        disabledReason: focusLocked ? focusLockReason : (!song.cacheKey ? "目前已無本機快取" : isSeparating ? "分離執行中暫無法清除" : undefined),
-                        onSelect: props.onClearSongCache,
+                        label: song.cacheKey || hasSavedChunks ? "清除此歌分離快取／進度" : "目前已無本機快取",
+                        disabled: focusLocked || (!song.cacheKey && !hasSavedChunks) || isSeparating,
+                        disabledReason: focusLocked ? focusLockReason : (!song.cacheKey && !hasSavedChunks ? "目前已無本機快取" : isSeparating ? "分離執行中暫無法清除" : undefined),
+                        onSelect: props.onClearSeparationData ?? props.onClearSongCache,
                         renderInline: () => (
                           <IconActionButton
                             icon="🧹"
-                            label={song.cacheKey ? "清除此歌分離快取" : "目前已無本機快取"}
-                            disabled={focusLocked || !song.cacheKey || isSeparating}
-                            disabledReason={focusLocked ? focusLockReason : (!song.cacheKey ? "目前已無本機快取" : isSeparating ? "分離執行中暫無法清除" : undefined)}
+                            label={song.cacheKey || hasSavedChunks ? "清除此歌分離快取／進度" : "目前已無本機快取"}
+                            disabled={focusLocked || (!song.cacheKey && !hasSavedChunks) || isSeparating}
+                            disabledReason={focusLocked ? focusLockReason : (!song.cacheKey && !hasSavedChunks ? "目前已無本機快取" : isSeparating ? "分離執行中暫無法清除" : undefined)}
                             className="is-compact"
-                            onClick={props.onClearSongCache}
+                            onClick={props.onClearSeparationData ?? props.onClearSongCache}
                           />
                         ),
                       },
@@ -815,7 +845,7 @@ export const SongCard = memo(function SongCard(props: Props) {
           </div>
           {(song.separationStatus === "processing" || song.separationStatus === "cancelling") && (() => {
             const isCancelling = song.separationStatus === "cancelling";
-            const hasDeterminate = !isCancelling && Number.isFinite(song.separationProgress) && song.separationProgress > 0 && song.separationProgress < 1;
+            const hasDeterminate = !isCancelling && Number.isFinite(song.separationProgress) && song.separationProgress > 0 && song.separationProgress <= 1;
             const pct = hasDeterminate ? Math.round(song.separationProgress * 100) : null;
             return (
               <div className="grid mixer-separation-active-panel" style={{ gap: 8 }}>
@@ -846,7 +876,15 @@ export const SongCard = memo(function SongCard(props: Props) {
                       />
                     </div>
                     <span className="small" style={{ opacity: 0.9 }}>
-                      {isCancelling ? "正在停…" : (song.separationMessage || "處理中…")}
+                      {isCancelling ? "正在安全停止…" : (song.separationMessage || "處理中…")}
+                    </span>
+                    {totalChunks > 0 && (
+                      <span className="small" style={{ color: "#cbd5e1", fontVariantNumeric: "tabular-nums" }}>
+                        {`第 ${completedChunks} / ${totalChunks} 段${pct !== null ? `（${pct}%）` : ""}｜本機已保存 ${committedMiB} MiB`}
+                      </span>
+                    )}
+                    <span className="small" style={{ color: "#94a3b8" }}>
+                      切換 App 或鎖定螢幕時將自動暫停，返回頁面後可從最近完成的段落接續。
                     </span>
                     {focusLocked && (
                       <span className="small" style={{ color: "#bae6fd" }}>
@@ -854,51 +892,191 @@ export const SongCard = memo(function SongCard(props: Props) {
                       </span>
                     )}
                   </div>
-                  {props.onAbortSeparation && (
-                    <button
-                      type="button"
-                      className="btn mixer-abort-button"
-                      disabled={isCancelling}
-                      aria-label={isCancelling ? "正在停止音源分離" : `中止「${song.name}」音源分離`}
-                      title="中止音源分離並清理暫存資源"
-                      onClick={props.onAbortSeparation}
-                    >
-                      <OctagonXIcon />
-                      <span>{isCancelling ? "正在停…" : "中止分離"}</span>
-                    </button>
-                  )}
+                  <div className="row" style={{ gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                    {props.onPauseSeparation && (
+                      <button
+                        type="button"
+                        className="btn mixer-button"
+                        disabled={isCancelling || isPausingStage}
+                        style={{ minHeight: 44, minWidth: 44, padding: "8px 12px" }}
+                        aria-label={`在安全邊界暫停「${song.name}」音源分離`}
+                        title="等待目前 Chunk 寫入完成後安全暫停，之後可接續完成"
+                        onClick={props.onPauseSeparation}
+                      >
+                        <PauseBoundaryIcon />
+                        <span>{isPausingStage ? "暫停中…" : "暫停（保留進度）"}</span>
+                      </button>
+                    )}
+                    {props.onAbortSeparation && (
+                      <button
+                        type="button"
+                        className="btn mixer-abort-button"
+                        disabled={isCancelling}
+                        aria-label={isCancelling ? "正在停止音源分離" : `中止「${song.name}」音源分離`}
+                        title="立即中止音源分離，已寫入之段落仍將安全保留"
+                        onClick={props.onAbortSeparation}
+                      >
+                        <OctagonXIcon />
+                        <span>{isCancelling ? "正在停…" : "中止分離"}</span>
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
             );
           })()}
-          {song.separationStatus === "cancelled" && (
-            <div role="status" className="card-warning-banner">
-              <span>{song.separationMessage || "已中止音源分離，保留原本音訊設定。"}</span>
-              <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
+          {(song.separationStatus === "paused" || song.separationStatus === "interrupted") && (
+            <div role="status" className="card-warning-banner" style={{ alignItems: "flex-start" }}>
+              <div className="grid" style={{ gap: 4, flex: "1 1 220px", minWidth: 0 }}>
+                <strong style={{ fontSize: 13 }}>
+                  {song.separationStatus === "paused" ? "已暫停分離（已保存安全檢查點）" : "背景中斷，可從最近完成段落接續"}
+                </strong>
+                <span>{song.separationMessage || "返回頁面後可接續未完成的分離段落。"}</span>
+                {totalChunks > 0 && (
+                  <span className="small" style={{ fontVariantNumeric: "tabular-nums" }}>
+                    {`進度：第 ${completedChunks} / ${totalChunks} 段（${chunkResumePct}%）｜本機已保存 ${committedMiB} MiB`}
+                  </span>
+                )}
+                <span className="small" style={{ opacity: 0.85 }}>
+                  切換 App 或鎖定螢幕時允許瀏覽器暫停運算，已完成的段落不會重算。
+                </span>
+              </div>
+              <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+                {props.onResumeSeparation && (
+                  <button
+                    type="button"
+                    className="btn mixer-button primary"
+                    style={{ minHeight: 44, minWidth: 44, padding: "8px 12px" }}
+                    disabled={focusLocked || audioUnavailable}
+                    onClick={props.onResumeSeparation}
+                  >
+                    <ResumePlayIcon />
+                    <span>{`繼續分離（第 ${Math.min(completedChunks + 1, Math.max(1, totalChunks))} 段起）`}</span>
+                  </button>
+                )}
+                {props.onClearSeparationData && (
+                  <button
+                    type="button"
+                    className="btn mixer-button"
+                    style={{ minHeight: 44, minWidth: 44, padding: "8px 12px" }}
+                    disabled={focusLocked}
+                    onClick={props.onClearSeparationData}
+                  >
+                    清除分離進度
+                  </button>
+                )}
                 {song.activeSnapshot && props.onRestoreSnapshot && (
-                  <button type="button" className="btn mixer-button" disabled={focusLocked} style={{ padding: "4px 10px", fontSize: 12 }} onClick={props.onRestoreSnapshot}>
+                  <button type="button" className="btn mixer-button" disabled={focusLocked} style={{ minHeight: 44, minWidth: 44, padding: "8px 12px" }} onClick={props.onRestoreSnapshot}>
                     ↩ 回復上一動
                   </button>
                 )}
-                <button type="button" className="btn mixer-button" style={{ padding: "4px 10px", fontSize: 12 }} disabled={focusLocked || audioUnavailable} onClick={() => props.onSeparate(mode)}>
+              </div>
+            </div>
+          )}
+          {song.separationStatus === "cancelled" && (
+            <div role="status" className="card-warning-banner" style={{ alignItems: "flex-start" }}>
+              <div className="grid" style={{ gap: 4, flex: "1 1 220px", minWidth: 0 }}>
+                <span>{song.separationMessage || "已中止音源分離，保留原本音訊設定。"}</span>
+                {hasSavedChunks && (
+                  <span className="small" style={{ fontVariantNumeric: "tabular-nums" }}>
+                    {`已保留第 ${completedChunks} / ${totalChunks} 段（${chunkResumePct}%）｜本機已保存 ${committedMiB} MiB`}
+                  </span>
+                )}
+              </div>
+              <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+                {hasSavedChunks && props.onResumeSeparation && (
+                  <button
+                    type="button"
+                    className="btn mixer-button primary"
+                    style={{ minHeight: 44, minWidth: 44, padding: "8px 12px" }}
+                    disabled={focusLocked || audioUnavailable}
+                    onClick={props.onResumeSeparation}
+                  >
+                    <ResumePlayIcon />
+                    <span>{`繼續分離（第 ${Math.min(completedChunks + 1, totalChunks)} 段起）`}</span>
+                  </button>
+                )}
+                {hasSavedChunks && props.onClearSeparationData && (
+                  <button
+                    type="button"
+                    className="btn mixer-button"
+                    style={{ minHeight: 44, minWidth: 44, padding: "8px 12px" }}
+                    disabled={focusLocked}
+                    onClick={props.onClearSeparationData}
+                  >
+                    清除已保存進度
+                  </button>
+                )}
+                {song.activeSnapshot && props.onRestoreSnapshot && (
+                  <button type="button" className="btn mixer-button" disabled={focusLocked} style={{ minHeight: 44, minWidth: 44, padding: "8px 12px" }} onClick={props.onRestoreSnapshot}>
+                    ↩ 回復上一動
+                  </button>
+                )}
+                <button type="button" className="btn mixer-button" style={{ minHeight: 44, minWidth: 44, padding: "8px 12px" }} disabled={focusLocked || audioUnavailable} onClick={() => props.onSeparate(mode)}>
                   重新分離
                 </button>
               </div>
             </div>
           )}
           {song.separationStatus === "completed" && song.separationMessage && (
-            <span className="small" style={{ color: "#34d399" }}>✓ {song.separationMessage}</span>
+            <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              <span className="small" style={{ color: "#34d399" }}>
+                ✓ {song.separationMessage}
+                {totalChunks > 0 ? `（已完成 ${completedChunks || totalChunks} / ${totalChunks} 段${song.separationCommittedBytes ? `｜${committedMiB} MiB` : ""}）` : ""}
+              </span>
+              {props.onClearSeparationData && (song.separationUsesChunkPlayback || hasSavedChunks) && (
+                <button
+                  type="button"
+                  className="btn mixer-button"
+                  style={{ minHeight: 44, minWidth: 44, padding: "6px 12px", fontSize: 12 }}
+                  disabled={focusLocked}
+                  onClick={props.onClearSeparationData}
+                >
+                  清除分段資料
+                </button>
+              )}
+            </div>
           )}
           {song.separationStatus === "failed" && (
-            <div role="alert" className="card-error-banner">
-              <span>{song.separationMessage}</span>
-              <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
+            <div role="alert" className="card-error-banner" style={{ alignItems: "flex-start" }}>
+              <div className="grid" style={{ gap: 4, flex: "1 1 220px", minWidth: 0 }}>
+                <span>{song.separationMessage}</span>
+                {hasSavedChunks && (
+                  <span className="small" style={{ fontVariantNumeric: "tabular-nums" }}>
+                    {`已完成第 ${completedChunks} / ${totalChunks} 段（${chunkResumePct}%）｜本機已保存 ${committedMiB} MiB`}
+                  </span>
+                )}
+              </div>
+              <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+                {hasSavedChunks && props.onResumeSeparation && (
+                  <button
+                    type="button"
+                    className="btn mixer-button primary"
+                    style={{ minHeight: 44, minWidth: 44, padding: "8px 12px" }}
+                    disabled={focusLocked || audioUnavailable}
+                    onClick={props.onResumeSeparation}
+                  >
+                    <ResumePlayIcon />
+                    <span>{`繼續分離（第 ${Math.min(completedChunks + 1, totalChunks)} 段起）`}</span>
+                  </button>
+                )}
+                {hasSavedChunks && props.onClearSeparationData && (
+                  <button
+                    type="button"
+                    className="btn mixer-button"
+                    style={{ minHeight: 44, minWidth: 44, padding: "8px 12px" }}
+                    disabled={focusLocked}
+                    onClick={props.onClearSeparationData}
+                  >
+                    清除分離進度
+                  </button>
+                )}
                 {song.activeSnapshot && props.onRestoreSnapshot && (
-                  <button type="button" className="btn mixer-button" disabled={focusLocked} style={{ padding: "4px 10px", fontSize: 12 }} onClick={props.onRestoreSnapshot}>
+                  <button type="button" className="btn mixer-button" disabled={focusLocked} style={{ minHeight: 44, minWidth: 44, padding: "8px 12px" }} onClick={props.onRestoreSnapshot}>
                     ↩ 回復上一動
                   </button>
                 )}
-                <button type="button" className="btn mixer-button" style={{ padding: "4px 10px", fontSize: 12 }} disabled={focusLocked || audioUnavailable} onClick={() => props.onSeparate(mode)}>
+                <button type="button" className="btn mixer-button" style={{ minHeight: 44, minWidth: 44, padding: "8px 12px" }} disabled={focusLocked || audioUnavailable} onClick={() => props.onSeparate(mode)}>
                   ↻ 重試
                 </button>
               </div>

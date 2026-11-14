@@ -680,10 +680,10 @@ export function estimateStereoPcmBytes(durationSec: number, sampleRate = DEFAULT
 /**
  * 依分離工作之三個不重疊生命週期階段估算峰值工作記憶體，避免把不會同時駐留的資料重複加總：
  * - Stage 1（解碼與重採樣）：1.4x stereo PCM（解碼後即 zero-copy 轉移至 Worker）
- * - Stage 2（Worker 7.8s 區段推論 + 滾動權重就地正規化）：
- *   固定區段 ONNX/STFT 與 1.3 MiB rollingWeights 工作集 (~175 MiB)
- *   + 並存音訊工作緩衝（省去全域 0.5x weights 與冗餘複製：two_stem 為 2.5x stereo PCM；four_stem 為 4.5x）
- * - Stage 3（Session 釋放後 AudioBuffer 重組）：Worker 已釋放 ONNX Session，僅存輸出 PCM 與 WebAudio AudioBuffer（two_stem 約 3.0x；four_stem 約 5.0x）
+ * - Stage 2（串流 Chunk 推論 + 即時 IndexedDB 提交）：
+ *   固定區段 ONNX/STFT、12.4 MiB 單區段滾動 4 軌緩衝區與單顆 transferable Chunk (~195 MiB + 模式微幅工作緩衝)
+ *   + 單份輸入立體聲來源（1.0x stereo PCM）；不再配置全曲 4 軌 Float32Array！
+ * - Stage 3（滑動視窗按需分段播放）：Worker 已釋放 ONNX Session，僅保留最多 6 顆 Chunk（約 47.2 MiB）駐留播放視窗
  */
 export function estimateSeparationStagePeaks(
   durationSec: number,
@@ -695,13 +695,16 @@ export function estimateSeparationStagePeaks(
       ? Math.round(stereoPcmBytesOverride)
       : estimateStereoPcmBytes(durationSec);
   const decodePeakBytes = Math.round(stereoPcmBytes * 1.4);
-  const fixedSegmentAndSessionBytes = 175 * BYTES_PER_MB;
-  const concurrentAudioMultiplier = mode === "two_stem" ? 2.5 : 4.5;
+  const fixedChunkAndSessionBytes =
+    (mode === "four_stem" ? 203 : 195) * BYTES_PER_MB;
   const inferencePeakBytes = Math.round(
-    fixedSegmentAndSessionBytes + stereoPcmBytes * concurrentAudioMultiplier,
+    fixedChunkAndSessionBytes + stereoPcmBytes,
   );
+  // 滑動視窗最多常駐 6 個 Chunk（6 * 7.87 MiB ≈ 47.2 MiB）加上來源或混音暫存
+  const maxResidentWindowBytes = Math.min(stereoPcmBytes * 4, 48 * BYTES_PER_MB);
+  const modeScratchBytes = (mode === "four_stem" ? 12 : 4) * BYTES_PER_MB;
   const reassemblyPeakBytes = Math.round(
-    stereoPcmBytes * (mode === "two_stem" ? 3.0 : 5.0),
+    stereoPcmBytes + maxResidentWindowBytes + modeScratchBytes,
   );
   const peakWorkingMemoryBytes = Math.max(
     decodePeakBytes,
@@ -752,9 +755,8 @@ export function estimateOperationFootprint(input: ResourceRiskAssessmentInput): 
     case "separate": {
       const mode = input.separationMode === "two_stem" ? "two_stem" : "four_stem";
       const stageBreakdown = estimateSeparationStagePeaks(durationSec, mode, stereoPcmBytes);
-      // 寫入 IndexedDB 時保存 PCM Float32 陣列；2-stem 保存 2 軌，4-stem 保存 4 軌
-      const storedTrackCount = mode === "two_stem" ? 2 : 4;
-      const estimatedStorageBytes = stereoPcmBytes * storedTrackCount;
+      // 串流 Chunk 統一以 4 軌標準格式持久化至 IndexedDB，確保 4-stem 與 2-stem 切換免重跑模型
+      const estimatedStorageBytes = stereoPcmBytes * 4;
       return {
         estimatedMemoryBytes: stageBreakdown.peakWorkingMemoryBytes,
         estimatedStorageBytes,
@@ -932,7 +934,7 @@ export function assessResourceRisk(input: ResourceRiskAssessmentInput): Resource
 
   const honestModeNote =
     input.operation === "separate"
-      ? "註：目前 2 Stem 與 4 Stem 使用同一套 4 Stem AI 模型推論單段音訊，不會降低模型推論本身的運算量；但 2 Stem 會在推論階段即時累加伴奏，僅配置 2 軌全曲輸出 PCM 緩衝區與快取（較 4 Stem 省下約一半全曲輸出緩衝與寫入容量）。"
+      ? "註：目前 2 Stem 模式仍以同一套 4 Stem AI 模型分段推論（不會降低模型推論本身的單段運算量）；系統採用分段 Chunk 串流推論與滑動視窗按需播放，不再一次性配置全曲 4 軌 PCM 記憶體，切換 2 Stem 時由播放器即時合併伴奏而無須重跑 AI 模型。"
       : null;
 
   let estimatedDurationLabel = "數秒內";
