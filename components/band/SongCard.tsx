@@ -189,6 +189,16 @@ function clampManualRate(value: number) {
   return Math.max(MANUAL_RATE_MIN, Math.min(MANUAL_RATE_MAX, value));
 }
 
+export function sliderPositionToRate(position: number): number {
+  const x = Math.max(0, Math.min(1, Number.isFinite(position) ? position : 0.5));
+  return 0.25 * Math.pow(16, x);
+}
+
+export function rateToSliderPosition(rate: number): number {
+  const safeRate = Math.max(MANUAL_RATE_MIN, Math.min(MANUAL_RATE_MAX, Number.isFinite(rate) ? rate : 1));
+  return Math.log(safeRate / 0.25) / Math.log(16);
+}
+
 export const SongCard = memo(function SongCard(props: Props) {
   const { song } = props;
   const [selectedMode, setSelectedMode] = useState<StemSeparationMode | null>(null);
@@ -248,7 +258,8 @@ export const SongCard = memo(function SongCard(props: Props) {
     ? song.targetBpm / Math.max(1, song.originalBpm)
     : song.manualRate;
   const masterVolumePct = Math.round(song.masterVolume * 100);
-  const manualRatePct = ((song.manualRate - MANUAL_RATE_MIN) / (MANUAL_RATE_MAX - MANUAL_RATE_MIN)) * 100;
+  const manualRatePosition = rateToSliderPosition(song.manualRate);
+  const manualRatePct = manualRatePosition * 100;
   const fineOffsetPct = ((song.fineRateOffset + 0.05) / 0.1) * 100;
   const isDefaultKey = song.keyShiftSemitones === 0;
   const isDefaultSpeed = Math.abs(rate - 1) < 0.0005 && song.fineRateOffset === 0 && song.targetBpm === song.originalBpm && song.manualRate === 1;
@@ -665,12 +676,16 @@ export const SongCard = memo(function SongCard(props: Props) {
                 className="manual-rate-slider mixer-range is-speed"
                 type="range"
                 disabled={focusLocked}
-                min={MANUAL_RATE_MIN}
-                max={MANUAL_RATE_MAX}
-                step={MANUAL_RATE_STEP}
-                value={song.manualRate}
+                min={0}
+                max={1}
+                step={0.001}
+                value={manualRatePosition}
                 style={{ "--range-progress": `${manualRatePct}%` } as CSSProperties}
-                onChange={(event) => setManualRate(Number(event.target.value))}
+                onChange={(event) => {
+                  const position = Number(event.target.value);
+                  const nextRate = sliderPositionToRate(position);
+                  setManualRate(nextRate);
+                }}
               />
             </div>
 
@@ -820,21 +835,6 @@ export const SongCard = memo(function SongCard(props: Props) {
                           />
                         ),
                       },
-                      {
-                        key: "toggle-stems",
-                        label: stemsOpen ? "收合分軌拉桿" : `展開分軌拉桿（${song.stemChannels.length} 軌）`,
-                        pressed: stemsOpen,
-                        onSelect: () => setStemsOpen((value) => !value),
-                        renderInline: () => (
-                          <IconActionButton
-                            icon={<ChevronIcon expanded={stemsOpen} />}
-                            label={stemsOpen ? "收合分軌拉桿" : `展開分軌拉桿（${song.stemChannels.length} 軌）`}
-                            expanded={stemsOpen}
-                            className="is-compact"
-                            onClick={() => setStemsOpen((value) => !value)}
-                          />
-                        ),
-                      },
                     ] satisfies AdaptiveActionItem[])
                   : []),
                 ...((song.separationStatus === "completed" || hasSavedChunks || Boolean(song.cacheKey)) && !isSeparating
@@ -878,6 +878,17 @@ export const SongCard = memo(function SongCard(props: Props) {
                   : []),
               ]}
             />
+            {song.stemIds.length > 0 && (
+              <div className="stem-collapse-toggle-wrap" style={{ marginLeft: "auto", flex: "0 0 auto" }}>
+                <IconActionButton
+                  icon={<ChevronIcon expanded={stemsOpen} />}
+                  label={stemsOpen ? "收合分軌拉桿" : `展開分軌拉桿（${song.stemChannels.length} 軌）`}
+                  expanded={stemsOpen}
+                  className="is-compact stem-collapse-toggle"
+                  onClick={() => setStemsOpen((value) => !value)}
+                />
+              </div>
+            )}
           </div>
           {(song.separationStatus === "processing" || song.separationStatus === "cancelling") && (() => {
             const isCancelling = song.separationStatus === "cancelling";
