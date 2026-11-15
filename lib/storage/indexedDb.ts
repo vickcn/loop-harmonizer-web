@@ -1,5 +1,9 @@
 const DB_NAME = "loop-harmonizer-audio-cache";
-const DB_VERSION = 3;
+const DB_VERSION = 4;
+
+export const INDEXEDDB_VERSION = DB_VERSION;
+export const SEPARATION_CHECKPOINT_HASH_INDEX = "by_sourceAudioHash";
+export const SEPARATION_CHUNK_TASK_INDEX = "by_taskId";
 
 export type AudioCacheStore =
   | "separations"
@@ -23,6 +27,12 @@ const ALL_STORES: readonly AudioCacheStore[] = [
 ];
 
 export interface InMemoryIdbHooks {
+  /** 在讀取指定 store 前呼叫，可用於驗證索引查詢不掃描完整二進位資料 */
+  beforeRead?: (
+    storeName: AudioCacheStore,
+    op: "get" | "getAll" | "getAllKeys" | "indexGetAll" | "indexGetAllKeys" | "openKeyCursor",
+    key?: string,
+  ) => void;
   /** 在寫入指定 store 前注入錯誤，用於驗證交易失敗時的原子性回滾 */
   beforeWrite?: (storeName: AudioCacheStore, op: "put" | "delete" | "clear", key?: string) => void;
   /** 在寫入指定 store 後、提交前注入錯誤，用於驗證已寫入同一交易的其他資料是否一併回滾 */
@@ -117,18 +127,73 @@ function createImmediateIdbRequest<T>(executor: () => T): IDBRequest<T> {
   return req;
 }
 
+export interface UpgradeableStoreLike {
+  indexNames: { contains(name: string): boolean };
+  createIndex(
+    name: string,
+    keyPath: string | string[],
+    options?: IDBIndexParameters,
+  ): unknown;
+}
+
+export interface UpgradeableDatabaseLike {
+  objectStoreNames: { contains(name: string): boolean };
+  createObjectStore(
+    name: string,
+    options?: IDBObjectStoreParameters,
+  ): UpgradeableStoreLike;
+}
+
+/**
+ * 向後相容的 IndexedDB schema 升級：
+ * - v1~v3 -> v4：僅增量建立 missing stores 與 metadata indexes，絕不清空或覆寫既有音訊/歌曲資料。
+ */
+export function applyIndexedDbSchemaUpgrade(
+  db: UpgradeableDatabaseLike,
+  upgradeTx: { objectStore(name: string): UpgradeableStoreLike } | null,
+): void {
+  for (const storeName of ALL_STORES) {
+    let store: UpgradeableStoreLike | null = null;
+    if (!db.objectStoreNames.contains(storeName)) {
+      store = db.createObjectStore(storeName, { keyPath: "key" });
+    } else if (upgradeTx) {
+      store = upgradeTx.objectStore(storeName);
+    }
+
+    if (!store) continue;
+
+    if (
+      storeName === "separationCheckpoints" &&
+      !store.indexNames.contains(SEPARATION_CHECKPOINT_HASH_INDEX)
+    ) {
+      store.createIndex(SEPARATION_CHECKPOINT_HASH_INDEX, "sourceAudioHash", {
+        unique: false,
+      });
+    }
+    if (
+      storeName === "separationChunks" &&
+      !store.indexNames.contains(SEPARATION_CHUNK_TASK_INDEX)
+    ) {
+      store.createIndex(SEPARATION_CHUNK_TASK_INDEX, "taskId", {
+        unique: false,
+      });
+    }
+  }
+}
+
 function openDatabase(): Promise<IDBDatabase> {
   if (typeof indexedDB === "undefined") {
     return Promise.reject(new Error("此瀏覽器不支援 IndexedDB。"));
   }
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
-    request.onupgradeneeded = () => {
+    request.onupgradeneeded = (event) => {
       const db = request.result;
-      // 保留既有資料表（separations/settings/modelMeta 等），僅增量建立新增 store
-      for (const store of ALL_STORES) {
-        if (!db.objectStoreNames.contains(store)) db.createObjectStore(store, { keyPath: "key" });
-      }
+      const tx =
+        request.transaction ??
+        (event.target as IDBOpenDBRequest | null)?.transaction ??
+        null;
+      applyIndexedDbSchemaUpgrade(db, tx);
     };
     request.onsuccess = () => {
       const db = request.result;
@@ -210,6 +275,7 @@ async function runInMemoryTransaction<T>(
           get(key: IDBValidKey) {
             return createImmediateIdbRequest(() => {
               if (aborted) throw new Error("IndexedDB 交易已中止。");
+              mem.hooks.beforeRead?.(storeName, "get", String(key));
               const val = map.get(String(key));
               return val === undefined ? undefined : cloneStoreValue(val);
             });
@@ -217,8 +283,118 @@ async function runInMemoryTransaction<T>(
           getAll() {
             return createImmediateIdbRequest(() => {
               if (aborted) throw new Error("IndexedDB 交易已中止。");
+              mem.hooks.beforeRead?.(storeName, "getAll");
               return Array.from(map.values(), (v) => cloneStoreValue(v));
             });
+          },
+          getAllKeys() {
+            return createImmediateIdbRequest(() => {
+              if (aborted) throw new Error("IndexedDB 交易已中止。");
+              mem.hooks.beforeRead?.(storeName, "getAllKeys");
+              return Array.from(map.keys());
+            });
+          },
+          index(indexName: string) {
+            const extractIndexedField = (rec: unknown): unknown => {
+              if (!rec || typeof rec !== "object") return undefined;
+              const obj = rec as Record<string, unknown>;
+              if (
+                storeName === "separationCheckpoints" &&
+                indexName === SEPARATION_CHECKPOINT_HASH_INDEX
+              ) {
+                return obj.sourceAudioHash;
+              }
+              if (
+                storeName === "separationChunks" &&
+                indexName === SEPARATION_CHUNK_TASK_INDEX
+              ) {
+                return obj.taskId;
+              }
+              throw new Error(`資料表 ${storeName} 尚未建立索引：${indexName}`);
+            };
+            const matchesQuery = (rec: unknown, query?: IDBValidKey | IDBKeyRange): boolean => {
+              if (query === undefined || query === null) return true;
+              const fieldVal = extractIndexedField(rec);
+              if (typeof query === "object" && "lower" in query && "upper" in query) {
+                const range = query as IDBKeyRange;
+                const lowerOk =
+                  range.lower === undefined ||
+                  (range.lowerOpen ? String(fieldVal) > String(range.lower) : String(fieldVal) >= String(range.lower));
+                const upperOk =
+                  range.upper === undefined ||
+                  (range.upperOpen ? String(fieldVal) < String(range.upper) : String(fieldVal) <= String(range.upper));
+                return lowerOk && upperOk;
+              }
+              return fieldVal === query;
+            };
+            return {
+              getAll(query?: IDBValidKey | IDBKeyRange) {
+                return createImmediateIdbRequest(() => {
+                  if (aborted) throw new Error("IndexedDB 交易已中止。");
+                  mem.hooks.beforeRead?.(storeName, "indexGetAll", indexName);
+                  const out: unknown[] = [];
+                  for (const val of map.values()) {
+                    if (matchesQuery(val, query)) out.push(cloneStoreValue(val));
+                  }
+                  return out;
+                });
+              },
+              getAllKeys(query?: IDBValidKey | IDBKeyRange) {
+                return createImmediateIdbRequest(() => {
+                  if (aborted) throw new Error("IndexedDB 交易已中止。");
+                  mem.hooks.beforeRead?.(storeName, "indexGetAllKeys", indexName);
+                  const out: IDBValidKey[] = [];
+                  for (const [k, val] of map.entries()) {
+                    if (matchesQuery(val, query)) out.push(k);
+                  }
+                  return out;
+                });
+              },
+              openKeyCursor(query?: IDBValidKey | IDBKeyRange) {
+                mem.hooks.beforeRead?.(storeName, "openKeyCursor", indexName);
+                const entries: Array<{ indexKey: IDBValidKey; primaryKey: IDBValidKey }> = [];
+                for (const [k, val] of map.entries()) {
+                  if (matchesQuery(val, query)) {
+                    entries.push({
+                      indexKey: extractIndexedField(val) as IDBValidKey,
+                      primaryKey: k,
+                    });
+                  }
+                }
+                let cursorPos = 0;
+                const req = {
+                  result: null as IDBCursor | null,
+                  error: null as DOMException | null,
+                  onsuccess: null as ((ev: Event) => void) | null,
+                  onerror: null as ((ev: Event) => void) | null,
+                };
+                const emitNext = () => {
+                  queueMicrotask(() => {
+                    if (aborted) {
+                      req.error = new Error("IndexedDB 交易已中止。") as unknown as DOMException;
+                      req.onerror?.(new Event("error"));
+                      return;
+                    }
+                    if (cursorPos >= entries.length) {
+                      req.result = null;
+                      req.onsuccess?.(new Event("success"));
+                      return;
+                    }
+                    const current = entries[cursorPos++];
+                    req.result = {
+                      key: current.indexKey,
+                      primaryKey: current.primaryKey,
+                      continue() {
+                        emitNext();
+                      },
+                    } as unknown as IDBCursor;
+                    req.onsuccess?.(new Event("success"));
+                  });
+                };
+                emitNext();
+                return req as unknown as IDBRequest<IDBCursor | null>;
+              },
+            } as unknown as IDBIndex;
           },
           put(value: { key?: string }) {
             return createImmediateIdbRequest(() => {

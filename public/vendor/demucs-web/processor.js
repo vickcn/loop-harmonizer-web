@@ -376,13 +376,20 @@ export class DemucsProcessor {
 
         segLeft.fill(0);
         segRight.fill(0);
+        let segInputPeak = 0;
         for (let i = 0; i < segmentLength; i++) {
           const localIdx = start + i - inputOffsetSample;
           if (localIdx < 0 || localIdx >= leftChannel.length) {
             throw new Error(`音訊片段樣本超出可用輸入範圍：${start + i}`);
           }
-          segLeft[i] = leftChannel[localIdx];
-          segRight[i] = rightChannel[localIdx];
+          const l = leftChannel[localIdx];
+          const r = rightChannel[localIdx];
+          segLeft[i] = l;
+          segRight[i] = r;
+          const al = l < 0 ? -l : l;
+          const ar = r < 0 ? -r : r;
+          if (al > segInputPeak) segInputPeak = al;
+          if (ar > segInputPeak) segInputPeak = ar;
         }
 
         const input = prepareModelInput(segLeft, segRight);
@@ -455,6 +462,51 @@ export class DemucsProcessor {
           const numTracks = timeShape[1];
           const numChannels = timeShape[2];
           const samples = timeShape[3];
+
+          let segOutputPeak = 0;
+          if (combinedOutputs) {
+            for (let t = 0; t < combinedOutputs.length; t++) {
+              const cL = combinedOutputs[t].left;
+              const cR = combinedOutputs[t].right;
+              const len = Math.min(segmentLength, cL.length);
+              for (let i = 0; i < len; i++) {
+                const vL = cL[i];
+                const vR = cR[i];
+                if (!Number.isFinite(vL) || !Number.isFinite(vR)) {
+                  segOutputPeak = NaN;
+                  break;
+                }
+                const al = vL < 0 ? -vL : vL;
+                const ar = vR < 0 ? -vR : vR;
+                if (al > segOutputPeak) segOutputPeak = al;
+                if (ar > segOutputPeak) segOutputPeak = ar;
+              }
+              if (!Number.isFinite(segOutputPeak)) break;
+            }
+          } else {
+            for (let t = 0; t < numTracks; t++) {
+              const lBase = t * numChannels * samples;
+              const rBase = lBase + samples;
+              const len = Math.min(segmentLength, samples);
+              for (let i = 0; i < len; i++) {
+                const vL = timeData[lBase + i];
+                const vR = timeData[rBase + i];
+                if (!Number.isFinite(vL) || !Number.isFinite(vR)) {
+                  segOutputPeak = NaN;
+                  break;
+                }
+                const al = vL < 0 ? -vL : vL;
+                const ar = vR < 0 ? -vR : vR;
+                if (al > segOutputPeak) segOutputPeak = al;
+                if (ar > segOutputPeak) segOutputPeak = ar;
+              }
+              if (!Number.isFinite(segOutputPeak)) break;
+            }
+          }
+
+          if (segInputPeak > 1e-3 && (!Number.isFinite(segOutputPeak) || segOutputPeak <= 1e-6)) {
+            throw new Error('Demucs 分離輸出為靜音或無效數值，切換至 WASM 重試');
+          }
 
           const overlapWindow = new Float32Array(segmentLength);
           for (let i = 0; i < segmentLength; i++) {

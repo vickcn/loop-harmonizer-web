@@ -91,6 +91,7 @@ export function IconActionButton({
       <button
         type="button"
         aria-label={label}
+        title={tooltipText}
         aria-pressed={pressed}
         aria-busy={busy}
         aria-expanded={expanded}

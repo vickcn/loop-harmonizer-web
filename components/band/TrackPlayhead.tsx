@@ -17,13 +17,27 @@ function fmt(sec: number) {
 
 export const TrackPlayhead = memo(function TrackPlayhead({ playheadSec, durationSec, onChange, onSelect }: Props) {
   const barRef = useRef<HTMLDivElement>(null);
+  const activePointerIdRef = useRef<number | null>(null);
   const progress = durationSec > 0 ? Math.min(1, playheadSec / durationSec) : 0;
 
   const secFromPointer = (e: React.PointerEvent) => {
     const bar = barRef.current;
-    if (!bar) return 0;
+    if (!bar || durationSec <= 0) return 0;
     const rect = bar.getBoundingClientRect();
+    if (rect.width <= 0) return 0;
     return Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)) * durationSec;
+  };
+
+  const clearDragState = (pointerId: number, target?: HTMLDivElement | null) => {
+    if (activePointerIdRef.current !== pointerId) return;
+    activePointerIdRef.current = null;
+    if (target && typeof target.hasPointerCapture === "function" && target.hasPointerCapture(pointerId)) {
+      try {
+        target.releasePointerCapture(pointerId);
+      } catch {
+        // ignore release failure on detached targets
+      }
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
@@ -62,8 +76,29 @@ export const TrackPlayhead = memo(function TrackPlayhead({ playheadSec, duration
         aria-valuenow={Math.round(playheadSec)}
         aria-valuetext={`${fmt(playheadSec)} / ${fmt(durationSec)}`}
         style={{ flex: 1, minHeight: 44, cursor: "pointer", position: "relative", userSelect: "none", display: "flex", alignItems: "center", touchAction: "none" }}
-        onPointerDown={(e) => { onSelect?.(); e.currentTarget.setPointerCapture(e.pointerId); onChange(secFromPointer(e)); }}
-        onPointerMove={(e) => { if (e.buttons === 0) return; onChange(secFromPointer(e)); }}
+        onPointerDown={(e) => {
+          if (e.pointerType === "mouse" && e.button !== 0) return;
+          if (activePointerIdRef.current !== null && activePointerIdRef.current !== e.pointerId) return;
+          activePointerIdRef.current = e.pointerId;
+          onSelect?.();
+          try {
+            e.currentTarget.setPointerCapture(e.pointerId);
+          } catch {
+            // ignore synthetic/unsupported pointer capture
+          }
+          onChange(secFromPointer(e));
+        }}
+        onPointerMove={(e) => {
+          if (activePointerIdRef.current === null || activePointerIdRef.current !== e.pointerId) return;
+          if (e.pointerType === "mouse" && e.buttons === 0) {
+            clearDragState(e.pointerId, e.currentTarget);
+            return;
+          }
+          onChange(secFromPointer(e));
+        }}
+        onPointerUp={(e) => clearDragState(e.pointerId, e.currentTarget)}
+        onPointerCancel={(e) => clearDragState(e.pointerId, e.currentTarget)}
+        onLostPointerCapture={(e) => clearDragState(e.pointerId)}
         onFocus={() => onSelect?.()}
         onKeyDown={handleKeyDown}
       >

@@ -16,9 +16,10 @@ import {
   DEMUCS_TRAINING_SAMPLES,
   type SeparationChunkRecord,
   getChunkSampleBounds,
-  getTaskChunkRecords,
+  getTaskChunkRecordsInStore,
   validateChunkRecordIntegrity,
 } from "../storage/separationChunkStore.ts";
+import { recordSeparationDiagnostic } from "./separationStateRecovery.ts";
 
 export const DEFAULT_JOB_LEASE_TTL_MS = 12_000;
 export const DEFAULT_JOB_HEARTBEAT_MS = 4_000;
@@ -31,6 +32,8 @@ export interface ResumeValidationContext {
   sampleRate?: number;
   modelVersion?: string;
   processingVersion?: string;
+  viewerTabId?: string;
+  now?: number;
 }
 
 export interface ResumeValidationResult {
@@ -131,7 +134,19 @@ export async function validateAndPrepareResume(
     };
   }
 
-  const checkpoint = await getCheckpoint(taskId);
+  const { checkpoint, records } = await withIdbTransaction(
+    ["separationCheckpoints", "separationChunks"],
+    "readonly",
+    async (tx) => {
+      const cpStore = tx.objectStore("separationCheckpoints");
+      const chunkStore = tx.objectStore("separationChunks");
+      const cp = ((await idbRequestPromise(cpStore.get(taskId))) ?? null) as
+        | SeparationCheckpoint
+        | null;
+      const taskRecords = await getTaskChunkRecordsInStore(chunkStore, taskId);
+      return { checkpoint: cp, records: taskRecords };
+    },
+  );
   if (!checkpoint) {
     return {
       valid: true,
@@ -200,7 +215,6 @@ export async function validateAndPrepareResume(
     };
   }
 
-  const records = await getTaskChunkRecords(taskId);
   const byIndex = new Map<number, SeparationChunkRecord>();
   const duplicateKeys: string[] = [];
 
@@ -256,11 +270,22 @@ export async function validateAndPrepareResume(
     }
   }
 
+  const nowTs = context.now ?? Date.now();
+  const hasForeignActiveLease = Boolean(
+    context.viewerTabId &&
+      checkpoint.lease &&
+      checkpoint.lease.ownerTabId !== context.viewerTabId &&
+      checkpoint.lease.leaseExpiresAt > nowTs,
+  );
+
   const needsCheckpointRepair =
     keysToDelete.length > 0 ||
     checkpoint.nextChunkIndex !== validPrefixCount ||
     checkpoint.committedEndSample !== committedEndSample ||
-    checkpoint.committedBytes !== committedBytes;
+    checkpoint.committedBytes !== committedBytes ||
+    (checkpoint.status === "completed" &&
+      (validPrefixCount < checkpoint.totalChunks ||
+        committedEndSample < checkpoint.totalSamples));
 
   let effectiveCheckpoint = checkpoint;
   if (needsCheckpointRepair) {
@@ -269,7 +294,9 @@ export async function validateAndPrepareResume(
       validPrefixCount === checkpoint.nextChunkIndex &&
       validateOverlapCarryBuffer(checkpoint.overlapCarryBuffer);
 
-    const isCompletedNow = validPrefixCount >= checkpoint.totalChunks;
+    const isCompletedNow =
+      validPrefixCount >= checkpoint.totalChunks &&
+      committedEndSample >= checkpoint.totalSamples;
     effectiveCheckpoint = {
       ...checkpoint,
       nextChunkIndex: validPrefixCount,
@@ -281,17 +308,37 @@ export async function validateAndPrepareResume(
         : checkpoint.status === "completed"
           ? "interrupted"
           : checkpoint.status,
-      updatedAt: Date.now(),
+      lease: isCompletedNow ? null : checkpoint.lease,
+      updatedAt: nowTs,
     };
 
-    await withIdbTransaction(["separationChunks", "separationCheckpoints"], "readwrite", async (tx) => {
-      const chunkStore = tx.objectStore("separationChunks");
-      const cpStore = tx.objectStore("separationCheckpoints");
-      for (const key of keysToDelete) {
-        await idbRequestPromise(chunkStore.delete(key));
-      }
-      await idbRequestPromise(cpStore.put(effectiveCheckpoint));
+    recordSeparationDiagnostic({
+      source: "validateAndPrepareResume",
+      taskId: checkpoint.taskId,
+      songId: checkpoint.songId,
+      generation: checkpoint.lease?.generation ?? null,
+      checkpointStatus: effectiveCheckpoint.status,
+      validChunkCount: validPrefixCount,
+      totalChunks: checkpoint.totalChunks,
+      leaseOwner: checkpoint.lease?.ownerTabId ?? null,
+      fromState: checkpoint.status,
+      toState: effectiveCheckpoint.status,
+      note: hasForeignActiveLease
+        ? `skipped IDB repair due to active foreign lease (${keysToDelete.length} stale chunks ignored)`
+        : `repaired checkpoint (deleted=${keysToDelete.length})`,
+      timestamp: nowTs,
     });
+
+    if (!hasForeignActiveLease) {
+      await withIdbTransaction(["separationChunks", "separationCheckpoints"], "readwrite", async (tx) => {
+        const chunkStore = tx.objectStore("separationChunks");
+        const cpStore = tx.objectStore("separationCheckpoints");
+        for (const key of keysToDelete) {
+          await idbRequestPromise(chunkStore.delete(key));
+        }
+        await idbRequestPromise(cpStore.put(effectiveCheckpoint));
+      });
+    }
   }
 
   if (
@@ -299,14 +346,30 @@ export async function validateAndPrepareResume(
     effectiveCheckpoint.committedEndSample >= effectiveCheckpoint.totalSamples
   ) {
     if (effectiveCheckpoint.status !== "completed") {
+      const prevStatus = effectiveCheckpoint.status;
       effectiveCheckpoint = {
         ...effectiveCheckpoint,
         status: "completed",
         overlapCarryBuffer: null,
         lease: null,
-        updatedAt: Date.now(),
+        updatedAt: nowTs,
       };
-      await saveCheckpoint(effectiveCheckpoint);
+      recordSeparationDiagnostic({
+        source: "validateAndPrepareResume",
+        taskId: effectiveCheckpoint.taskId,
+        songId: effectiveCheckpoint.songId,
+        generation: effectiveCheckpoint.lease?.generation ?? null,
+        checkpointStatus: "completed",
+        validChunkCount: validPrefixCount,
+        totalChunks: effectiveCheckpoint.totalChunks,
+        fromState: prevStatus,
+        toState: "completed",
+        note: "upgraded checkpoint status to completed from verified chunks",
+        timestamp: nowTs,
+      });
+      if (!hasForeignActiveLease) {
+        await saveCheckpoint(effectiveCheckpoint);
+      }
     }
     return {
       valid: true,
@@ -499,7 +562,12 @@ export class SeparationJobLeaseManager {
             existingLease: existing.lease,
           };
         }
-        if (existing.status === "completed") {
+        const isActuallyCompleted =
+          existing.status === "completed" &&
+          existing.totalChunks > 0 &&
+          existing.nextChunkIndex >= existing.totalChunks &&
+          existing.committedEndSample >= existing.totalSamples;
+        if (isActuallyCompleted) {
           return {
             acquired: false as const,
             reason: "任務已完成，無須取得執行權。",
@@ -622,28 +690,96 @@ export class SeparationJobLeaseManager {
     });
   }
 
+  notifyTaskCompleted(
+    taskId: string,
+    ownerTabId: string,
+    generation?: number,
+    now = Date.now(),
+  ): void {
+    this.post({
+      type: "task-completed",
+      taskId,
+      ownerTabId,
+      generation,
+      timestamp: now,
+    });
+  }
+
   async releaseLease(
     taskId: string,
     lease: Pick<SeparationLeaseInfo, "ownerTabId" | "ownerJobToken" | "generation">,
     nextStatus?: SeparationCheckpointStatus,
     now = Date.now(),
   ): Promise<boolean> {
+    let resolvedStatus: SeparationCheckpointStatus | undefined = nextStatus;
+    let alreadyCompletedWithoutLease = false;
+
     const released = await withIdbTransaction("separationCheckpoints", "readwrite", async (tx) => {
       const store = tx.objectStore("separationCheckpoints");
       const existing = (await idbRequestPromise(store.get(taskId))) as
         | SeparationCheckpoint
         | undefined;
-      if (!existing || !existing.lease) return false;
+      if (!existing) return false;
+
+      if (existing.status === "completed") {
+        resolvedStatus = "completed";
+        if (nextStatus && nextStatus !== "completed") {
+          recordSeparationDiagnostic({
+            event: "stale-worker-update-rejected",
+            source: "SeparationJobLeaseManager.releaseLease",
+            taskId,
+            songId: existing.songId,
+            generation: lease.generation,
+            checkpointStatus: existing.status,
+            validChunkCount: existing.nextChunkIndex,
+            totalChunks: existing.totalChunks,
+            leaseOwner: lease.ownerTabId,
+            leaseState: existing.lease ? "held" : "none",
+            fromState: "completed",
+            toState: nextStatus,
+            outcome: "rejected",
+            note: "blocked downgrade of completed checkpoint on releaseLease",
+            timestamp: now,
+          });
+        }
+        if (!existing.lease) {
+          alreadyCompletedWithoutLease = true;
+          return false;
+        }
+      }
+
+      if (!existing.lease) return false;
       if (
         existing.lease.ownerTabId !== lease.ownerTabId ||
         existing.lease.ownerJobToken !== lease.ownerJobToken ||
         existing.lease.generation !== lease.generation
       ) {
+        recordSeparationDiagnostic({
+          event: "stale-worker-update-rejected",
+          source: "SeparationJobLeaseManager.releaseLease",
+          taskId,
+          songId: existing.songId,
+          generation: lease.generation,
+          checkpointStatus: existing.status,
+          validChunkCount: existing.nextChunkIndex,
+          totalChunks: existing.totalChunks,
+          leaseOwner: existing.lease.ownerTabId,
+          leaseState: existing.lease.leaseExpiresAt > now ? "foreign_active" : "expired",
+          outcome: "rejected",
+          note: `rejected stale releaseLease (expectedGen=${existing.lease.generation}, gotGen=${lease.generation})`,
+          timestamp: now,
+        });
         return false;
       }
+
+      const finalStatus =
+        existing.status === "completed"
+          ? "completed"
+          : (nextStatus ?? existing.status);
+      resolvedStatus = finalStatus;
       const next: SeparationCheckpoint = {
         ...existing,
-        status: nextStatus ?? existing.status,
+        status: finalStatus,
         lease: null,
         updatedAt: now,
       };
@@ -651,16 +787,17 @@ export class SeparationJobLeaseManager {
       return true;
     });
 
-    if (released) {
-      this.post({
-        type:
-          nextStatus === "cancelled"
+    if (released || (alreadyCompletedWithoutLease && resolvedStatus === "completed")) {
+      const broadcastType =
+        resolvedStatus === "completed"
+          ? "task-completed"
+          : resolvedStatus === "cancelled"
             ? "task-cancelled"
-            : nextStatus === "paused"
+            : resolvedStatus === "paused"
               ? "task-paused"
-              : nextStatus === "completed"
-                ? "task-completed"
-                : "lease-released",
+              : "lease-released";
+      this.post({
+        type: broadcastType,
         taskId,
         ownerTabId: lease.ownerTabId,
         generation: lease.generation,

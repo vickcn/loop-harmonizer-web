@@ -1,4 +1,4 @@
-import { DemucsProcessor } from "./processor.js";
+import { DemucsProcessor } from "./processor.js?v=2";
 
 let currentAbortController = null;
 let currentTaskId = null;
