@@ -36,6 +36,7 @@ type Props = {
   isDragging?: boolean;
   isActive?: boolean;
   separationFocusLocked?: boolean;
+  isStartingSeparation?: boolean;
   isStartingPlayback?: boolean;
   playbackError?: string | null;
   actionFeedback?: string | null;
@@ -213,6 +214,7 @@ export const SongCard = memo(function SongCard(props: Props) {
     prevSeparationStatusRef.current = song.separationStatus;
   }, [song.separationStatus, song.stemIds.length]);
   const isSeparating = song.separationStatus === "processing" || song.separationStatus === "cancelling";
+  const isSeparationBusy = Boolean(props.isStartingSeparation) || isSeparating;
   const isPausingStage = isSeparating && (song.separationStage as string) === "pausing";
   const completedChunks = song.separationCompletedChunks ?? 0;
   const totalChunks = song.separationTotalChunks ?? 0;
@@ -702,11 +704,11 @@ export const SongCard = memo(function SongCard(props: Props) {
                 {
                   key: "separate",
                   label: separateActionLabel,
-                  disabled: focusLocked || isSeparating || audioUnavailable,
+                  disabled: focusLocked || isSeparationBusy || audioUnavailable,
                   disabledReason: focusLocked
                     ? focusLockReason
-                    : isSeparating
-                      ? "正在進行或停止音源分離，請稍候"
+                    : isSeparationBusy
+                      ? "正在準備或進行音源分離，請稍候"
                       : audioUnavailable
                         ? "請先等待恢復、解碼或重新選取原始音檔"
                         : undefined,
@@ -720,19 +722,19 @@ export const SongCard = memo(function SongCard(props: Props) {
                   renderInline: () => (
                     <IconActionButton
                       icon={
-                        isSeparating
+                        isSeparationBusy
                           ? <span className="mixer-spinner" aria-hidden="true" />
                           : <SplitStemsIcon refresh={song.separationStatus === "completed" || song.separationStatus === "cancelled" || song.separationStatus === "paused" || song.separationStatus === "interrupted"} />
                       }
                       label={separateActionLabel}
                       primary
-                      busy={isSeparating}
-                      disabled={focusLocked || isSeparating || audioUnavailable}
+                      busy={isSeparationBusy}
+                      disabled={focusLocked || isSeparationBusy || audioUnavailable}
                       disabledReason={
                         focusLocked
                           ? focusLockReason
-                          : isSeparating
-                            ? "正在進行或停止音源分離，請稍候"
+                          : isSeparationBusy
+                            ? "正在準備或進行音源分離，請稍候"
                             : audioUnavailable
                               ? "請先等待恢復、解碼或重新選取原始音檔"
                               : undefined
@@ -794,6 +796,31 @@ export const SongCard = memo(function SongCard(props: Props) {
                       },
                     ] satisfies AdaptiveActionItem[])
                   : []),
+                ...(song.separationStatus === "completed" &&
+                props.onClearSeparationData &&
+                (song.separationUsesChunkPlayback || hasSavedChunks || Boolean(song.separationTaskId) || Boolean(song.cacheKey))
+                  ? ([
+                      {
+                        key: "delete-completed-stems",
+                        label: "刪除已完成分軌",
+                        danger: true,
+                        disabled: focusLocked,
+                        disabledReason: focusLocked ? focusLockReason : undefined,
+                        onSelect: () => props.onClearSeparationData?.("completed"),
+                        renderInline: () => (
+                          <IconActionButton
+                            icon="🗑"
+                            label="刪除已完成分軌"
+                            danger
+                            disabled={focusLocked}
+                            disabledReason={focusLocked ? focusLockReason : undefined}
+                            className="is-compact"
+                            onClick={() => props.onClearSeparationData?.("completed")}
+                          />
+                        ),
+                      },
+                    ] satisfies AdaptiveActionItem[])
+                  : []),
               ]}
             />
             {song.stemIds.length > 0 && (
@@ -808,6 +835,14 @@ export const SongCard = memo(function SongCard(props: Props) {
               </div>
             )}
           </div>
+          {props.isStartingSeparation && !isSeparating && (
+            <div className="row" role="status" aria-live="polite" style={{ gap: 8, alignItems: "center" }}>
+              <span className="mixer-spinner" aria-hidden="true" />
+              <span className="small" style={{ color: "#38bdf8" }}>
+                正在準備音源分離…
+              </span>
+            </div>
+          )}
           {(song.separationStatus === "processing" || song.separationStatus === "cancelling") && (() => {
             const isCancelling = song.separationStatus === "cancelling";
             const hasDeterminate = !isCancelling && Number.isFinite(song.separationProgress) && song.separationProgress > 0 && song.separationProgress <= 1;
@@ -1007,19 +1042,6 @@ export const SongCard = memo(function SongCard(props: Props) {
                 ✓ {song.separationMessage || "音源分離已完成"}
                 {totalChunks > 0 ? `（已完成 ${completedChunks || totalChunks} / ${totalChunks} 段${song.separationCommittedBytes ? `｜${committedMiB} MiB` : ""}）` : ""}
               </span>
-              <div className="row" style={{ gap: 6, alignItems: "center" }}>
-                {props.onClearSeparationData && (song.separationUsesChunkPlayback || hasSavedChunks || Boolean(song.separationTaskId) || Boolean(song.cacheKey)) && (
-                  <IconActionButton
-                    icon="🗑"
-                    label="刪除已完成分軌"
-                    danger
-                    disabled={focusLocked}
-                    disabledReason={focusLocked ? focusLockReason : undefined}
-                    className="is-compact"
-                    onClick={() => props.onClearSeparationData?.("completed")}
-                  />
-                )}
-              </div>
             </div>
           )}
           {song.separationStatus === "failed" && (
@@ -1094,6 +1116,7 @@ export const SongCard = memo(function SongCard(props: Props) {
   && prev.isDragging === next.isDragging
   && prev.isActive === next.isActive
   && prev.separationFocusLocked === next.separationFocusLocked
+  && prev.isStartingSeparation === next.isStartingSeparation
   && prev.isStartingPlayback === next.isStartingPlayback
   && prev.playbackError === next.playbackError
   && prev.actionFeedback === next.actionFeedback
