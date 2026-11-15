@@ -251,6 +251,7 @@ export function BandMixer() {
   } | null>(null);
   const [deleteDialogCheckbox, setDeleteDialogCheckbox] = useState(false);
   const [deleteSubmitting, setDeleteSubmitting] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
   const [idleCleanupReport, setIdleCleanupReport] = useState<string>("");
   const [resourceProfile, setResourceProfile] = useState<DeviceResourceProfile | null>(null);
   const [profileWarning, setProfileWarning] = useState<string>("");
@@ -2828,12 +2829,7 @@ export function BandMixer() {
         songId: latestSong.id,
         sourceAudioHash: latestSong.sourceAudioHash ?? undefined,
         knownInMemorySongs: sessionRef.current.songs,
-      }).catch(() => ({
-        deletedCheckpoints: 0,
-        deletedChunks: 0,
-        preservedCompletedTaskIds: [] as string[],
-        blockedByLeaseTaskIds: [] as string[],
-      }));
+      });
 
       if (result.blockedByLeaseTaskIds.length > 0) {
         showCardFeedback(latestSong.id, "其他分頁正在執行或持有此分離任務，已安全保護並保留暫存進度。");
@@ -2924,14 +2920,6 @@ export function BandMixer() {
       }
     }
 
-    sharedSeparationCoordinator.invalidateSongGeneration(latestSong.id);
-    const engine = getEngine();
-    if (latestSong.playbackSource === "stems" && latestSong.status === "playing") {
-      engine.pauseTracks(latestSong.stemIds);
-    }
-    latestSong.stemIds.forEach((id) => engine.removeTrack(id));
-    stemResultsRef.current.delete(latestSong.id);
-
     const cacheKeyToRelease =
       latestSong.cacheKey ||
       (latestSong.sourceAudioHash && latestSong.separationMode
@@ -2964,16 +2952,6 @@ export function BandMixer() {
     const nextSongsSnapshot = sessionRef.current.songs.map((item) =>
       item.id === latestSong.id ? clearedSong : item,
     );
-    setSession((previous) => ({
-      ...previous,
-      songs: previous.songs.map((item) => (item.id === latestSong.id ? clearedSong : item)),
-    }));
-    applySongToEngine(clearedSong);
-    if (clearedSong.sourceAudioHash && clearedSong.persistenceStatus !== "missing_audio") {
-      await saveSongStateRecord(clearedSong).catch(() => undefined);
-    } else {
-      persistSongDebounced(latestSong.id, 0);
-    }
 
     const releaseResult = taskId || latestSong.sourceAudioHash || cacheKeyToRelease
       ? await releaseCheckpointReferenceAndMaybeGc({
@@ -2984,7 +2962,7 @@ export function BandMixer() {
           knownInMemorySongs: nextSongsSnapshot,
           knownRemovedSongIds: removedSongIdsRef.current,
           source: "BandMixer.deleteCompletedStems",
-        }).catch(() => null)
+        })
       : null;
 
     await deleteIncompleteCheckpointsForSong({
@@ -2992,7 +2970,26 @@ export function BandMixer() {
       sourceAudioHash: latestSong.sourceAudioHash ?? undefined,
       excludeTaskId: releaseResult?.preservedTaskIds[0],
       knownInMemorySongs: nextSongsSnapshot,
-    }).catch(() => undefined);
+    });
+
+    sharedSeparationCoordinator.invalidateSongGeneration(latestSong.id);
+    const engine = getEngine();
+    if (latestSong.playbackSource === "stems" && latestSong.status === "playing") {
+      engine.pauseTracks(latestSong.stemIds);
+    }
+    latestSong.stemIds.forEach((id) => engine.removeTrack(id));
+    stemResultsRef.current.delete(latestSong.id);
+
+    setSession((previous) => ({
+      ...previous,
+      songs: previous.songs.map((item) => (item.id === latestSong.id ? clearedSong : item)),
+    }));
+    applySongToEngine(clearedSong);
+    if (clearedSong.sourceAudioHash && clearedSong.persistenceStatus !== "missing_audio") {
+      await saveSongStateRecord(clearedSong).catch(() => undefined);
+    } else {
+      persistSongDebounced(latestSong.id, 0);
+    }
 
     const keptSharedData = Boolean(
       releaseResult &&
@@ -3979,7 +3976,7 @@ export function BandMixer() {
       return;
     }
     if (!cacheSharedByOtherSong) {
-      await deleteCachedStemSet(latestSong.cacheKey).catch(() => undefined);
+      await deleteCachedStemSet(latestSong.cacheKey);
     }
     updateSong(latestSong.id, {
       cacheKey: null,
@@ -4010,7 +4007,7 @@ export function BandMixer() {
       showShortcutHint(msg);
       return;
     }
-    await clearAllCachedStemSets().catch(() => undefined);
+    await clearAllCachedStemSets();
     setSession((previous) => ({
       ...previous,
       songs: previous.songs.map((song) => ({
@@ -4074,35 +4071,15 @@ export function BandMixer() {
       );
       setDiagnosticLogs(getSeparationDiagnosticLogs());
       void refreshCacheStats();
-    } catch {
-      setStorageActionMsg("清理未完成暫存時發生錯誤。");
+    } catch (error) {
+      const msg = error instanceof Error && error.message ? error.message : "清理未完成暫存時發生錯誤。";
+      setStorageActionMsg(msg);
+      throw error instanceof Error ? error : new Error(msg);
     }
   };
 
   const removeSong = async (song: BandSong, deleteLocalData: boolean) => {
-    removedSongIdsRef.current.add(song.id);
-    separationTokensRef.current.delete(song.id);
-    sharedSeparationCoordinator.invalidateSongGeneration(song.id);
-    void sharedSeparationCoordinator.cancelTask(song.id, "歌曲已移除，中止進行中的分離任務。", 0);
-    if (separationFocusRef.current?.songId === song.id && separationFocusRef.current.active) {
-      void finishSeparationFocus({
-        songId: song.id,
-        outcome: "cancelled",
-        message: "歌曲已移除並中止分離，解除資源鎖定。",
-      });
-    }
-    cancelPendingSongPersist(song.id);
-    persistedMetaBySongIdRef.current.delete(song.id);
-    const ids = [song.sourceAudioId, ...song.stemIds];
-    getEngine().stopTracks(ids);
-    ids.forEach((id) => getEngine().removeTrack(id));
-    sourceFilesRef.current.delete(song.id);
-    stemResultsRef.current.delete(song.id);
-    savedSettingsRef.current.delete(song.id);
     const remainingSongs = sessionRef.current.songs.filter((candidate) => candidate.id !== song.id);
-    setSession((previous) => ({ ...previous, songs: previous.songs.filter((candidate) => candidate.id !== song.id) }));
-    setSelection((previous) => sanitizeMixerSelection(previous, remainingSongs));
-
     try {
       await restorePromiseRef.current.catch(() => undefined);
       const result = await removePersistedSong({
@@ -4110,6 +4087,29 @@ export function BandMixer() {
         deleteLocalData,
         inMemoryRemainingSongs: remainingSongs,
       });
+
+      removedSongIdsRef.current.add(song.id);
+      separationTokensRef.current.delete(song.id);
+      sharedSeparationCoordinator.invalidateSongGeneration(song.id);
+      void sharedSeparationCoordinator.cancelTask(song.id, "歌曲已移除，中止進行中的分離任務。", 0);
+      if (separationFocusRef.current?.songId === song.id && separationFocusRef.current.active) {
+        void finishSeparationFocus({
+          songId: song.id,
+          outcome: "cancelled",
+          message: "歌曲已移除並中止分離，解除資源鎖定。",
+        });
+      }
+      cancelPendingSongPersist(song.id);
+      persistedMetaBySongIdRef.current.delete(song.id);
+      const ids = [song.sourceAudioId, ...song.stemIds];
+      getEngine().stopTracks(ids);
+      ids.forEach((id) => getEngine().removeTrack(id));
+      sourceFilesRef.current.delete(song.id);
+      stemResultsRef.current.delete(song.id);
+      savedSettingsRef.current.delete(song.id);
+      setSession((previous) => ({ ...previous, songs: previous.songs.filter((candidate) => candidate.id !== song.id) }));
+      setSelection((previous) => sanitizeMixerSelection(previous, remainingSongs));
+
       if (deleteLocalData && result.sharedWithOtherSongs) {
         showShortcutHint(`已移除「${song.name}」；另有其他歌曲共用此音檔，已保留共用資料。`);
       } else if (deleteLocalData) {
@@ -4118,8 +4118,12 @@ export function BandMixer() {
         showShortcutHint(`已從清單移除「${song.name}」（已保留本機音檔與快取）。`);
       }
       void refreshCacheStats();
-    } catch {
-      showShortcutHint(`已從畫面移除「${song.name}」，但清理本機資料庫時發生錯誤。`);
+    } catch (error) {
+      const msg = error instanceof Error && error.message
+        ? error.message
+        : `移除「${song.name}」並清理本機資料庫時發生錯誤。`;
+      showShortcutHint(msg);
+      throw error instanceof Error ? error : new Error(msg);
     }
   };
 
@@ -4136,12 +4140,15 @@ export function BandMixer() {
           : "目前沒有未使用的分離快取（使用中歌曲皆已完整保留）。",
       );
       void refreshCacheStats();
-    } catch {
-      setStorageActionMsg("清理未使用的分離快取時發生錯誤。");
+    } catch (error) {
+      const msg = error instanceof Error && error.message ? error.message : "清理未使用的分離快取時發生錯誤。";
+      setStorageActionMsg(msg);
+      throw error instanceof Error ? error : new Error(msg);
     }
   };
 
   const openDeleteConfirmDialog = (config: NonNullable<typeof deleteDialog>, defaultChecked = false) => {
+    setDeleteError("");
     setDeleteDialogCheckbox(defaultChecked);
     setDeleteDialog(config);
   };
@@ -4754,9 +4761,14 @@ export function BandMixer() {
       {cacheStats.isLowStorage && (
         <div role="alert" className="card card-warning-banner">
           <span>⚠ 瀏覽器可用儲存空間偏低，建議清除不再使用的分離快取，避免後續寫入失敗。</span>
-          <button type="button" className="btn mixer-button" style={{ padding: "4px 10px", fontSize: 12 }} onClick={() => void handleClearUnusedSeparationCaches()}>
-            清除未使用的分離快取
-          </button>
+          <IconActionButton
+            icon="🫧"
+            label="清除未使用的分離快取"
+            disabled={focusLocked}
+            disabledReason={focusLocked ? "分離專注模式啟動中，暫停清理未使用快取。" : undefined}
+            className="is-compact"
+            onClick={requestClearUnusedSeparationCaches}
+          />
         </div>
       )}
 
@@ -4796,11 +4808,47 @@ export function BandMixer() {
                 啟用持久儲存保護
               </button>
             )}
-            <button type="button" className="btn mixer-button" disabled={focusLocked} onClick={() => void releaseIdleResources()}>🧹 釋放閒置資源</button>
-            <button type="button" className="btn mixer-button" disabled={focusLocked} onClick={requestClearAllTempSeparationProgress}>清理暫存進度</button>
-            <button type="button" className="btn mixer-button" disabled={focusLocked} onClick={requestClearUnusedSeparationCaches}>清除未使用快取</button>
-            <button type="button" className="btn mixer-button" disabled={focusLocked} onClick={requestClearAllSeparationCache}>刪除已完成分軌快取</button>
-            <button type="button" className="btn mixer-button" disabled={focusLocked} onClick={requestClearModelCache}>清理模型快取</button>
+            <IconActionButton
+              icon="♻️"
+              label="釋放閒置資源（卸載未播放歌曲緩衝與閒置 Worker）"
+              disabled={focusLocked}
+              disabledReason={focusLocked ? "分離專注模式啟動中，暫停釋放資源。" : undefined}
+              className="is-compact"
+              onClick={() => void releaseIdleResources()}
+            />
+            <IconActionButton
+              icon="🧹"
+              label="清理暫存進度"
+              disabled={focusLocked}
+              disabledReason={focusLocked ? "分離專注模式啟動中，暫停清理暫存。" : undefined}
+              className="is-compact"
+              onClick={requestClearAllTempSeparationProgress}
+            />
+            <IconActionButton
+              icon="🫧"
+              label="清除未使用快取"
+              disabled={focusLocked}
+              disabledReason={focusLocked ? "分離專注模式啟動中，暫停清理未使用快取。" : undefined}
+              className="is-compact"
+              onClick={requestClearUnusedSeparationCaches}
+            />
+            <IconActionButton
+              icon="🗑"
+              label="刪除已完成分軌快取"
+              danger
+              disabled={focusLocked}
+              disabledReason={focusLocked ? "分離專注模式啟動中，暫停刪除已完成分軌快取。" : undefined}
+              className="is-compact"
+              onClick={requestClearAllSeparationCache}
+            />
+            <IconActionButton
+              icon="📦"
+              label="清理模型快取"
+              disabled={focusLocked}
+              disabledReason={focusLocked ? "分離專注模式啟動中，暫停清理模型快取。" : undefined}
+              className="is-compact"
+              onClick={requestClearModelCache}
+            />
             <button
               type="button"
               className="btn mixer-button"
@@ -4828,14 +4876,14 @@ export function BandMixer() {
                 <span className="small" style={{ opacity: 0.85 }}>
                   本機分離狀態診斷循環日誌（僅存本機 · 最近 {diagnosticLogs.length} 筆 · 不含原始音訊）
                 </span>
-                <button
-                  type="button"
-                  className="btn mixer-button"
-                  style={{ padding: "2px 8px", fontSize: 12 }}
+                <IconActionButton
+                  icon="🧹"
+                  label="清空本機診斷紀錄"
+                  disabled={diagnosticLogs.length === 0}
+                  disabledReason={diagnosticLogs.length === 0 ? "目前沒有本機診斷紀錄可清空。" : undefined}
+                  className="is-compact"
                   onClick={requestClearDiagnosticLogs}
-                >
-                  清空紀錄
-                </button>
+                />
               </div>
               {diagnosticLogs.length === 0 ? (
                 <div className="small" style={{ opacity: 0.65 }}>尚無本機診斷紀錄。</div>
@@ -5034,6 +5082,7 @@ export function BandMixer() {
           preserveItems={deleteDialog.preserveItems}
           recoverability={deleteDialog.recoverability}
           safetyNote={deleteDialog.safetyNote}
+          errorMessage={deleteError || null}
           checkboxOption={
             deleteDialog.checkboxLabel
               ? {
@@ -5047,23 +5096,32 @@ export function BandMixer() {
           confirmLabel={deleteDialog.confirmLabel}
           danger={deleteDialog.danger}
           submitting={deleteSubmitting}
-          onConfirm={() => {
+          onConfirm={async () => {
             if (deleteSubmitting) return;
             const activeDialog = deleteDialog;
             const checked = deleteDialogCheckbox;
+            setDeleteError("");
             setDeleteSubmitting(true);
-            void activeDialog
-              .onExecute(checked)
-              .finally(() => {
-                setDeleteSubmitting(false);
-                setDeleteDialog(null);
-                setDeleteDialogCheckbox(false);
-              });
+            try {
+              await activeDialog.onExecute(checked);
+              setDeleteDialog(null);
+              setDeleteDialogCheckbox(false);
+              setDeleteError("");
+            } catch (error) {
+              const msg =
+                error instanceof Error && error.message
+                  ? error.message
+                  : "執行清理或刪除時發生錯誤，資料未完全清除，請再試一次或按取消。";
+              setDeleteError(msg);
+            } finally {
+              setDeleteSubmitting(false);
+            }
           }}
           onCancel={() => {
             if (deleteSubmitting) return;
             setDeleteDialog(null);
             setDeleteDialogCheckbox(false);
+            setDeleteError("");
           }}
         />
       )}

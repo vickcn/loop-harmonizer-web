@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 
 export type ConfirmDeleteCheckboxOption = {
   label: string;
@@ -17,6 +17,7 @@ type Props = {
   preserveItems: string[];
   recoverability: string;
   safetyNote?: string | null;
+  errorMessage?: string | null;
   checkboxOption?: ConfirmDeleteCheckboxOption;
   confirmLabel: string;
   cancelLabel?: string;
@@ -26,6 +27,19 @@ type Props = {
   onCancel: () => void;
 };
 
+function getFocusableElements(container: HTMLElement | null): HTMLElement[] {
+  if (!container) return [];
+  const candidates = Array.from(
+    container.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    ),
+  );
+  return candidates.filter((el) => {
+    if (el.getAttribute("aria-hidden") === "true") return false;
+    return el.getClientRects().length > 0;
+  });
+}
+
 export function ConfirmDeleteDialog({
   open,
   title,
@@ -34,6 +48,7 @@ export function ConfirmDeleteDialog({
   preserveItems,
   recoverability,
   safetyNote,
+  errorMessage,
   checkboxOption,
   confirmLabel,
   cancelLabel = "取消",
@@ -42,19 +57,92 @@ export function ConfirmDeleteDialog({
   onConfirm,
   onCancel,
 }: Props) {
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+  const onCancelRef = useRef(onCancel);
+  const submittingRef = useRef(submitting);
+
+  useEffect(() => {
+    onCancelRef.current = onCancel;
+  }, [onCancel]);
+
+  useEffect(() => {
+    submittingRef.current = submitting;
+  }, [submitting]);
+
   useEffect(() => {
     if (!open) return;
-    const onKey = (event: KeyboardEvent) => {
+
+    previousFocusRef.current =
+      typeof document !== "undefined" && document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+
+    const focusDialog = () => {
+      const panel = panelRef.current;
+      if (!panel) return;
+      const focusables = getFocusableElements(panel);
+      if (focusables.length > 0) {
+        focusables[0].focus();
+      } else {
+        panel.focus();
+      }
+    };
+
+    focusDialog();
+    const rafId = window.requestAnimationFrame(() => {
+      const panel = panelRef.current;
+      if (panel && !panel.contains(document.activeElement)) {
+        focusDialog();
+      }
+    });
+
+    const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        if (!submitting) {
-          onCancel();
+        if (!submittingRef.current) {
+          onCancelRef.current();
+        }
+        return;
+      }
+
+      if (event.key === "Tab") {
+        const panel = panelRef.current;
+        if (!panel) return;
+        const focusables = getFocusableElements(panel);
+        if (focusables.length === 0) {
+          event.preventDefault();
+          panel.focus();
+          return;
+        }
+        const first = focusables[0];
+        const last = focusables[focusables.length - 1];
+        const active = document.activeElement;
+        const activeInside = active instanceof Node && panel.contains(active);
+
+        if (event.shiftKey) {
+          if (!activeInside || active === first || active === panel) {
+            event.preventDefault();
+            last.focus();
+          }
+        } else if (!activeInside || active === last) {
+          event.preventDefault();
+          first.focus();
         }
       }
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onCancel, open, submitting]);
+
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => {
+      window.cancelAnimationFrame(rafId);
+      window.removeEventListener("keydown", onKeyDown, true);
+      const previous = previousFocusRef.current;
+      previousFocusRef.current = null;
+      if (previous && previous.isConnected) {
+        previous.focus();
+      }
+    };
+  }, [open]);
 
   if (!open) return null;
 
@@ -70,7 +158,12 @@ export function ConfirmDeleteDialog({
         }
       }}
     >
-      <div className="card mixer-modal-panel">
+      <div
+        ref={panelRef}
+        tabIndex={-1}
+        className="card mixer-modal-panel"
+        style={{ outline: "none" }}
+      >
         <div className="row" style={{ justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
           <div className="grid" style={{ gap: 4 }}>
             <strong id="confirm-delete-dialog-title" style={{ fontSize: 16 }}>
@@ -165,6 +258,12 @@ export function ConfirmDeleteDialog({
           </label>
         )}
 
+        {errorMessage && (
+          <div role="alert" className="card-error-banner">
+            <span>{errorMessage}</span>
+          </div>
+        )}
+
         <div className="row mixer-modal-actions">
           <button
             type="button"
@@ -178,7 +277,11 @@ export function ConfirmDeleteDialog({
             type="button"
             className={`btn mixer-button${danger ? " mixer-abort-button" : " primary"}`}
             disabled={submitting}
-            onClick={() => void onConfirm()}
+            onClick={() => {
+              if (!submitting) {
+                void Promise.resolve(onConfirm()).catch(() => undefined);
+              }
+            }}
           >
             {submitting ? "處理中…" : confirmLabel}
           </button>
