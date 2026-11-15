@@ -3912,12 +3912,36 @@ export function BandMixer() {
       try {
         await new Promise<void>((resolve) => {
           if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
-            window.requestAnimationFrame(() => resolve());
+            window.requestAnimationFrame(() => {
+              window.requestAnimationFrame(() => resolve());
+            });
           } else {
             resolve();
           }
         });
         await separateSong(latestSong, mode, options);
+      } catch (error) {
+        const message =
+          error instanceof Error && error.message
+            ? error.message
+            : "啟動音源分離時發生未預期錯誤。";
+        const isAbort =
+          (error instanceof Error && error.name === "AbortError") ||
+          /已取消|已中止|aborted|cancelled/i.test(message);
+        if (!isAbort) {
+          showCardFeedback(latestSong.id, `音源分離失敗：${message}`);
+          const currentSong = sessionRef.current.songs.find((item) => item.id === latestSong.id);
+          if (currentSong && currentSong.separationStatus !== "completed") {
+            patchSongMetadataOnly(
+              latestSong.id,
+              {
+                separationStatus: "failed",
+                separationMessage: `音源分離失敗：${message}`,
+              },
+              { source: "BandMixer.requestStartSeparation.catch" },
+            );
+          }
+        }
       } finally {
         clearSeparationStarting(latestSong.id);
       }
