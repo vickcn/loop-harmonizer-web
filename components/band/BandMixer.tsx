@@ -200,11 +200,11 @@ function formatSeparationFocusStageLabel(stage: SeparationTaskStage): string {
     case "cancelling":
       return "正在停止 Worker 與清理暫存";
     case "cancelled":
-      return "已中止音源分離";
+      return "已中止音軌分離";
     case "completed":
-      return "音源分離完成";
+      return "音軌分離完成";
     case "failed":
-      return "音源分離失敗";
+      return "音軌分離失敗";
     default:
       return "待命";
   }
@@ -2551,7 +2551,7 @@ export function BandMixer() {
           const fallbackMsg =
             nextCompleted > 0 && nextCompleted < nextTotal
               ? `偵測到先前分軌僅完成第 ${nextCompleted}/${nextTotal} 段，已切換回原曲播放；可點擊「繼續分離」接續完成。`
-              : "偵測到先前分軌資料尚未完整保存，已自動切換回原曲播放；請重新分離音源。";
+              : "偵測到先前分軌資料尚未完整保存，已自動切換回原曲播放；請重新分離音軌。";
           const fallbackSong: BandSong = {
             ...preparedSong,
             ...derived,
@@ -2782,11 +2782,11 @@ export function BandMixer() {
         clearLeaseIfTerminal: true,
       }).catch(() => undefined);
     }
-    await sharedSeparationCoordinator.cancelTask(song.id, "已中止音源分離（保留已提交 Chunk；不會自動續跑）。", 80);
+    await sharedSeparationCoordinator.cancelTask(song.id, "已中止音軌分離（保留已提交 Chunk；不會自動續跑）。", 80);
     await finishSeparationFocus({
       songId: song.id,
       outcome: "cancelled",
-      message: "已中止音源分離（保留已提交 Chunk）。",
+      message: "已中止音軌分離（保留已提交 Chunk）。",
     });
     persistSongDebounced(song.id, 150);
   };
@@ -3283,7 +3283,7 @@ export function BandMixer() {
         }
       } else if (assessment.requiresConfirmation || !networkEval.allowed || networkEval.requiresExternalDownloadConfirmation) {
         const decision = await requestGuardConfirmation({
-          title: `音源分離風險與傳輸確認：「${latestReadySong.name}」`,
+          title: `音軌分離風險與傳輸確認：「${latestReadySong.name}」`,
           subtitle: `目前選擇：${effectiveMode === "four_stem" ? "4 Stem（人聲／鼓／貝斯／其他）" : "2 Stem（人聲／伴奏）"}`,
           assessment,
           networkEvaluation: networkEval,
@@ -3408,7 +3408,7 @@ export function BandMixer() {
       focusDecision.enabled && postPauseSong.status === "playing"
         ? { ...postPauseSong, status: "paused" }
         : postPauseSong,
-      "音源分離前穩定狀態",
+      "音軌分離前穩定狀態",
     );
     patchSongMetadataOnly(song.id, {
       activeSnapshot: stableSnapshot,
@@ -3711,11 +3711,11 @@ export function BandMixer() {
       }
 
       if (isAbortError(error) || controller.isCancellingOrCancelled()) {
-        await controller.cancel("已中止音源分離，已恢復操作前穩定狀態。");
+        await controller.cancel("已中止音軌分離，已恢復操作前穩定狀態。");
         await finishSeparationFocus({
           songId: song.id,
           outcome: "cancelled",
-          message: "已中止音源分離，已恢復操作前穩定狀態。",
+          message: "已中止音軌分離，已恢復操作前穩定狀態。",
         });
         return;
       }
@@ -3728,7 +3728,7 @@ export function BandMixer() {
         return;
       }
       if (!controller.isCurrent()) return;
-      const errMsg = error instanceof Error ? error.message : "音源分離失敗。";
+      const errMsg = error instanceof Error ? error.message : "音軌分離失敗。";
       controller.markFailed(errMsg);
       const validChunks = idbValidation?.validChunkCount ?? currentInState?.separationCompletedChunks ?? 0;
       const hasChunks = validChunks > 0;
@@ -3924,19 +3924,19 @@ export function BandMixer() {
         const message =
           error instanceof Error && error.message
             ? error.message
-            : "啟動音源分離時發生未預期錯誤。";
+            : "啟動音軌分離時發生未預期錯誤。";
         const isAbort =
           (error instanceof Error && error.name === "AbortError") ||
           /已取消|已中止|aborted|cancelled/i.test(message);
         if (!isAbort) {
-          showCardFeedback(latestSong.id, `音源分離失敗：${message}`);
+          showCardFeedback(latestSong.id, `音軌分離失敗：${message}`);
           const currentSong = sessionRef.current.songs.find((item) => item.id === latestSong.id);
           if (currentSong && currentSong.separationStatus !== "completed") {
             patchSongMetadataOnly(
               latestSong.id,
               {
                 separationStatus: "failed",
-                separationMessage: `音源分離失敗：${message}`,
+                separationMessage: `音軌分離失敗：${message}`,
               },
               { source: "BandMixer.requestStartSeparation.catch" },
             );
@@ -4283,7 +4283,7 @@ export function BandMixer() {
       isFocusLocked() ||
       sharedSeparationCoordinator.hasRunningHeavyTask()
     ) {
-      const msg = "此歌曲或混音器目前正在進行音源分離，請先等待完成或手動中止後再進行清理。";
+      const msg = "此歌曲或混音器目前正在進行音軌分離，請先等待完成或手動中止後再進行清理。";
       showCardFeedback(latestSong.id, msg);
       showShortcutHint(msg);
       return;
@@ -4755,7 +4755,7 @@ export function BandMixer() {
           <section
             role="status"
             aria-live="polite"
-            aria-label="音源分離專注模式狀態"
+            aria-label="音軌分離專注模式狀態"
             className={`card mixer-focus-banner${bannerStateClass}`}
           >
             <div className="row" style={{ gap: 12, alignItems: "center", justifyContent: "space-between", flexWrap: "wrap" }}>
@@ -4776,7 +4776,7 @@ export function BandMixer() {
                   type="button"
                   className="btn mixer-abort-button"
                   disabled={isCancelling || !focusAbortSong}
-                  aria-label={isCancelling ? "正在中止音源分離" : `中止「${separationFocus.songName}」音源分離`}
+                  aria-label={isCancelling ? "正在中止音軌分離" : `中止「${separationFocus.songName}」音軌分離`}
                   onClick={() => {
                     if (focusAbortSong) void abortSongSeparation(focusAbortSong);
                   }}
@@ -5080,7 +5080,7 @@ export function BandMixer() {
           <p className="small" style={{ opacity: 0.5, margin: 0 }}>
             {restoringSession ? "正在讀取先前保存的歌曲清單…" : "尚未載入歌曲"}
           </p>
-          <p className="small" style={{ opacity: 0.35, marginTop: 6 }}>載入後可自動保存於此裝置，並於歌曲卡片內分離音源</p>
+          <p className="small" style={{ opacity: 0.35, marginTop: 6 }}>載入後可自動保存於此裝置，並於歌曲卡片內分離音軌</p>
         </div>
       ) : (
         <div className="grid mixer-songs" style={{ gap: 12 }}>

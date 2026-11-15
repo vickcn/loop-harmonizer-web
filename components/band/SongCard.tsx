@@ -236,7 +236,7 @@ export const SongCard = memo(function SongCard(props: Props) {
           : (song.separationStage as string) === "pausing"
             ? "正在安全邊界暫停並寫入 Checkpoint"
             : song.separationStage === "processing"
-              ? "AI 音源分離運算中"
+              ? "AI 音軌分離運算中"
               : "處理中";
   const isDecodingAudio = song.audioLoadState === "decoding";
   const audioUnavailable =
@@ -249,10 +249,10 @@ export const SongCard = memo(function SongCard(props: Props) {
       : song.separationStatus === "processing"
         ? "分離中…"
         : song.separationStatus === "cancelled" || song.separationStatus === "completed" || song.separationStatus === "paused" || song.separationStatus === "interrupted"
-          ? "重新分離音源"
+          ? "重新分離音軌"
           : song.separationStatus === "failed"
-            ? "重試分離音源"
-            : "分離音源";
+            ? "重試分離音軌"
+            : "分離音軌";
   const persistenceInfo = song.persistenceStatus ? PERSISTENCE_BADGE[song.persistenceStatus] : null;
   const rate = getEffectivePlaybackRate(song);
   const coarseRate = song.tempoMode === "target-bpm"
@@ -694,7 +694,7 @@ export const SongCard = memo(function SongCard(props: Props) {
 
         <section className="grid" style={{ gap: 10, paddingTop: 12, borderTop: "1px solid var(--line)" }}>
           <div className="row" style={{ gap: 8, flexWrap: "nowrap", minWidth: 0 }}>
-            <strong style={{ flex: "0 0 auto" }}>音源</strong>
+            <strong style={{ flex: "0 0 auto" }}>音軌</strong>
             <select className="input" aria-label="分離軌數模式" value={mode} disabled={isSeparating || focusLocked} style={{ flex: "0 0 auto" }} onChange={(event) => setSelectedMode(event.target.value as StemSeparationMode)}>
               <option value="two_stem">2 Stem</option>
               <option value="four_stem">4 Stem</option>
@@ -708,7 +708,7 @@ export const SongCard = memo(function SongCard(props: Props) {
                   disabledReason: focusLocked
                     ? focusLockReason
                     : isSeparationBusy
-                      ? "正在準備或進行音源分離，請稍候"
+                      ? "正在準備或進行音軌分離，請稍候"
                       : audioUnavailable
                         ? "請先等待恢復、解碼或重新選取原始音檔"
                         : undefined,
@@ -734,7 +734,7 @@ export const SongCard = memo(function SongCard(props: Props) {
                         focusLocked
                           ? focusLockReason
                           : isSeparationBusy
-                            ? "正在準備或進行音源分離，請稍候"
+                            ? "正在準備或進行音軌分離，請稍候"
                             : audioUnavailable
                               ? "請先等待恢復、解碼或重新選取原始音檔"
                               : undefined
@@ -839,7 +839,7 @@ export const SongCard = memo(function SongCard(props: Props) {
             <div className="row" role="status" aria-live="polite" style={{ gap: 8, alignItems: "center" }}>
               <span className="mixer-spinner" aria-hidden="true" />
               <span className="small" style={{ color: "#38bdf8" }}>
-                正在準備音源分離…
+                正在準備音軌分離…
               </span>
             </div>
           )}
@@ -864,7 +864,7 @@ export const SongCard = memo(function SongCard(props: Props) {
                     </div>
                     <div
                       role="progressbar"
-                      aria-label="音源分離進度"
+                      aria-label="音軌分離進度"
                       aria-valuemin={0}
                       aria-valuemax={100}
                       aria-valuenow={pct ?? undefined}
@@ -899,7 +899,7 @@ export const SongCard = memo(function SongCard(props: Props) {
                         className="btn mixer-button"
                         disabled={isCancelling || isPausingStage}
                         style={{ minHeight: 44, minWidth: 44, padding: "8px 12px" }}
-                        aria-label={`在安全邊界暫停「${song.name}」音源分離`}
+                        aria-label={`在安全邊界暫停「${song.name}」音軌分離`}
                         title="等待目前 Chunk 寫入完成後安全暫停，之後可接續完成"
                         onClick={props.onPauseSeparation}
                       >
@@ -912,8 +912,8 @@ export const SongCard = memo(function SongCard(props: Props) {
                         type="button"
                         className="btn mixer-abort-button"
                         disabled={isCancelling}
-                        aria-label={isCancelling ? "正在停止音源分離" : `中止「${song.name}」音源分離`}
-                        title="立即中止音源分離，已寫入之段落仍將安全保留"
+                        aria-label={isCancelling ? "正在停止音軌分離" : `中止「${song.name}」音軌分離`}
+                        title="立即中止音軌分離，已寫入之段落仍將安全保留"
                         onClick={props.onAbortSeparation}
                       >
                         <OctagonXIcon />
@@ -995,7 +995,7 @@ export const SongCard = memo(function SongCard(props: Props) {
           {song.separationStatus === "cancelled" && (
             <div role="status" className="card-warning-banner" style={{ alignItems: "flex-start" }}>
               <div className="grid" style={{ gap: 4, flex: "1 1 220px", minWidth: 0 }}>
-                <span>{song.separationMessage || "已中止音源分離，保留原本音訊設定。"}</span>
+                <span>{song.separationMessage || "已中止音軌分離，保留原本音訊設定。"}</span>
                 {hasSavedChunks && (
                   <span className="small" style={{ fontVariantNumeric: "tabular-nums" }}>
                     {`已保留第 ${completedChunks} / ${totalChunks} 段（${chunkResumePct}%）｜本機已保存 ${committedMiB} MiB`}
@@ -1039,7 +1039,7 @@ export const SongCard = memo(function SongCard(props: Props) {
           {song.separationStatus === "completed" && (
             <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
               <span className="small" style={{ color: "#34d399" }}>
-                ✓ {song.separationMessage || "音源分離已完成"}
+                ✓ {song.separationMessage || "音軌分離已完成"}
                 {totalChunks > 0 ? `（已完成 ${completedChunks || totalChunks} / ${totalChunks} 段${song.separationCommittedBytes ? `｜${committedMiB} MiB` : ""}）` : ""}
               </span>
             </div>

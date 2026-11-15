@@ -90,7 +90,7 @@ export function TrackCard({ track, onChange, collapsed = false, onToggleCollapse
             {!collapsed && <div className="small" style={{ opacity: 0.45 }}>{track.fileName}</div>}
             {!collapsed && track.stemMetadata && (
               <div className="small" style={{ marginTop: 2, color: "var(--accent)", opacity: 0.8 }}>
-                分離音源組 · {track.stemMetadata.sourceFileName}
+                分離音軌組 · {track.stemMetadata.sourceFileName}
               </div>
             )}
           </div>

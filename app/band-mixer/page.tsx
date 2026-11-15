@@ -12,7 +12,7 @@ export default function BandMixerPage() {
 
       <header className="col-full">
         <h1 className="title">歌曲混音器</h1>
-        <p className="subtitle">每首歌獨立控制 BPM、Key、Loop 與分軌混音；音源分離和播放處理都留在瀏覽器。</p>
+        <p className="subtitle">每首歌獨立控制 BPM、Key、Loop 與分軌混音；音軌分離和播放處理都留在瀏覽器。</p>
       </header>
 
       <div className="col-full">

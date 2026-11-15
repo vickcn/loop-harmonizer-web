@@ -96,7 +96,7 @@ export function StemSeparationDialog({ open, onClose, onAddStems }: Props) {
       });
       setStatus("分離完成。可先下載 WAV，或將全部分軌加入 Band Mixer。");
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "音源分離失敗，請稍後重試。");
+      setError(caught instanceof Error ? caught.message : "音軌分離失敗，請稍後重試。");
       setStatus("分離未完成。");
     } finally {
       setRunning(false);
@@ -143,7 +143,7 @@ export function StemSeparationDialog({ open, onClose, onAddStems }: Props) {
       >
         <div className="row" style={{ justifyContent: "space-between", gap: 12 }}>
           <div>
-            <h2 id="stem-separation-title" style={{ margin: 0, fontSize: 20 }}>分離音源</h2>
+            <h2 id="stem-separation-title" style={{ margin: 0, fontSize: 20 }}>分離音軌</h2>
             <p className="small" style={{ margin: "6px 0 0", opacity: 0.65 }}>
               模型與推論完全在您的瀏覽器中執行，不會上傳到伺服器。
             </p>
