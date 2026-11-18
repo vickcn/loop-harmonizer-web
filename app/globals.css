@@ -16,6 +16,12 @@ html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--te
 button, input, select { font: inherit; }
 button { cursor: pointer; }
 
+.background-separation-indicator { position: fixed; z-index: 30; right: 16px; bottom: max(16px, env(safe-area-inset-bottom)); display: flex; align-items: center; gap: 10px; max-width: min(360px, calc(100vw - 28px)); padding: 10px 13px; border: 1px solid rgba(138, 180, 248, .42); border-radius: 14px; background: rgba(23, 26, 35, .94); box-shadow: 0 14px 36px rgba(0,0,0,.42); backdrop-filter: blur(12px); }
+.background-separation-copy { display: grid; min-width: 0; gap: 2px; font-size: 12px; color: var(--muted); }
+.background-separation-copy strong { overflow: hidden; color: var(--text); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.background-separation-spinner { width: 16px; height: 16px; flex: 0 0 auto; border: 2px solid rgba(138, 180, 248, .28); border-top-color: var(--accent); border-radius: 999px; animation: separation-spin .8s linear infinite; }
+@keyframes separation-spin { to { transform: rotate(360deg); } }
+
 /* ── 容器：把寬度上限放到 1600，手機減少 padding ── */
 .container { max-width: 1600px; margin: 0 auto; padding: 24px; }
 @media (max-width: 640px) { .container { padding: 14px; } }

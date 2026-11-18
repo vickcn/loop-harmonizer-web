@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { BandSession, BandSong, SeparationFocusSessionSnapshot, SongPlaybackSource, StemChannel } from "@/lib/band/bandTypes";
 import { createDefaultBandSession } from "@/lib/band/bandSession";
 import {
@@ -31,6 +31,7 @@ import {
   sharedSeparationCoordinator,
   type SeparationTaskStage,
 } from "@/lib/separation/separationTaskController";
+import { sharedSeparationJobManager } from "@/lib/separation/separationJobManager";
 import {
   assessResourceRisk,
   collectDeviceCapabilities,
@@ -301,6 +302,11 @@ export function BandMixer() {
   const autoResumeDebounceRef = useRef<number | null>(null);
   const attemptForegroundAutoResumeRef = useRef<() => void>(() => undefined);
   const persistSongDebouncedRef = useRef<(songId: string, delayMs?: number) => void>(() => undefined);
+  const backgroundSeparationJobs = useSyncExternalStore(
+    sharedSeparationJobManager.subscribe.bind(sharedSeparationJobManager),
+    sharedSeparationJobManager.getSnapshot,
+    sharedSeparationJobManager.getSnapshot,
+  );
 
   const getEngine = useCallback(() => {
     if (!engineRef.current) {
@@ -350,6 +356,43 @@ export function BandMixer() {
   useEffect(() => {
     profileWarningRef.current = profileWarning;
   }, [profileWarning]);
+
+  // BandMixer 僅訂閱全域投影；重新掛載時不重新建立 Worker，也不以舊 UI callback 降級 completed。
+  useEffect(() => {
+    if (backgroundSeparationJobs.length === 0) return;
+    setSession((previous) => {
+      let changed = false;
+      const songs = previous.songs.map((song) => {
+        const job = backgroundSeparationJobs.find((candidate) => candidate.songId === song.id);
+        if (!job || song.separationStatus === "completed") return song;
+        const status: BandSong["separationStatus"] = job.stage === "interrupted"
+          ? "interrupted"
+          : job.stage === "paused" || job.stage === "cancelled" || job.stage === "failed"
+            ? job.stage
+            : job.stage === "cancelling"
+              ? "cancelling"
+              : "processing";
+        if (
+          song.separationStatus === status &&
+          song.separationCompletedChunks === job.completedChunks &&
+          song.separationTotalChunks === job.totalChunks &&
+          song.separationMessage === job.message
+        ) return song;
+        changed = true;
+        return {
+          ...song,
+          separationStatus: status,
+          separationStage: job.stage,
+          separationProgress: job.progress,
+          separationCompletedChunks: job.completedChunks,
+          separationTotalChunks: job.totalChunks,
+          separationCommittedBytes: job.committedBytes,
+          separationMessage: job.message,
+        };
+      });
+      return changed ? { ...previous, songs } : previous;
+    });
+  }, [backgroundSeparationJobs]);
 
   const showShortcutHint = useCallback((message: string) => {
     setShortcutHint(message);
@@ -1592,7 +1635,10 @@ export function BandMixer() {
       sharedPerfTelemetry.stopObserving();
       engineRef.current?.dispose();
       engineRef.current = null;
-      void disposeStemSeparator({ revokeModelUrl: true });
+      // 路由切換只會卸載 UI；全域 job manager 持有中的 Worker 必須繼續執行。
+      if (!sharedSeparationCoordinator.hasRunningHeavyTask()) {
+        void disposeStemSeparator({ revokeModelUrl: true });
+      }
     };
   }, []);
 
@@ -2782,7 +2828,11 @@ export function BandMixer() {
         clearLeaseIfTerminal: true,
       }).catch(() => undefined);
     }
-    await sharedSeparationCoordinator.cancelTask(song.id, "已中止音軌分離（保留已提交 Chunk；不會自動續跑）。", 80);
+    if (taskId) {
+      await sharedSeparationJobManager.cancelJob(taskId);
+    } else {
+      await sharedSeparationCoordinator.cancelTask(song.id, "已中止音軌分離（保留已提交 Chunk；不會自動續跑）。", 80);
+    }
     await finishSeparationFocus({
       songId: song.id,
       outcome: "cancelled",
@@ -2803,7 +2853,14 @@ export function BandMixer() {
           : prev
       ));
     }
-    await sharedSeparationCoordinator.pauseTask(song.id, "已於安全 Chunk 邊界暫停，可隨時繼續分離。", 80);
+    const taskId = song.separationTaskId || (song.sourceAudioHash
+      ? createCheckpointTaskId(song.id, song.sourceAudioHash, DEMUCS_MODEL_VERSION, SEPARATION_PROCESSING_VERSION)
+      : null);
+    if (taskId) {
+      await sharedSeparationJobManager.pauseJob(taskId);
+    } else {
+      await sharedSeparationCoordinator.pauseTask(song.id, "已於安全 Chunk 邊界暫停，可隨時繼續分離。", 80);
+    }
   };
 
   const resumeSongSeparation = async (song: BandSong) => {
@@ -3421,8 +3478,10 @@ export function BandMixer() {
 
     let controller;
     try {
-      controller = sharedSeparationCoordinator.startTask({
+      controller = sharedSeparationJobManager.startJob({
+        taskId: checkpointTaskId,
         songId: song.id,
+        songName: latestReadySong.name,
         throttleMs: 180,
         cooldownMs: 80,
         onProgress: (event) => {
@@ -3493,6 +3552,11 @@ export function BandMixer() {
 
     const token = Symbol(song.id);
     separationTokensRef.current.set(song.id, token);
+    sharedSeparationJobManager.registerAutoResume(checkpointTaskId, async () => {
+      const current = sessionRef.current.songs.find((candidate) => candidate.id === song.id);
+      if (!current) throw new Error("原歌曲已移除，禁止自動續跑。");
+      await separateSong({ ...current, separationStatus: "interrupted" }, effectiveMode, { isAutoResume: true });
+    });
 
     try {
       let stems: SeparatedStemSet | null = preCached ?? null;
@@ -3504,7 +3568,7 @@ export function BandMixer() {
           separationTaskId: checkpointTaskId,
           separationUserAuthorized: true,
         });
-        const result = await separateAudio(file, {
+        const result = await sharedSeparationJobManager.runJob(checkpointTaskId, () => separateAudio(file, {
           mode: effectiveMode,
           controller,
           songId: song.id,
@@ -3515,6 +3579,14 @@ export function BandMixer() {
           knownInMemorySongs: sessionRef.current.songs,
           maxThreads,
           onChunkCommitted: ({ checkpoint: committedCp, chunkIndex, totalChunks }) => {
+            sharedSeparationJobManager.updateJob(checkpointTaskId, {
+              stage: committedCp.status === "completed" ? "completed" : "processing",
+              progress: totalChunks > 0 ? (chunkIndex + 1) / totalChunks : 0,
+              completedChunks: committedCp.nextChunkIndex,
+              totalChunks,
+              committedBytes: committedCp.committedBytes,
+              message: `正在分離並提交第 ${chunkIndex + 1} / ${totalChunks} 段…`,
+            });
             if (!controller.isCurrent()) return;
             const pct = totalChunks > 0 ? (chunkIndex + 1) / totalChunks : 0;
             patchSongMetadataOnly(
@@ -3534,7 +3606,7 @@ export function BandMixer() {
               },
             );
           },
-        });
+        }));
         sharedPerfTelemetry.recordSeparationDuration(result.durationMs);
 
         if (result.paused) {

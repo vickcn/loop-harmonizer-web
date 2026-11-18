@@ -21,8 +21,10 @@ import {
 } from "../storage/separationChunkStore.ts";
 import { recordSeparationDiagnostic } from "./separationStateRecovery.ts";
 
-export const DEFAULT_JOB_LEASE_TTL_MS = 12_000;
-export const DEFAULT_JOB_HEARTBEAT_MS = 4_000;
+/** 背景分頁 timer 會節流，TTL 必須大於單次 heartbeat 間隔的數倍。 */
+export const DEFAULT_BACKGROUND_JOB_LEASE_TTL_MS = 90_000;
+export const DEFAULT_JOB_LEASE_TTL_MS = DEFAULT_BACKGROUND_JOB_LEASE_TTL_MS;
+export const DEFAULT_JOB_HEARTBEAT_MS = 20_000;
 export const SEPARATION_LEASE_CHANNEL_NAME = "loop-harmonizer-separation-lease";
 
 export interface ResumeValidationContext {
@@ -491,6 +493,14 @@ export interface LeaseBroadcastMessage {
   timestamp: number;
 }
 
+export type WebLockAdapter = {
+  request<T>(
+    name: string,
+    options: { ifAvailable: boolean },
+    callback: (lock: Lock | null) => Promise<T>,
+  ): Promise<T>;
+};
+
 /**
  * 跨分頁單一執行鎖（Lease + Heartbeat + Generation Token + Web Locks 輔助）。
  * 防止多個分頁同時啟動重複 Demucs Worker 或覆寫 IndexedDB Chunk。
@@ -498,6 +508,32 @@ export interface LeaseBroadcastMessage {
 export class SeparationJobLeaseManager {
   private channel: BroadcastChannel | null = null;
   private closed = false;
+  private readonly lockAdapter?: WebLockAdapter | null;
+
+  constructor(options?: { lockAdapter?: WebLockAdapter | null }) {
+    this.lockAdapter = options?.lockAdapter;
+  }
+
+  /**
+   * Web Lock 必須覆蓋整個推論生命週期，而不是只包住 acquireLease。
+   * IDB Lease / generation 仍是 commit 的權威防線，讓不支援 Web Locks 的瀏覽器安全降級。
+   */
+  async withTaskLock<T>(
+    taskId: string,
+    runner: () => Promise<T>,
+    adapter?: WebLockAdapter | null,
+  ): Promise<{ acquired: true; value: T } | { acquired: false }> {
+    const locks: WebLockAdapter | null | undefined = adapter === undefined
+      ? (this.lockAdapter === undefined
+          ? (typeof navigator !== "undefined" ? navigator.locks as unknown as WebLockAdapter : undefined)
+          : this.lockAdapter)
+      : adapter;
+    if (!locks?.request) return { acquired: true, value: await runner() };
+    return locks.request(`loop-harmonizer:separation:${taskId}`, { ifAvailable: true }, async (lock) => {
+      if (!lock) return { acquired: false };
+      return { acquired: true, value: await runner() };
+    });
+  }
 
   private ensureChannel(): BroadcastChannel | null {
     if (this.closed || typeof BroadcastChannel === "undefined") return null;
@@ -608,35 +644,6 @@ export class SeparationJobLeaseManager {
           checkpoint: updated,
         };
       });
-
-    // 若環境提供 Web Locks API，先行原子仲裁避免同分頁／跨分頁競態
-    if (typeof navigator !== "undefined" && navigator.locks?.request) {
-      return navigator.locks.request(
-        `loop-harmonizer:lease:${taskId}`,
-        { ifAvailable: true },
-        async (lock) => {
-          if (!lock) {
-            const cp = await getCheckpoint(taskId);
-            return {
-              acquired: false as const,
-              reason: "另一條執行緒或分頁正在競爭同一分離任務鎖。",
-              existingLease: cp?.lease ?? null,
-            };
-          }
-          const result = await doAcquire();
-          if (result.acquired) {
-            this.post({
-              type: "lease-acquired",
-              taskId,
-              ownerTabId,
-              generation: result.lease.generation,
-              timestamp: now,
-            });
-          }
-          return result;
-        },
-      );
-    }
 
     const result = await doAcquire();
     if (result.acquired) {
