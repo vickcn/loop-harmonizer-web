@@ -486,10 +486,21 @@ export function evaluateAutoResumeEligibility(
 }
 
 export interface LeaseBroadcastMessage {
-  type: "lease-acquired" | "lease-released" | "task-cancelled" | "task-paused" | "task-completed";
+  type:
+    | "lease-acquired"
+    | "lease-released"
+    | "task-progress"
+    | "task-cancelled"
+    | "task-paused"
+    | "task-completed"
+    | "task-failed";
   taskId: string;
   ownerTabId: string;
   generation?: number;
+  completedChunks?: number;
+  totalChunks?: number;
+  committedBytes?: number;
+  message?: string;
   timestamp: number;
 }
 
@@ -533,6 +544,27 @@ export class SeparationJobLeaseManager {
       if (!lock) return { acquired: false };
       return { acquired: true, value: await runner() };
     });
+  }
+
+  /**
+   * 非阻塞偵測任務級 Web Lock 是否仍被某個分頁／Worker 持有。
+   * 即使背景分頁的 timer 被瀏覽器節流而導致 IndexedDB Lease 暫時超時，
+   * 只要 Web Lock 仍被持有，其他分頁就不得搶奪接管或將任務誤判為 interrupted。
+   */
+  async isTaskLockHeld(taskId: string, adapter?: WebLockAdapter | null): Promise<boolean> {
+    const locks: WebLockAdapter | null | undefined = adapter === undefined
+      ? (this.lockAdapter === undefined
+          ? (typeof navigator !== "undefined" ? navigator.locks as unknown as WebLockAdapter : undefined)
+          : this.lockAdapter)
+      : adapter;
+    if (!locks?.request) return false;
+    try {
+      return await locks.request(`loop-harmonizer:separation:${taskId}`, { ifAvailable: true }, async (lock) => {
+        return !lock;
+      });
+    } catch {
+      return false;
+    }
   }
 
   private ensureChannel(): BroadcastChannel | null {
@@ -712,6 +744,46 @@ export class SeparationJobLeaseManager {
     });
   }
 
+  notifyTaskProgress(params: {
+    taskId: string;
+    ownerTabId: string;
+    generation?: number;
+    completedChunks: number;
+    totalChunks: number;
+    committedBytes: number;
+    message?: string;
+    now?: number;
+  }): void {
+    this.post({
+      type: "task-progress",
+      taskId: params.taskId,
+      ownerTabId: params.ownerTabId,
+      generation: params.generation,
+      completedChunks: params.completedChunks,
+      totalChunks: params.totalChunks,
+      committedBytes: params.committedBytes,
+      message: params.message,
+      timestamp: params.now ?? Date.now(),
+    });
+  }
+
+  notifyTaskFailed(
+    taskId: string,
+    ownerTabId: string,
+    generation?: number,
+    message?: string,
+    now = Date.now(),
+  ): void {
+    this.post({
+      type: "task-failed",
+      taskId,
+      ownerTabId,
+      generation,
+      message,
+      timestamp: now,
+    });
+  }
+
   async releaseLease(
     taskId: string,
     lease: Pick<SeparationLeaseInfo, "ownerTabId" | "ownerJobToken" | "generation">,
@@ -802,7 +874,9 @@ export class SeparationJobLeaseManager {
             ? "task-cancelled"
             : resolvedStatus === "paused"
               ? "task-paused"
-              : "lease-released";
+              : resolvedStatus === "failed"
+                ? "task-failed"
+                : "lease-released";
       this.post({
         type: broadcastType,
         taskId,

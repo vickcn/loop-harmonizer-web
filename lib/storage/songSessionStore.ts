@@ -1,4 +1,4 @@
-import type { BandSong } from "@/lib/band/bandTypes";
+import type { BandSong, SeparationStatus } from "../band/bandTypes.ts";
 import {
   detectSongRevisionConflict,
   findUnreferencedAudioKeys,
@@ -8,15 +8,17 @@ import {
   sortPersistedSongsByOrder,
   type PersistedSessionMetaRecord,
   type PersistedSongRecord,
-} from "@/lib/band/songModel";
-import { DEMUCS_MODEL_VERSION, SEPARATION_PROCESSING_VERSION } from "./cacheKeys";
-import { idbGetAll, idbRequestPromise, withIdbTransaction } from "./indexedDb";
-import { getModelCacheMetadata } from "./modelCache";
-import type { StemCacheRecord } from "./separationCacheRecord";
+  type PersistedStemChannelState,
+} from "../band/songModel.ts";
+import { DEMUCS_MODEL_VERSION, SEPARATION_PROCESSING_VERSION } from "./cacheKeys.ts";
+import { idbGetAll, idbRequestPromise, withIdbTransaction } from "./indexedDb.ts";
+import { getModelCacheMetadata } from "./modelCache.ts";
+import type { StemCacheRecord } from "./separationCacheRecord.ts";
 import {
   releaseCheckpointReferenceAndMaybeGc,
   runCheckpointGarbageCollection,
-} from "./separationCheckpointStore";
+} from "./separationCheckpointStore.ts";
+import { canTransitionSeparationStatus } from "../separation/separationStateRecovery.ts";
 
 const SESSION_META_KEY = "band-session" as const;
 const SYNC_CHANNEL_NAME = "loop-harmonizer-band-sync";
@@ -234,6 +236,135 @@ export async function getPersistedSongWithAudio(songId: string): Promise<{
       tx.objectStore("audioFiles").get(song.audioKey),
     )) ?? null;
     return { song, audio };
+  });
+}
+
+export async function getPersistedSongRecord(songId: string): Promise<PersistedSongRecord | null> {
+  if (!songId) return null;
+  return withIdbTransaction(["songs"], "readonly", async (tx) => {
+    const song = await idbRequestPromise<PersistedSongRecord | undefined>(
+      tx.objectStore("songs").get(songId),
+    );
+    return song ?? null;
+  });
+}
+
+export async function getAllPersistedSongRecords(): Promise<PersistedSongRecord[]> {
+  return idbGetAll<PersistedSongRecord>("songs").catch(() => []);
+}
+
+export type SeparationSongRecordPatch = {
+  separationMode?: "two_stem" | "four_stem" | null;
+  separationStatus?: SeparationStatus;
+  separationTaskId?: string | null;
+  separationCompletedChunks?: number;
+  separationTotalChunks?: number;
+  separationCommittedBytes?: number;
+  separationUserAuthorized?: boolean;
+  cacheKey?: string | null;
+  playbackSource?: "original" | "stems";
+  ensureStemRoles?: readonly string[];
+  allowResetCompleted?: boolean;
+  allowChunkRegression?: boolean;
+};
+
+/**
+ * 僅在資料層以欄位級合併更新歌曲的分軌持久化欄位，完整保留使用者在背景分軌期間
+ * 修改的 targetBpm、keyShiftSemitones、音量、Loop 與分軌混音設定，絕不以過期快照覆寫。
+ */
+export async function patchPersistedSongSeparationFields(
+  songId: string,
+  patch: SeparationSongRecordPatch,
+): Promise<PersistedSongRecord | null> {
+  if (!songId) return null;
+  const tabId = getTabSyncId();
+  return enqueueDbWrite(async () => {
+    const outcome = await withIdbTransaction(["songs"], "readwrite", async (tx) => {
+      const songsStore = tx.objectStore("songs");
+      const existing = await idbRequestPromise<PersistedSongRecord | undefined>(songsStore.get(songId));
+      if (!existing) return { updated: false as const, record: null };
+
+      const currentStatus: SeparationStatus = existing.separationStatus ?? "not_started";
+      if (
+        patch.separationStatus &&
+        !canTransitionSeparationStatus(currentStatus, patch.separationStatus, {
+          allowResetCompleted: patch.allowResetCompleted,
+        })
+      ) {
+        return { updated: false as const, record: existing };
+      }
+
+      const nextTaskId =
+        patch.separationTaskId !== undefined ? patch.separationTaskId : existing.separationTaskId ?? null;
+      const sameTask = Boolean(nextTaskId && existing.separationTaskId === nextTaskId);
+
+      let nextCompletedChunks =
+        patch.separationCompletedChunks !== undefined
+          ? patch.separationCompletedChunks
+          : existing.separationCompletedChunks ?? 0;
+      let nextCommittedBytes =
+        patch.separationCommittedBytes !== undefined
+          ? patch.separationCommittedBytes
+          : existing.separationCommittedBytes ?? 0;
+
+      if (
+        sameTask &&
+        !patch.allowResetCompleted &&
+        !patch.allowChunkRegression &&
+        patch.separationStatus !== "not_started" &&
+        patch.separationStatus !== "cancelled"
+      ) {
+        nextCompletedChunks = Math.max(existing.separationCompletedChunks ?? 0, nextCompletedChunks);
+        nextCommittedBytes = Math.max(existing.separationCommittedBytes ?? 0, nextCommittedBytes);
+      }
+
+      let nextStemChannels: PersistedStemChannelState[] = existing.stemChannels;
+      if (patch.ensureStemRoles && patch.ensureStemRoles.length > 0) {
+        nextStemChannels = patch.ensureStemRoles.map((role) => {
+          const prev = existing.stemChannels.find((ch) => ch.stemType === role);
+          return prev
+            ? { ...prev }
+            : { stemType: role, volume: 1, muted: false, solo: false };
+        });
+      }
+
+      const nextRecord: PersistedSongRecord = {
+        ...existing,
+        separationMode:
+          patch.separationMode !== undefined ? patch.separationMode : existing.separationMode,
+        separationStatus: patch.separationStatus ?? existing.separationStatus,
+        separationTaskId: nextTaskId,
+        separationCompletedChunks: nextCompletedChunks,
+        separationTotalChunks:
+          patch.separationTotalChunks !== undefined
+            ? patch.separationTotalChunks
+            : existing.separationTotalChunks,
+        separationCommittedBytes: nextCommittedBytes,
+        separationUserAuthorized:
+          patch.separationUserAuthorized !== undefined
+            ? patch.separationUserAuthorized
+            : existing.separationUserAuthorized,
+        cacheKey: patch.cacheKey !== undefined ? patch.cacheKey : existing.cacheKey,
+        playbackSource: patch.playbackSource ?? existing.playbackSource,
+        stemChannels: nextStemChannels,
+        revision: (existing.revision ?? 0) + 1,
+        updatedAt: Date.now(),
+        updatedByTabId: tabId,
+      };
+
+      await idbRequestPromise(songsStore.put(nextRecord));
+      return { updated: true as const, record: nextRecord };
+    });
+
+    if (outcome.updated && outcome.record) {
+      postSyncMessage({
+        type: "song-updated",
+        tabId,
+        songId,
+        record: outcome.record,
+      });
+    }
+    return outcome.record;
   });
 }
 
