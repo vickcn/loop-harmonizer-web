@@ -64,6 +64,11 @@ export interface RetryStorageAdapter {
   setItem(key: string, value: string): void;
 }
 
+export interface RetryTimerAdapter {
+  setTimeout(callback: () => void, delayMs: number): ReturnType<typeof setTimeout>;
+  clearTimeout(timer: ReturnType<typeof setTimeout>): void;
+}
+
 type CoordinatorLike = Pick<
   typeof sharedSeparationCoordinator,
   "startTask" | "pauseTask" | "cancelTask" | "getActiveController" | "hasRunningHeavyTask"
@@ -93,6 +98,7 @@ type JobManagerOptions = {
   runnerDeps?: SeparationJobRunnerDeps;
   retryStorage?: RetryStorageAdapter | null;
   now?: () => number;
+  retryTimer?: RetryTimerAdapter;
   enableBroadcastSync?: boolean;
 };
 
@@ -126,6 +132,7 @@ export function mapJobStageToSongSeparationStatus(stage: SeparationJobStage): Se
     case "preparing":
     case "downloading":
     case "processing":
+    case "finalizing":
     case "pausing":
       return "processing";
     case "cancelling":
@@ -153,11 +160,12 @@ export function mapCheckpointStatusToJobStage(
   context: {
     hasActiveLocalController: boolean;
     hasActiveForeignOwner: boolean;
+    isFinalized?: boolean;
   },
 ): SeparationJobStage {
   switch (checkpoint.status) {
     case "completed":
-      return "completed";
+      return context.isFinalized ? "completed" : "finalizing";
     case "cancelled":
       return "cancelled";
     case "failed":
@@ -253,6 +261,7 @@ export class SeparationJobManager implements SeparationJobSinkPort {
   private readonly runnerDeps: SeparationJobRunnerDeps;
   private readonly retryStorage: RetryStorageAdapter | null;
   private readonly now: () => number;
+  private readonly retryTimer: RetryTimerAdapter;
   private readonly managerCreatedAt: number;
 
   private readonly jobs = new Map<string, SeparationJobState>();
@@ -267,6 +276,7 @@ export class SeparationJobManager implements SeparationJobSinkPort {
   private globalFocusOwnerSongId: string | null = null;
   private lifecycleRecoveryInFlight: Promise<void> | null = null;
   private lifecycleDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private retryWakeupTimer: ReturnType<typeof setTimeout> | null = null;
   private unsubscribeBroadcast: (() => void) | null = null;
 
   constructor(options: JobManagerOptions = {}) {
@@ -284,6 +294,7 @@ export class SeparationJobManager implements SeparationJobSinkPort {
     this.retryStorage =
       options.retryStorage !== undefined ? options.retryStorage : DEFAULT_RETRY_STORAGE;
     this.now = options.now ?? (() => Date.now());
+    this.retryTimer = options.retryTimer ?? { setTimeout, clearTimeout };
     this.managerCreatedAt = this.now();
 
     if (options.enableBroadcastSync !== false) {
@@ -298,6 +309,7 @@ export class SeparationJobManager implements SeparationJobSinkPort {
       clearTimeout(this.lifecycleDebounceTimer);
       this.lifecycleDebounceTimer = null;
     }
+    this.clearRetryWakeup();
     this.unsubscribeBroadcast?.();
     this.unsubscribeBroadcast = null;
     this.controllers.clear();
@@ -589,6 +601,8 @@ export class SeparationJobManager implements SeparationJobSinkPort {
       }
     }
 
+    this.scheduleRetryWakeup();
+
     this.pruneTerminalHistory();
     this.publish();
   }
@@ -650,7 +664,31 @@ export class SeparationJobManager implements SeparationJobSinkPort {
    * 即使 BandMixer 卸載或使用者切換路由至 /studio，仍能完整完成並提交歌曲資料。
    */
   async runSongSeparation(request: StartSeparationJobRequest): Promise<SeparationJobRunOutcome> {
-    return runSeparationJob(request, this, this.runnerDeps);
+    const outcome = await runSeparationJob(request, this, this.runnerDeps);
+    // 手動／初次執行在 finalizing 失敗時也要有第一個實際喚醒；自動續跑路徑由 requestAutoResume
+    // 自己遞增嘗試次數，避免雙重計數。
+    if (!request.isAutoResume && outcome.status === "failed" && outcome.retryable) {
+      const job = this.jobs.get(outcome.taskId);
+      if (job?.stage === "finalizing") {
+        const existing = this.getAutoResumeRetryState(outcome.taskId);
+        if (!existing) {
+          this.saveRetryEntry({
+            taskId: outcome.taskId,
+            attempts: 0,
+            nextEligibleAt: this.now() + AUTO_RESUME_BACKOFF_MS[0],
+            lastError: outcome.message,
+            baselineCompletedChunks: outcome.completedChunks,
+          });
+          this.updateJob(outcome.taskId, {
+            stage: "finalizing",
+            autoResumeAttempts: 0,
+            requiresManualAction: false,
+            message: "分軌已完成，等待保存結果（將於稍後自動重試）。",
+          }, { source: "runner.finalizationRetryScheduled" });
+        }
+      }
+    }
+    return outcome;
   }
 
   async runJob<T>(taskId: string, runner: () => Promise<T>): Promise<T> {
@@ -751,11 +789,12 @@ export class SeparationJobManager implements SeparationJobSinkPort {
       this.writeRetryMap(entries);
     }
     this.memoryRetryEntries.delete(taskId);
+    this.scheduleRetryWakeup();
   }
 
   async requestAutoResume(taskId: string): Promise<boolean> {
     const job = this.jobs.get(taskId);
-    if (!job || job.stage !== "interrupted" || job.isForeignActive) {
+    if (!job || (job.stage !== "interrupted" && job.stage !== "finalizing") || job.isForeignActive) {
       return false;
     }
     if (this.inFlightAutoResume.has(taskId) || this.hasRunningHeavyTask()) {
@@ -1004,14 +1043,22 @@ export class SeparationJobManager implements SeparationJobSinkPort {
       (await this.leaseManager.isTaskLockHeld(taskId, this.lockAdapter));
 
     const hasActiveForeignOwner = hasForeignLease || lockHeldByOther;
+    const persistedSong = await getPersistedSongRecord(checkpoint.songId).catch(() => null);
+    const isFinalized = Boolean(
+      persistedSong &&
+        persistedSong.separationStatus === "completed" &&
+        persistedSong.separationTaskId === checkpoint.taskId &&
+        persistedSong.sourceAudioHash === checkpoint.sourceAudioHash,
+    );
     const stage = mapCheckpointStatusToJobStage(checkpoint, {
       hasActiveLocalController: hasActiveLocal,
       hasActiveForeignOwner,
+      isFinalized,
     });
 
     const resolvedSongName =
       existing?.songName ??
-      (await getPersistedSongRecord(checkpoint.songId).catch(() => null))?.name;
+      persistedSong?.name;
     const cpGeneration = checkpoint.lease?.generation ?? existing?.generation ?? 0;
 
     const progress =
@@ -1024,6 +1071,8 @@ export class SeparationJobManager implements SeparationJobSinkPort {
     let message = existing?.message ?? "已從本機 Checkpoint 同步分離狀態。";
     if (stage === "completed") {
       message = `分段分離完成（共 ${checkpoint.totalChunks} 段按需播放）。`;
+    } else if (stage === "finalizing") {
+      message = "音軌分離完成，正在保存結果…";
     } else if (stage === "cancelled") {
       message = "已中止音軌分離（保留已提交分段）。";
     } else if (stage === "failed") {
@@ -1039,6 +1088,7 @@ export class SeparationJobManager implements SeparationJobSinkPort {
     // 若權威 IDB 已顯示終態（例如跨分頁完成、取消、失敗或由背景回復為 interrupted），同步至 Job 狀態
     const allowAuthoritativeSync =
       stage === "completed" ||
+      stage === "finalizing" ||
       stage === "cancelled" ||
       stage === "paused" ||
       (hasActiveForeignOwner && stage === "processing");
@@ -1086,6 +1136,7 @@ export class SeparationJobManager implements SeparationJobSinkPort {
     if (removedAny) {
       this.publish();
     }
+    this.scheduleRetryWakeup();
   }
 
   /**
@@ -1102,7 +1153,7 @@ export class SeparationJobManager implements SeparationJobSinkPort {
         if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
         if (this.hasRunningHeavyTask() || this.isGlobalFocusActive()) return;
         const interrupted = this.getJobs().filter(
-          (job) => job.stage === "interrupted" && !job.isForeignActive,
+          (job) => (job.stage === "interrupted" || job.stage === "finalizing") && !job.isForeignActive,
         );
         for (const job of interrupted) {
           if (await this.requestAutoResume(job.taskId)) break;
@@ -1202,6 +1253,7 @@ export class SeparationJobManager implements SeparationJobSinkPort {
         baselineCompletedChunks: completedChunks,
       };
       this.writeRetryMap(entries);
+      this.scheduleRetryWakeup();
     }
   }
 
@@ -1209,6 +1261,7 @@ export class SeparationJobManager implements SeparationJobSinkPort {
     const entries = this.readRetryMap();
     entries[entry.taskId] = entry;
     this.writeRetryMap(entries);
+    this.scheduleRetryWakeup();
   }
 
   private readRetryMap(): Record<string, AutoResumeRetryEntry> {
@@ -1234,6 +1287,29 @@ export class SeparationJobManager implements SeparationJobSinkPort {
       return;
     }
     this.retryStorage.setItem(AUTO_RESUME_RETRY_STORAGE_KEY, JSON.stringify(entries));
+  }
+
+  private clearRetryWakeup(): void {
+    if (this.retryWakeupTimer !== null) {
+      this.retryTimer.clearTimeout(this.retryWakeupTimer);
+      this.retryWakeupTimer = null;
+    }
+  }
+
+  /** 單一、低頻的到期喚醒器；到點後仍重新驗證執行權與生命週期資格。 */
+  private scheduleRetryWakeup(): void {
+    this.clearRetryWakeup();
+    const now = this.now();
+    const entries = Object.values(this.readRetryMap()).filter((entry) =>
+      !entry.permanentlyBlockedReason && entry.attempts < MAX_AUTO_RESUME_ATTEMPTS &&
+      (this.jobs.get(entry.taskId)?.stage === "interrupted" || this.jobs.get(entry.taskId)?.stage === "finalizing"),
+    );
+    if (entries.length === 0) return;
+    const nextEligibleAt = Math.min(...entries.map((entry) => entry.nextEligibleAt));
+    this.retryWakeupTimer = this.retryTimer.setTimeout(() => {
+      this.retryWakeupTimer = null;
+      void this.triggerLifecycleRecovery("retry-wakeup").finally(() => this.scheduleRetryWakeup());
+    }, Math.max(0, nextEligibleAt - now));
   }
 
   private publish(): void {

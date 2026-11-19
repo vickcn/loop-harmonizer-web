@@ -30,6 +30,7 @@ import {
   releaseCheckpointReferenceAndMaybeGc,
 } from "../storage/separationCheckpointStore.ts";
 import {
+  commitPersistedSongSeparationFinalization,
   getPersistedAudioBlobByKey,
   getPersistedSongRecord,
   patchPersistedSongSeparationFields,
@@ -435,6 +436,7 @@ export interface SeparationJobSinkPort {
         | "preparing"
         | "downloading"
         | "processing"
+        | "finalizing"
         | "pausing"
         | "paused"
         | "cancelling"
@@ -609,18 +611,16 @@ export async function runSeparationJob(
           effectiveMode === "two_stem"
             ? "已從既有 4 軌分段 Checkpoint 即時合成 2 Stem（零 AI 重算與網路下載）。"
             : `已從本機分段 Checkpoint 驗證並載入完整分軌（共 ${existingValidation.totalChunks} 段按需播放）。`;
-        await patchPersistedSongSeparationFields(request.songId, {
-          separationMode: effectiveMode,
-          separationStatus: "completed",
-          separationTaskId: resolvedCp.taskId,
-          separationCompletedChunks: resolvedCp.totalChunks,
-          separationTotalChunks: resolvedCp.totalChunks,
-          separationCommittedBytes: resolvedCp.committedBytes,
-          separationUserAuthorized: true,
-          cacheKey: activeCacheKey,
-          playbackSource: "stems",
-          ensureStemRoles: stemRolesForMode(effectiveMode),
-        }).catch(() => undefined);
+        const finalCommit = await commitPersistedSongSeparationFinalization({
+          songId: request.songId, taskId: resolvedCp.taskId, sourceAudioHash,
+          modelVersion: DEMUCS_MODEL_VERSION, processingVersion: SEPARATION_PROCESSING_VERSION,
+          mode: effectiveMode, totalChunks: resolvedCp.totalChunks,
+          committedBytes: resolvedCp.committedBytes, cacheKey: activeCacheKey,
+          stemRoles: stemRolesForMode(effectiveMode),
+        });
+        if (finalCommit.status !== "committed" && finalCommit.status !== "already_committed") {
+          throw new Error(`分軌已完成，但尚未保存結果（${finalCommit.status}）。`);
+        }
         jobSink.updateJob(
           resolvedCp.taskId,
           {
@@ -923,6 +923,20 @@ export async function runSeparationJob(
         return next;
       };
 
+      const finalizePersistedSong = async (taskId: string, totalChunks: number, committedBytes: number) => {
+        // 進度 patch 可安全降級；最後提交必須等待佇列並以嚴格 transaction 確認。
+        await persistChain;
+        const result = await commitPersistedSongSeparationFinalization({
+          songId: request.songId, taskId, sourceAudioHash,
+          modelVersion: DEMUCS_MODEL_VERSION, processingVersion: SEPARATION_PROCESSING_VERSION,
+          mode: effectiveMode, totalChunks, committedBytes, cacheKey: activeCacheKey,
+          stemRoles: stemRolesForMode(effectiveMode),
+        });
+        if (result.status !== "committed" && result.status !== "already_committed") {
+          throw new Error(`分軌已完成，但尚未保存結果（${result.status}）。`);
+        }
+      };
+
       try {
         let stems: SeparatedStemSet | null = preCached;
         let chunkedSummary: ChunkedSeparationSummary | undefined;
@@ -1079,21 +1093,16 @@ export async function runSeparationJob(
 
         controller.throwIfAborted();
 
-        // 5) 最終結果提交：僅更新歌曲分離欄位，完整保留使用者編輯中的 BPM/Key/Volume/Loop 設定
+        // 5) 所有 Chunk 已寫入後仍先進入 finalizing；只有嚴格提交成功才可 completed。
         const committedTotalChunks = chunkedSummary?.totalChunks ?? 0;
         const committedBytes = chunkedSummary?.committedBytes ?? 0;
-        await enqueueSongSeparationPatch({
-          separationMode: effectiveMode,
-          separationStatus: "completed",
-          separationTaskId: chunkedSummary?.taskId ?? latestCommittedTaskId,
-          separationCompletedChunks: committedTotalChunks,
-          separationTotalChunks: committedTotalChunks,
-          separationCommittedBytes: committedBytes,
-          separationUserAuthorized: true,
-          cacheKey: activeCacheKey,
-          playbackSource: "stems",
-          ensureStemRoles: stemRolesForMode(effectiveMode),
-        });
+        const finalTaskId = chunkedSummary?.taskId ?? latestCommittedTaskId;
+        jobSink.updateJob(checkpointTaskId, {
+          generation: controller.generation, stage: "finalizing", progress: 0.99,
+          completedChunks: committedTotalChunks, totalChunks: committedTotalChunks,
+          committedBytes, message: "音軌分離完成，正在保存結果…",
+        }, { generation: controller.generation, source: "runner.finalizing" });
+        await finalizePersistedSong(finalTaskId, committedTotalChunks, committedBytes);
 
         if (
           request.forceRecompute &&
@@ -1133,14 +1142,14 @@ export async function runSeparationJob(
           { generation: controller.generation, source: "runner.completed" },
         );
         leaseManager.notifyTaskCompleted(
-          chunkedSummary?.taskId ?? latestCommittedTaskId,
+          finalTaskId,
           tabId,
           controller.generation,
         );
 
         return {
           status: "completed",
-          taskId: chunkedSummary?.taskId ?? latestCommittedTaskId,
+          taskId: finalTaskId,
           songId: request.songId,
           generation: controller.generation,
           mode: effectiveMode,
@@ -1180,18 +1189,27 @@ export async function runSeparationJob(
             toState: "completed",
             note: "recovered completed state in runner catch from authoritative IDB",
           });
-          await enqueueSongSeparationPatch({
-            separationMode: effectiveMode,
-            separationStatus: "completed",
-            separationTaskId: doneCp.taskId,
-            separationCompletedChunks: doneCp.totalChunks,
-            separationTotalChunks: doneCp.totalChunks,
-            separationCommittedBytes: doneCp.committedBytes,
-            separationUserAuthorized: true,
-            cacheKey: activeCacheKey,
-            playbackSource: "stems",
-            ensureStemRoles: stemRolesForMode(effectiveMode),
-          });
+          jobSink.updateJob(checkpointTaskId, {
+            generation: controller.generation, stage: "finalizing", progress: 0.99,
+            completedChunks: doneCp.totalChunks, totalChunks: doneCp.totalChunks,
+            committedBytes: doneCp.committedBytes, message: "音軌分離完成，正在保存結果…",
+          }, { generation: controller.generation, source: "runner.catchFinalizingRecovery" });
+          try {
+            await finalizePersistedSong(doneCp.taskId, doneCp.totalChunks, doneCp.committedBytes);
+          } catch (finalizeError) {
+            const message = finalizeError instanceof Error ? finalizeError.message : "分軌已完成，等待保存結果。";
+            jobSink.updateJob(checkpointTaskId, {
+              generation: controller.generation, stage: "finalizing", progress: 0.99,
+              completedChunks: doneCp.totalChunks, totalChunks: doneCp.totalChunks,
+              committedBytes: doneCp.committedBytes, message,
+            }, { generation: controller.generation, source: "runner.finalizationPending" });
+            return {
+              status: "failed", taskId: doneCp.taskId, songId: request.songId,
+              generation: controller.generation, retryable: true,
+              completedChunks: doneCp.totalChunks, totalChunks: doneCp.totalChunks,
+              committedBytes: doneCp.committedBytes, message,
+            };
+          }
           controller.markCompleted(recoveredMsg);
           jobSink.updateJob(
             checkpointTaskId,

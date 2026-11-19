@@ -268,6 +268,93 @@ export type SeparationSongRecordPatch = {
   allowChunkRegression?: boolean;
 };
 
+/** 最終分軌提交的明確結果；呼叫端不得以非 null 推斷提交成功。 */
+export type SeparationCommitResult =
+  | { status: "committed"; record: PersistedSongRecord }
+  | { status: "already_committed"; record: PersistedSongRecord }
+  | { status: "song_missing" }
+  | { status: "stale_generation" }
+  | { status: "source_mismatch" }
+  | { status: "transition_rejected" };
+
+export type FinalizePersistedSongSeparationInput = {
+  songId: string;
+  taskId: string;
+  sourceAudioHash: string;
+  modelVersion: string;
+  processingVersion: string;
+  mode: "two_stem" | "four_stem";
+  totalChunks: number;
+  committedBytes: number;
+  cacheKey: string;
+  stemRoles: readonly string[];
+};
+
+/**
+ * 在同一 songs transaction 中驗證目前歌曲身分並完成最後欄位提交。
+ * 這和可失敗的進度 patch 分開：任何拒絕或 IndexedDB 例外都不會被轉成成功。
+ */
+export async function commitPersistedSongSeparationFinalization(
+  input: FinalizePersistedSongSeparationInput,
+): Promise<SeparationCommitResult> {
+  const tabId = getTabSyncId();
+  return enqueueDbWrite(async () => {
+    const outcome = await withIdbTransaction(["songs"], "readwrite", async (tx) => {
+      const store = tx.objectStore("songs");
+      const existing = await idbRequestPromise<PersistedSongRecord | undefined>(store.get(input.songId));
+      if (!existing) return { status: "song_missing" } as SeparationCommitResult;
+      if (existing.sourceAudioHash !== input.sourceAudioHash) {
+        return { status: "source_mismatch" } as SeparationCommitResult;
+      }
+      if (existing.modelVersion !== input.modelVersion || existing.processingVersion !== input.processingVersion) {
+        return { status: "stale_generation" } as SeparationCommitResult;
+      }
+      if (existing.separationTaskId && existing.separationTaskId !== input.taskId) {
+        return { status: "stale_generation" } as SeparationCommitResult;
+      }
+      if (existing.separationStatus === "completed") {
+        if (
+          existing.separationTaskId === input.taskId &&
+          existing.separationMode === input.mode &&
+          existing.cacheKey === input.cacheKey
+        ) {
+          return { status: "already_committed", record: existing } as SeparationCommitResult;
+        }
+        return { status: "transition_rejected" } as SeparationCommitResult;
+      }
+      if (!canTransitionSeparationStatus(existing.separationStatus ?? "not_started", "completed")) {
+        return { status: "transition_rejected" } as SeparationCommitResult;
+      }
+      const stemChannels = input.stemRoles.map((stemType) => {
+        const previous = existing.stemChannels.find((channel) => channel.stemType === stemType);
+        return previous ?? { stemType, volume: 1, muted: false, solo: false };
+      });
+      const record: PersistedSongRecord = {
+        ...existing,
+        separationMode: input.mode,
+        separationStatus: "completed",
+        separationTaskId: input.taskId,
+        separationCompletedChunks: input.totalChunks,
+        separationTotalChunks: input.totalChunks,
+        separationCommittedBytes: input.committedBytes,
+        separationUserAuthorized: true,
+        cacheKey: input.cacheKey,
+        playbackSource: "stems",
+        stemChannels,
+        revision: (existing.revision ?? 0) + 1,
+        updatedAt: Date.now(),
+        updatedByTabId: tabId,
+      };
+      await idbRequestPromise(store.put(record));
+      return { status: "committed", record } as SeparationCommitResult;
+    });
+    if (outcome.status === "committed") {
+      postSyncMessage({ type: "song-updated", tabId, songId: input.songId, record: outcome.record });
+    }
+    return outcome;
+  });
+}
+
 /**
  * 僅在資料層以欄位級合併更新歌曲的分軌持久化欄位，完整保留使用者在背景分軌期間
  * 修改的 targetBpm、keyShiftSemitones、音量、Loop 與分軌混音設定，絕不以過期快照覆寫。

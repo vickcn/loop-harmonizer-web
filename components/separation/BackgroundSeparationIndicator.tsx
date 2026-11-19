@@ -14,6 +14,7 @@ export function BackgroundSeparationIndicator() {
       job.stage === "preparing" ||
       job.stage === "downloading" ||
       job.stage === "processing" ||
+      job.stage === "finalizing" ||
       job.stage === "pausing" ||
       job.stage === "cancelling",
   );
@@ -63,6 +64,8 @@ export function BackgroundSeparationIndicator() {
   const stageText =
     active.stage === "downloading"
       ? "載入模型"
+      : active.stage === "finalizing"
+        ? "保存結果"
       : active.stage === "pausing"
         ? "準備暫停"
         : active.stage === "cancelling"

@@ -611,7 +611,7 @@ test("Scenario 6 & 7: job manager blocks stale generations, chunk regressions, a
   manager.dispose();
 });
 
-test("Scenario 10 & 11: cross-tab refreshFromStorage syncs completed/cancelled terminal states and prunes deleted checkpoints", async () => {
+test("Scenario 10 & 11: cross-tab refreshFromStorage keeps completed chunks in finalizing until the song result is committed", async () => {
   resetInMemoryIdbForTests();
   configureInMemoryIdbForTests();
 
@@ -660,7 +660,7 @@ test("Scenario 10 & 11: cross-tab refreshFromStorage syncs completed/cancelled t
       });
     }
     await tabBManager.refreshFromStorage();
-    assert.equal(tabBManager.getJob(taskId)?.stage, "completed");
+    assert.equal(tabBManager.getJob(taskId)?.stage, "finalizing");
 
     // 測試另一任務在其他分頁取消後，Tab B 同步停止顯示執行動畫
     const cancelTaskId = createCheckpointTaskId("song-sync-2", "hash-sync-2");

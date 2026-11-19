@@ -3,6 +3,7 @@ export type SeparationTaskStage =
   | "preparing"
   | "downloading"
   | "processing"
+  | "finalizing"
   | "pausing"
   | "paused"
   | "cancelling"

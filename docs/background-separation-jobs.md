@@ -143,3 +143,26 @@ flowchart TD
 1. **作業系統背景節流／凍結**：瀏覽器仍可能在 OS 省電、休眠或鎖屏下暫停 Web Worker；本設計仰賴每段 Atomic Chunk Commit 保證已算段落不遺失，恢復前景後從最近有效 Checkpoint 安全續跑，而非阻止系統休眠。
 2. **主執行緒 Commit ACK 邊界**：Chunk 仍透過 Transferable 傳回主執行緒進行 IndexedDB atomic transaction（以維持 Checksum 與 generation fencing 一致性）；若未來實機實測確認主執行緒背景 timer 節流造成 commit ack 延遲成為瓶頸，才考慮下一階段將 IndexedDB Chunk commit 移入 Worker 執行。
 3. **跨分頁控制權限制**：若分頁 B 檢視分頁 A 正在執行的任務，目前採安全鎖定不允許由分頁 B 偽裝暫停或取消成功，須回到持有執行權的分頁或待該任務凍結釋放鎖後再行接手。
+
+## 十一、第三階段：最終提交與自動恢復補強
+
+`completed` 現在只代表「分軌產物、歌曲紀錄與必要播放欄位均已一致提交」；Checkpoint 的 `completed` 僅表示所有 Chunk 已通過驗證。
+
+```mermaid
+stateDiagram-v2
+  [*] --> processing
+  processing --> finalizing: 全部 Chunk atomic commit
+  finalizing --> completed: 嚴格 songs transaction 成功
+  finalizing --> finalizing: 暫時性儲存失敗
+  finalizing --> failed: 歌曲刪除／來源或世代不一致
+  processing --> interrupted
+  interrupted --> processing: 尚有 Chunk 時恢復
+  interrupted --> finalizing: Chunk 已完成時恢復
+```
+
+- `commitPersistedSongSeparationFinalization` 在單一 `songs` transaction 內確認歌曲存在、`taskId`、來源 hash、模型／處理版本、模式與狀態轉移，並以 discriminated union 回傳 `committed`、`already_committed`、`song_missing`、`stale_generation`、`source_mismatch` 或 `transition_rejected`。它不吞掉 IndexedDB 錯誤。
+- Runner 會在最後一段後投影 `finalizing`（99%），只有上述嚴格提交成功後才呼叫 `markCompleted`、廣播 `task-completed`、釋放舊產物引用。最終提交失敗會保留有效 Chunk；下次恢復會走零推論的既有 Checkpoint 路徑。
+- 跨分頁 `refreshFromCheckpoint` 一律重讀歌曲紀錄：完整 Chunk 但歌曲結果未提交時顯示 `finalizing`，不再只依 Broadcast 或 Checkpoint status 顯示完成。
+- Job Manager 使用單一 `retryWakeupTimer` 掃描持久化 `nextEligibleAt`；到期後重新驗證生命週期與執行權。背景節流只會延後該喚醒，不會產生 polling 或多個 timer。finalizing 與 interrupted 都可進入同一安全恢復入口，因此完整 Chunk 的重試不會建立 Demucs Worker 或重新下載模型。
+
+本階段新增 `spec/separation-finalization.spec.mjs` 與 `spec/separation-resume-scheduler.spec.mjs`，並擴充跨分頁測試以確認「Chunk completed → finalizing」的權威投影及單一最早到期 retry timer。最新本機驗證：`npm test` 110/110 通過、`npx tsc --noEmit` 通過；實際 UI smoke test 已確認 Band Mixer／首頁／Studio 路由與節拍器互動，未載入真實歌曲，因此 finalizing 與真實 hidden／凍結仍列為未驗證。
