@@ -50,6 +50,9 @@ export type PersistedSongRecord = {
   separationTotalChunks?: number;
   separationCommittedBytes?: number;
   separationUserAuthorized?: boolean;
+  separationGeneration?: number;
+  separationOwnerJobToken?: string | null;
+  separationFinalizedAt?: number | null;
   cacheKey: string | null;
   modelVersion: string;
   processingVersion: string;
@@ -236,6 +239,9 @@ export function serializePersistedSong(
     separationTotalChunks: song.separationTotalChunks ?? 0,
     separationCommittedBytes: song.separationCommittedBytes ?? 0,
     separationUserAuthorized: Boolean(song.separationUserAuthorized),
+    separationGeneration: song.separationGeneration,
+    separationOwnerJobToken: song.separationOwnerJobToken ?? null,
+    separationFinalizedAt: song.separationFinalizedAt ?? null,
     cacheKey: song.cacheKey ?? null,
     modelVersion: meta.modelVersion,
     processingVersion: meta.processingVersion,
@@ -321,6 +327,9 @@ export function restoreBandSongFromRecord(
     separationTotalChunks: record.separationTotalChunks ?? 0,
     separationCommittedBytes: record.separationCommittedBytes ?? 0,
     separationUserAuthorized: Boolean(record.separationUserAuthorized),
+    separationGeneration: record.separationGeneration,
+    separationOwnerJobToken: record.separationOwnerJobToken ?? null,
+    separationFinalizedAt: record.separationFinalizedAt ?? null,
     cacheKey: record.cacheKey ?? null,
     stemChannels: restoredChannels,
   };
@@ -466,6 +475,7 @@ export function restoreSongsAfterSeparationFocus(
     if (
       song.id === focusSnapshot.targetSongId &&
       song.separationStatus !== "completed" &&
+      (song.separationStage !== "finalizing" || options.outcome === "cancelled") &&
       (options.outcome === "cancelled" || options.outcome === "paused" || options.outcome === "failed")
     ) {
       const reverted = applySongOperationSnapshot(song, entry.snapshot);

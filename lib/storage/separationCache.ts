@@ -1,8 +1,8 @@
-import type { SeparatedStemSet } from "../separation/stemTypes";
-import { idbClear, idbDelete, idbGet, idbGetAll, idbPut } from "./indexedDb";
-import { restoreStemSet, type StemCacheRecord } from "./separationCacheRecord";
-export { createStemCacheRecord, restoreStemSet } from "./separationCacheRecord";
-export type { StemCacheRecord } from "./separationCacheRecord";
+import type { SeparatedStemSet } from "../separation/stemTypes.ts";
+import { idbClear, idbDelete, idbGet, idbGetAll, idbPut } from "./indexedDb.ts";
+import { restoreStemSet, type StemCacheRecord } from "./separationCacheRecord.ts";
+export { createStemCacheRecord, restoreStemSet } from "./separationCacheRecord.ts";
+export type { StemCacheRecord } from "./separationCacheRecord.ts";
 
 export async function hashSourceAudio(file: Blob): Promise<string> {
   const buf = await file.arrayBuffer();

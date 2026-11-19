@@ -25,6 +25,20 @@ export interface SeparationDiagnosticEntry {
   taskId: string | null;
   songId: string | null;
   generation: number | null;
+  ownerJobToken: string | null;
+  visibilityState: string | null;
+  lifecycleEvent: string | null;
+  jobStage: string | null;
+  retryPhase: string | null;
+  retryWaitReason: string | null;
+  retryAttempts: number | null;
+  nextEligibleAt: number | null;
+  retryTimerDelay: number | null;
+  lastChunkCommitAt: number | null;
+  lastHeartbeatAt: number | null;
+  lastCommitAckMs: number | null;
+  finalizationOutcome: string | null;
+  controllerSettled: boolean | null;
   checkpointStatus: string | null;
   validChunkCount: number | null;
   totalChunks: number | null;
@@ -45,6 +59,20 @@ export interface RecordSeparationDiagnosticInput {
   taskId?: string | null;
   songId?: string | null;
   generation?: number | null;
+  ownerJobToken?: string | null;
+  visibilityState?: string | null;
+  lifecycleEvent?: string | null;
+  jobStage?: string | null;
+  retryPhase?: string | null;
+  retryWaitReason?: string | null;
+  retryAttempts?: number | null;
+  nextEligibleAt?: number | null;
+  retryTimerDelay?: number | null;
+  lastChunkCommitAt?: number | null;
+  lastHeartbeatAt?: number | null;
+  lastCommitAckMs?: number | null;
+  finalizationOutcome?: string | null;
+  controllerSettled?: boolean | null;
   checkpointStatus?: string | null;
   validChunkCount?: number | null;
   totalChunks?: number | null;
@@ -113,6 +141,12 @@ export function recordSeparationDiagnostic(
   const timestamp = input.timestamp ?? Date.now();
   const fromState = input.fromState ?? null;
   const toState = input.toState ?? null;
+  const currentVisibility =
+    input.visibilityState !== undefined
+      ? input.visibilityState
+      : typeof document !== "undefined"
+        ? document.visibilityState
+        : null;
   const entry: SeparationDiagnosticEntry = {
     id: `diag-${timestamp}-${++diagnosticSeq}`,
     timestamp,
@@ -123,6 +157,39 @@ export function recordSeparationDiagnostic(
       typeof input.generation === "number" && Number.isFinite(input.generation)
         ? input.generation
         : null,
+    ownerJobToken: input.ownerJobToken ?? null,
+    visibilityState: currentVisibility ?? null,
+    lifecycleEvent: input.lifecycleEvent ?? null,
+    jobStage: input.jobStage ?? null,
+    retryPhase: input.retryPhase ?? null,
+    retryWaitReason: input.retryWaitReason ?? null,
+    retryAttempts:
+      typeof input.retryAttempts === "number" && Number.isFinite(input.retryAttempts)
+        ? input.retryAttempts
+        : null,
+    nextEligibleAt:
+      typeof input.nextEligibleAt === "number" && Number.isFinite(input.nextEligibleAt)
+        ? input.nextEligibleAt
+        : null,
+    retryTimerDelay:
+      typeof input.retryTimerDelay === "number" && Number.isFinite(input.retryTimerDelay)
+        ? input.retryTimerDelay
+        : null,
+    lastChunkCommitAt:
+      typeof input.lastChunkCommitAt === "number" && Number.isFinite(input.lastChunkCommitAt)
+        ? input.lastChunkCommitAt
+        : null,
+    lastHeartbeatAt:
+      typeof input.lastHeartbeatAt === "number" && Number.isFinite(input.lastHeartbeatAt)
+        ? input.lastHeartbeatAt
+        : null,
+    lastCommitAckMs:
+      typeof input.lastCommitAckMs === "number" && Number.isFinite(input.lastCommitAckMs)
+        ? input.lastCommitAckMs
+        : null,
+    finalizationOutcome: input.finalizationOutcome ?? null,
+    controllerSettled:
+      typeof input.controllerSettled === "boolean" ? input.controllerSettled : null,
     checkpointStatus: input.checkpointStatus ?? null,
     validChunkCount:
       typeof input.validChunkCount === "number" &&
@@ -193,6 +260,20 @@ export function formatSeparationDiagnosticLine(
     `task=${entry.taskId ?? "-"}`,
     `song=${entry.songId ?? "-"}`,
     `gen=${entry.generation ?? "-"}`,
+    entry.ownerJobToken ? `token=${entry.ownerJobToken.slice(0, 8)}` : null,
+    entry.visibilityState ? `vis=${entry.visibilityState}` : null,
+    entry.lifecycleEvent ? `life=${entry.lifecycleEvent}` : null,
+    entry.jobStage ? `stage=${entry.jobStage}` : null,
+    entry.retryPhase ? `retryPhase=${entry.retryPhase}` : null,
+    entry.retryWaitReason ? `wait=${entry.retryWaitReason}` : null,
+    entry.retryAttempts != null ? `attempts=${entry.retryAttempts}` : null,
+    entry.nextEligibleAt != null ? `nextRetry=${entry.nextEligibleAt}` : null,
+    entry.retryTimerDelay != null ? `timerMs=${entry.retryTimerDelay}` : null,
+    entry.lastChunkCommitAt != null ? `lastCommit=${entry.lastChunkCommitAt}` : null,
+    entry.lastHeartbeatAt != null ? `lastHb=${entry.lastHeartbeatAt}` : null,
+    entry.lastCommitAckMs != null ? `ackMs=${entry.lastCommitAckMs}` : null,
+    entry.finalizationOutcome ? `fin=${entry.finalizationOutcome}` : null,
+    entry.controllerSettled != null ? `settled=${entry.controllerSettled}` : null,
     `cp=${entry.checkpointStatus ?? "-"}`,
     `chunks=${chunkStr}`,
     entry.referenceCount != null ? `refs=${entry.referenceCount}` : null,

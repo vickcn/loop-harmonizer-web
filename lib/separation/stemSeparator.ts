@@ -175,6 +175,11 @@ export type StemSeparationResult = {
   chunkedTask?: ChunkedSeparationSummary;
   paused?: boolean;
   checkpoint?: SeparationCheckpoint;
+  executionFence?: {
+    generation: number;
+    ownerJobToken: string;
+    ownerTabId: string;
+  };
   durationMs: number;
   usedWorker: boolean;
 };
@@ -691,6 +696,8 @@ async function runSeparationInWorker(params: {
             return;
           }
           try {
+            const commitStartMs =
+              typeof performance !== "undefined" ? performance.now() : Date.now();
             const committed = await commitChunkAndCheckpointAtomically({
               taskId: checkpointTaskId,
               chunkIndex,
@@ -700,11 +707,27 @@ async function runSeparationInWorker(params: {
               overlapCarryBuffer,
               expectedLease: lease,
             });
+            const commitEndMs =
+              typeof performance !== "undefined" ? performance.now() : Date.now();
+            const commitAckMs = Math.max(0, Math.round(commitEndMs - commitStartMs));
             latestCheckpoint = committed.checkpoint;
             options.onChunkCommitted?.({
               checkpoint: committed.checkpoint,
               chunkIndex,
               totalChunks: committed.checkpoint.totalChunks,
+            });
+            recordSeparationDiagnostic({
+              source: "runSeparationInWorker.chunkCommitAck",
+              taskId: checkpointTaskId,
+              songId: committed.checkpoint.songId,
+              generation: lease?.generation ?? null,
+              ownerJobToken: lease?.ownerJobToken ?? null,
+              checkpointStatus: committed.checkpoint.status,
+              validChunkCount: committed.checkpoint.nextChunkIndex,
+              totalChunks: committed.checkpoint.totalChunks,
+              lastChunkCommitAt: committed.checkpoint.updatedAt,
+              lastCommitAckMs: commitAckMs,
+              outcome: "chunk_committed",
             });
             worker.postMessage({
               type: "chunk-ack",
@@ -1033,14 +1056,10 @@ export async function separateAudio(
         checkpointTaskId,
         activeLease,
         effectiveNextStatus,
+        Date.now(),
+        { suppressCompletedBroadcast: true },
       );
-      if (effectiveNextStatus === "completed") {
-        sharedSeparationLeaseManager.notifyTaskCompleted(
-          checkpointTaskId,
-          activeLease.ownerTabId,
-          activeLease.generation,
-        );
-      } else if (lastError !== undefined) {
+      if (effectiveNextStatus !== "completed" && lastError !== undefined) {
         await updateCheckpointStatus(checkpointTaskId, {
           status: effectiveNextStatus,
           lastError,
@@ -1173,13 +1192,12 @@ export async function separateAudio(
         const finalCp = (await getCheckpoint(resolvedTaskId)) ?? validation.checkpoint;
         const durationMs =
           (typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt;
-        controller.markCompleted("已從本機分段 Checkpoint 驗證並還原完成狀態");
-        sharedSeparationLeaseManager.notifyTaskCompleted(resolvedTaskId, tabId);
         recordSeparationDiagnostic({
           source: "stemSeparator.alreadyCompleted",
           taskId: resolvedTaskId,
           songId: effectiveSongId,
-          generation: controller.generation,
+          generation: finalCp.finalizationFence?.generation ?? finalCp.lastExecutionGeneration ?? controller.generation,
+          ownerJobToken: finalCp.finalizationFence?.ownerJobToken ?? null,
           checkpointStatus: finalCp.status,
           validChunkCount: validation.validChunkCount,
           totalChunks: validation.totalChunks,
@@ -1187,7 +1205,7 @@ export async function separateAudio(
           workerExitReason: "skipped-already-completed",
           leaseOwner: finalCp.lease?.ownerTabId ?? null,
           fromState: validation.checkpoint.status,
-          toState: "completed",
+          toState: "finalizing",
         });
         return {
           backend: "wasm",
@@ -1201,6 +1219,13 @@ export async function separateAudio(
             durationSeconds: finalCp.totalSamples / finalCp.sampleRate,
           },
           checkpoint: finalCp,
+          executionFence: finalCp.finalizationFence
+            ? {
+                generation: finalCp.finalizationFence.generation,
+                ownerJobToken: finalCp.finalizationFence.ownerJobToken,
+                ownerTabId: finalCp.finalizationFence.ownerTabId,
+              }
+            : undefined,
           durationMs,
           usedWorker: false,
         };
@@ -1298,10 +1323,23 @@ export async function separateAudio(
 
       heartbeatTimer = setInterval(() => {
         if (!checkpointTaskId || !activeLease || controller.isTerminal()) return;
+        const currentLease = activeLease;
         void sharedSeparationLeaseManager
-          .renewLease(checkpointTaskId, activeLease)
+          .renewLease(checkpointTaskId, currentLease)
           .then((ok) => {
-            if (!ok && !controller.isTerminal() && !controller.isCancellingOrCancelled()) {
+            if (ok) {
+              recordSeparationDiagnostic({
+                source: "stemSeparator.heartbeat",
+                taskId: checkpointTaskId,
+                songId: effectiveSongId,
+                generation: currentLease.generation,
+                ownerJobToken: currentLease.ownerJobToken,
+                lastHeartbeatAt: Date.now(),
+                outcome: "lease_renewed",
+              });
+              return;
+            }
+            if (!controller.isTerminal() && !controller.isCancellingOrCancelled()) {
               void controller.cancel("其他分頁已接手或執行權已失效，已安全停止分離");
             }
           })
@@ -1435,23 +1473,19 @@ export async function separateAudio(
 
           streamCompleted = true;
           await releaseActiveLease("completed");
-          sharedSeparationLeaseManager.notifyTaskCompleted(
-            checkpointTaskId,
-            getOrCreateTabId(),
-            activeLease?.generation,
-          );
           recordSeparationDiagnostic({
-            source: "stemSeparator.completed",
+            source: "stemSeparator.chunksCompleted",
             taskId: checkpointTaskId,
             songId: effectiveSongId,
             generation: activeLease?.generation ?? controller.generation,
+            ownerJobToken: activeLease?.ownerJobToken ?? null,
             checkpointStatus: finalCp?.status ?? "completed",
             validChunkCount: finalCp?.nextChunkIndex ?? totalChunks,
             totalChunks,
             workerExitReason: "completed",
             leaseOwner: activeLease?.ownerTabId ?? null,
             fromState: "running",
-            toState: "completed",
+            toState: "finalizing",
           });
           return {
             backend: workerOutput.backend,
@@ -1465,6 +1499,19 @@ export async function separateAudio(
               durationSeconds: totalSamples / DEMUCS_SAMPLE_RATE,
             },
             checkpoint: finalCp,
+            executionFence: activeLease
+              ? {
+                  generation: activeLease.generation,
+                  ownerJobToken: activeLease.ownerJobToken,
+                  ownerTabId: activeLease.ownerTabId,
+                }
+              : finalCp?.finalizationFence
+                ? {
+                    generation: finalCp.finalizationFence.generation,
+                    ownerJobToken: finalCp.finalizationFence.ownerJobToken,
+                    ownerTabId: finalCp.finalizationFence.ownerTabId,
+                  }
+                : undefined,
             durationMs,
             usedWorker: true,
           };
@@ -1591,6 +1638,19 @@ export async function separateAudio(
               durationSeconds: totalSamples / DEMUCS_SAMPLE_RATE,
             },
             checkpoint: finalCp ?? undefined,
+            executionFence: activeLease
+              ? {
+                  generation: activeLease.generation,
+                  ownerJobToken: activeLease.ownerJobToken,
+                  ownerTabId: activeLease.ownerTabId,
+                }
+              : finalCp?.finalizationFence
+                ? {
+                    generation: finalCp.finalizationFence.generation,
+                    ownerJobToken: finalCp.finalizationFence.ownerJobToken,
+                    ownerTabId: finalCp.finalizationFence.ownerTabId,
+                  }
+                : undefined,
             durationMs,
             usedWorker: false,
           };

@@ -45,6 +45,30 @@ export interface SeparationLeaseInfo {
   leaseExpiresAt: number;
 }
 
+export interface FinalizationFence {
+  taskId: string;
+  generation: number;
+  ownerJobToken: string;
+  ownerTabId: string;
+  updatedAt: number;
+}
+
+export interface PersistedCheckpointRetryState {
+  attempts: number;
+  nextEligibleAt: number;
+  blockedUntilAt?: number;
+  lastError?: string;
+  permanentlyBlockedReason?: string;
+  baselineCompletedChunks: number;
+  retryPhase: "inference" | "finalization";
+  waitReason?: string;
+  backoffCursor?: 0 | 1;
+  reservationToken?: string | null;
+  reservationTabId?: string | null;
+  reservationExpiresAt?: number | null;
+  updatedAt: number;
+}
+
 export interface SeparationCheckpoint {
   /** IndexedDB keyPath，與 taskId 相同 */
   key: string;
@@ -69,6 +93,13 @@ export interface SeparationCheckpoint {
   status: SeparationCheckpointStatus;
   lastError?: string;
   lease: SeparationLeaseInfo | null;
+  /** 跨 Lease 單調遞增的執行世代與最後有效最終提交執行權柵欄 */
+  lastExecutionGeneration?: number;
+  finalizationFence?: FinalizationFence | null;
+  finalizedAt?: number | null;
+  finalizedGeneration?: number | null;
+  finalizedOwnerJobToken?: string | null;
+  retryState?: PersistedCheckpointRetryState | null;
   /** 明確引用此 Checkpoint 的歌曲 ID 清單（向後相容：舊資料可能為 undefined） */
   referencedBySongIds?: string[];
   /** 各引用歌曲目前使用的分離播放模式（two_stem / four_stem） */
@@ -257,9 +288,23 @@ export async function updateCheckpointStatus(
         timestamp: now,
       });
       if (patch.clearLeaseIfTerminal && existing.lease !== null) {
+        const preservedGen = Math.max(
+          existing.lastExecutionGeneration ?? 0,
+          existing.lease.generation,
+          existing.finalizationFence?.generation ?? 0,
+        );
+        const preservedFence: FinalizationFence = existing.finalizationFence ?? {
+          taskId: existing.taskId,
+          generation: existing.lease.generation,
+          ownerJobToken: existing.lease.ownerJobToken,
+          ownerTabId: existing.lease.ownerTabId,
+          updatedAt: now,
+        };
         const preserved: SeparationCheckpoint = {
           ...existing,
           lease: null,
+          lastExecutionGeneration: preservedGen,
+          finalizationFence: preservedFence,
           updatedAt: now,
         };
         await idbRequestPromise(store.put(preserved));
@@ -267,12 +312,29 @@ export async function updateCheckpointStatus(
       }
       return existing;
     }
+    const maxKnownGen = Math.max(
+      existing.lastExecutionGeneration ?? 0,
+      existing.lease?.generation ?? 0,
+      existing.finalizationFence?.generation ?? 0,
+    );
     const next: SeparationCheckpoint = {
       ...existing,
       status: patch.status,
       lastError: patch.lastError,
       userAuthorized: patch.userAuthorized ?? existing.userAuthorized,
       requestedMode: patch.requestedMode ?? existing.requestedMode,
+      lastExecutionGeneration: maxKnownGen > 0 ? maxKnownGen : existing.lastExecutionGeneration,
+      finalizationFence:
+        existing.finalizationFence ??
+        (existing.lease
+          ? {
+              taskId: existing.taskId,
+              generation: existing.lease.generation,
+              ownerJobToken: existing.lease.ownerJobToken,
+              ownerTabId: existing.lease.ownerTabId,
+              updatedAt: now,
+            }
+          : existing.finalizationFence),
       lease:
         patch.clearLeaseIfTerminal &&
         (patch.status === "completed" ||
@@ -450,6 +512,22 @@ export async function commitChunkAndCheckpointAtomically(
     const isFinalChunk =
       nextChunkIndex >= existing.totalChunks || params.endSample >= existing.totalSamples;
 
+    const activeExec = params.expectedLease ?? existing.lease;
+    const nextExecutionGen = Math.max(
+      existing.lastExecutionGeneration ?? 0,
+      existing.finalizationFence?.generation ?? 0,
+      activeExec?.generation ?? 0,
+    );
+    const nextFence: FinalizationFence | null = activeExec
+      ? {
+          taskId: existing.taskId,
+          generation: activeExec.generation,
+          ownerJobToken: activeExec.ownerJobToken,
+          ownerTabId: activeExec.ownerTabId,
+          updatedAt: now,
+        }
+      : (existing.finalizationFence ?? null);
+
     const updatedCheckpoint: SeparationCheckpoint = {
       ...existing,
       nextChunkIndex,
@@ -458,6 +536,8 @@ export async function commitChunkAndCheckpointAtomically(
       overlapCarryBuffer: isFinalChunk ? null : params.overlapCarryBuffer,
       status: isFinalChunk ? "completed" : existing.status === "paused" ? "paused" : "running",
       lease: isFinalChunk ? null : existing.lease,
+      lastExecutionGeneration: nextExecutionGen > 0 ? nextExecutionGen : existing.lastExecutionGeneration,
+      finalizationFence: nextFence,
       lastError: undefined,
       updatedAt: now,
     };

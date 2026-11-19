@@ -1,5 +1,5 @@
-import { evaluateNetworkTransfer, sharedNetworkBudgetLedger } from "@/lib/band/networkBudgetGuard";
-import { idbClear, idbGet, idbPut } from "./indexedDb";
+import { evaluateNetworkTransfer, sharedNetworkBudgetLedger } from "../band/networkBudgetGuard.ts";
+import { idbClear, idbGet, idbPut } from "./indexedDb.ts";
 import {
   STATIC_RUNTIME_CACHE_NAME,
   clearStaticRuntimeCache,
@@ -9,7 +9,7 @@ import {
   isStaticAssetCached,
   prepareApprovedOrtWasmUrl,
   revokeActiveOrtWasmBlobUrl,
-} from "./staticAssetCache";
+} from "./staticAssetCache.ts";
 
 configureStaticAssetNetworkGuard({
   evaluateTransfer: evaluateNetworkTransfer,

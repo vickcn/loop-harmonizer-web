@@ -1496,3 +1496,62 @@ test("18. silent intro/outro chunk payload with valid checksum is preserved duri
   assert.equal(validation.repairedChunksDeleted, 0);
   assert.ok(await getChunkRecord(taskId, 0));
 });
+
+test("19. patchPersistedSongSeparationFields merges separation fields without overwriting user mix edits or downgrading completed", async () => {
+  const { saveSongWithAudioFile, patchPersistedSongSeparationFields, getPersistedSongRecord } = await import(
+    "../lib/storage/songSessionStore.ts"
+  );
+  resetInMemoryIdbForTests();
+  configureInMemoryIdbForTests();
+
+  const song = createBandSong({
+    id: "song-patch-1",
+    name: "Field Merge Test",
+    fileName: "merge.wav",
+    sourceAudioId: "song-patch-1_original",
+    originalBpm: 120,
+    durationSec: 30,
+    sourceAudioHash: "hash-merge",
+  });
+  song.targetBpm = 138;
+  song.keyShiftSemitones = -2;
+  song.masterVolume = 0.6;
+  song.loop = true;
+  song.stemChannels = [
+    { id: "song-patch-1_stem_vocals", songId: "song-patch-1", stemType: "vocals", volume: 0.25, muted: true, solo: false },
+  ];
+  await saveSongWithAudioFile({
+    song,
+    file: new Blob([new Uint8Array(16)], { type: "audio/wav" }),
+    sourceAudioHash: "hash-merge",
+    force: true,
+  });
+
+  const completed = await patchPersistedSongSeparationFields("song-patch-1", {
+    separationMode: "two_stem",
+    separationStatus: "completed",
+    separationTaskId: "task-merge",
+    separationCompletedChunks: 3,
+    separationTotalChunks: 3,
+    cacheKey: "cache-merge",
+    playbackSource: "stems",
+    ensureStemRoles: ["vocals", "instrumental"],
+  });
+
+  assert.equal(completed?.separationStatus, "completed");
+  assert.equal(completed?.targetBpm, 138);
+  assert.equal(completed?.keyShiftSemitones, -2);
+  assert.equal(completed?.masterVolume, 0.6);
+  assert.equal(completed?.loop, true);
+  assert.equal(completed?.stemChannels.find((c) => c.stemType === "vocals")?.volume, 0.25);
+  assert.equal(completed?.stemChannels.find((c) => c.stemType === "vocals")?.muted, true);
+  assert.equal(completed?.stemChannels.find((c) => c.stemType === "instrumental")?.volume, 1);
+
+  // 禁止過期事件將 completed 降級為 failed/interrupted
+  await patchPersistedSongSeparationFields("song-patch-1", {
+    separationStatus: "failed",
+    separationTaskId: "task-merge",
+  });
+  const afterStale = await getPersistedSongRecord("song-patch-1");
+  assert.equal(afterStale?.separationStatus, "completed");
+});

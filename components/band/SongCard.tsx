@@ -24,6 +24,7 @@ type Props = {
   onClearSongCache: () => void;
   onPauseSeparation?: () => void;
   onResumeSeparation?: () => void;
+  onRetryFinalization?: () => void;
   onClearSeparationData?: (scope?: "temp" | "completed") => void;
   onAbortSeparation?: () => void;
   onRestoreSnapshot?: () => void;
@@ -214,7 +215,10 @@ export const SongCard = memo(function SongCard(props: Props) {
     prevSeparationStatusRef.current = song.separationStatus;
   }, [song.separationStatus, song.stemIds.length]);
   const isSeparating = song.separationStatus === "processing" || song.separationStatus === "cancelling";
+  const isFinalizingStage = isSeparating && (song.separationStage as string) === "finalizing";
+  const isWaitingFinalization = isFinalizingStage && !song.separationActivelyFinalizing;
   const isSeparationBusy = Boolean(props.isStartingSeparation) || isSeparating;
+  const showSeparationRolling = Boolean(props.isStartingSeparation) || (isSeparating && !isWaitingFinalization);
   const isPausingStage = isSeparating && (song.separationStage as string) === "pausing";
   const completedChunks = song.separationCompletedChunks ?? 0;
   const totalChunks = song.separationTotalChunks ?? 0;
@@ -231,13 +235,21 @@ export const SongCard = memo(function SongCard(props: Props) {
       ? "準備資源與檢查環境"
       : song.separationStage === "downloading"
         ? "下載或讀取模型權重"
-        : song.separationStage === "cancelling"
-          ? "正在停止 Worker 並保留已完成段落"
-          : (song.separationStage as string) === "pausing"
-            ? "正在安全邊界暫停並寫入 Checkpoint"
-            : song.separationStage === "processing"
-              ? "AI 音軌分離運算中"
-              : "處理中";
+        : (song.separationStage as string) === "finalizing"
+          ? (song.separationForeignActive ||
+            song.separationWaitReason === "foreign_lock" ||
+            song.separationWaitReason === "foreign_lease")
+            ? "其他分頁正在處理"
+            : song.separationActivelyFinalizing
+              ? "正在保存結果"
+              : "分軌已完成，等待保存"
+          : song.separationStage === "cancelling"
+            ? "正在停止 Worker 並保留已完成段落"
+            : (song.separationStage as string) === "pausing"
+              ? "正在安全邊界暫停並寫入 Checkpoint"
+              : song.separationStage === "processing"
+                ? "AI 音軌分離運算中"
+                : "處理中";
   const isDecodingAudio = song.audioLoadState === "decoding";
   const audioUnavailable =
     song.persistenceStatus === "restoring"
@@ -722,13 +734,13 @@ export const SongCard = memo(function SongCard(props: Props) {
                   renderInline: () => (
                     <IconActionButton
                       icon={
-                        isSeparationBusy
+                        showSeparationRolling
                           ? <span className="mixer-spinner" aria-hidden="true" />
                           : <SplitStemsIcon refresh={song.separationStatus === "completed" || song.separationStatus === "cancelled" || song.separationStatus === "paused" || song.separationStatus === "interrupted"} />
                       }
                       label={separateActionLabel}
                       primary
-                      busy={isSeparationBusy}
+                      busy={showSeparationRolling}
                       disabled={focusLocked || isSeparationBusy || audioUnavailable}
                       disabledReason={
                         focusLocked
@@ -843,7 +855,7 @@ export const SongCard = memo(function SongCard(props: Props) {
               </span>
             </div>
           )}
-          {(song.separationStatus === "processing" || song.separationStatus === "cancelling") && (() => {
+          {(song.separationStatus === "processing" || song.separationStatus === "cancelling") && !isWaitingFinalization && (() => {
             const isCancelling = song.separationStatus === "cancelling";
             const hasDeterminate = !isCancelling && Number.isFinite(song.separationProgress) && song.separationProgress > 0 && song.separationProgress <= 1;
             const pct = hasDeterminate ? Math.round(song.separationProgress * 100) : null;
@@ -897,7 +909,7 @@ export const SongCard = memo(function SongCard(props: Props) {
                       <button
                         type="button"
                         className="btn mixer-button"
-                        disabled={isCancelling || isPausingStage}
+                        disabled={isCancelling || isPausingStage || isFinalizingStage}
                         style={{ minHeight: 44, minWidth: 44, padding: "8px 12px" }}
                         aria-label={`在安全邊界暫停「${song.name}」音軌分離`}
                         title="等待目前 Chunk 寫入完成後安全暫停，之後可接續完成"
@@ -921,6 +933,69 @@ export const SongCard = memo(function SongCard(props: Props) {
                       </button>
                     )}
                   </div>
+                </div>
+              </div>
+            );
+          })()}
+          {isWaitingFinalization && (() => {
+            const isForeign = Boolean(
+              song.separationForeignActive ||
+                song.separationWaitReason === "foreign_lock" ||
+                song.separationWaitReason === "foreign_lease",
+            );
+            const isQuotaWait =
+              song.separationWaitReason === "quota_exceeded" ||
+              song.separationWaitReason === "storage_unavailable";
+            const isExhausted = Boolean(song.separationAutoResumeExhausted || song.separationRequiresManualAction);
+            const heading = isForeign
+              ? "其他分頁正在處理"
+              : isQuotaWait
+                ? "請釋放空間後重試保存"
+                : isExhausted
+                  ? "保存未完成，請手動重試"
+                  : "分軌已完成，等待保存";
+            return (
+              <div
+                role="status"
+                aria-live="polite"
+                className={isQuotaWait || isExhausted ? "card-error-banner" : "card-warning-banner"}
+                style={{ alignItems: "flex-start" }}
+              >
+                <div className="grid" style={{ gap: 4, flex: "1 1 220px", minWidth: 0 }}>
+                  <strong style={{ fontSize: 13 }}>{heading}</strong>
+                  <span className="small" style={{ opacity: 0.92 }}>
+                    {song.separationMessage || heading}
+                  </span>
+                  {totalChunks > 0 && (
+                    <span className="small" style={{ fontVariantNumeric: "tabular-nums" }}>
+                      {`已完成 ${completedChunks} / ${totalChunks} 段｜本機已保存 ${committedMiB} MiB`}
+                    </span>
+                  )}
+                </div>
+                <div className="row" style={{ gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                  {!song.separationForeignActive && props.onRetryFinalization && (
+                    <button
+                      type="button"
+                      className="btn primary"
+                      disabled={Boolean(song.separationActivelyFinalizing)}
+                      style={{ minHeight: 40, padding: "6px 12px", fontSize: 12 }}
+                      onClick={props.onRetryFinalization}
+                    >
+                      ↻ 重試保存
+                    </button>
+                  )}
+                  {props.onAbortSeparation && (
+                    <button
+                      type="button"
+                      className="btn mixer-abort-button"
+                      disabled={song.separationStatus === "cancelling"}
+                      aria-label={`中止「${song.name}」音軌保存`}
+                      onClick={props.onAbortSeparation}
+                    >
+                      <OctagonXIcon />
+                      <span>中止</span>
+                    </button>
+                  )}
                 </div>
               </div>
             );
