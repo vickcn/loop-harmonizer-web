@@ -15,9 +15,11 @@ import { idbGetAll, idbRequestPromise, withIdbTransaction } from "./indexedDb.ts
 import { getModelCacheMetadata } from "./modelCache.ts";
 import type { StemCacheRecord } from "./separationCacheRecord.ts";
 import {
+  type SeparationCheckpoint,
   releaseCheckpointReferenceAndMaybeGc,
   runCheckpointGarbageCollection,
 } from "./separationCheckpointStore.ts";
+import { getTaskChunkKeysInStore } from "./separationChunkStore.ts";
 import { canTransitionSeparationStatus } from "../separation/separationStateRecovery.ts";
 
 const SESSION_META_KEY = "band-session" as const;
@@ -283,71 +285,292 @@ export type FinalizePersistedSongSeparationInput = {
   sourceAudioHash: string;
   modelVersion: string;
   processingVersion: string;
+  generation: number;
+  ownerJobToken: string;
+  ownerTabId?: string;
   mode: "two_stem" | "four_stem";
   totalChunks: number;
   committedBytes: number;
   cacheKey: string;
   stemRoles: readonly string[];
+  allowReplaceCompleted?: boolean;
+  expectedPreviousTaskId?: string | null;
 };
 
 /**
- * 在同一 songs transaction 中驗證目前歌曲身分並完成最後欄位提交。
- * 這和可失敗的進度 patch 分開：任何拒絕或 IndexedDB 例外都不會被轉成成功。
+ * 在單一 readwrite 原子交易中（涵蓋 songs、separationCheckpoints、separationChunks、separations）
+ * 驗證歌曲、來源、模型/處理版本、執行世代（generation）、ownerJobToken 與分軌產物存在性，
+ * 並同步寫入歌曲完成欄位與 Checkpoint finalized 紀錄，徹底消除 TOCTOU 與過期 Worker 覆寫風險。
  */
 export async function commitPersistedSongSeparationFinalization(
   input: FinalizePersistedSongSeparationInput,
 ): Promise<SeparationCommitResult> {
-  const tabId = getTabSyncId();
+  const tabId = input.ownerTabId || getTabSyncId();
   return enqueueDbWrite(async () => {
-    const outcome = await withIdbTransaction(["songs"], "readwrite", async (tx) => {
-      const store = tx.objectStore("songs");
-      const existing = await idbRequestPromise<PersistedSongRecord | undefined>(store.get(input.songId));
-      if (!existing) return { status: "song_missing" } as SeparationCommitResult;
-      if (existing.sourceAudioHash !== input.sourceAudioHash) {
-        return { status: "source_mismatch" } as SeparationCommitResult;
-      }
-      if (existing.modelVersion !== input.modelVersion || existing.processingVersion !== input.processingVersion) {
-        return { status: "stale_generation" } as SeparationCommitResult;
-      }
-      if (existing.separationTaskId && existing.separationTaskId !== input.taskId) {
-        return { status: "stale_generation" } as SeparationCommitResult;
-      }
-      if (existing.separationStatus === "completed") {
+    const outcome = await withIdbTransaction(
+      ["songs", "separationCheckpoints", "separationChunks", "separations"],
+      "readwrite",
+      async (tx) => {
+        const store = tx.objectStore("songs");
+        const cpStore = tx.objectStore("separationCheckpoints");
+        const chunkStore = tx.objectStore("separationChunks");
+        const sepStore = tx.objectStore("separations");
+        const now = Date.now();
+
+        const existing = await idbRequestPromise<PersistedSongRecord | undefined>(
+          store.get(input.songId),
+        );
+        if (!existing) return { status: "song_missing" } as SeparationCommitResult;
+        if (existing.sourceAudioHash !== input.sourceAudioHash) {
+          return { status: "source_mismatch" } as SeparationCommitResult;
+        }
+        if (
+          existing.modelVersion !== input.modelVersion ||
+          existing.processingVersion !== input.processingVersion
+        ) {
+          return { status: "stale_generation" } as SeparationCommitResult;
+        }
+        if (
+          typeof input.generation !== "number" ||
+          !Number.isFinite(input.generation) ||
+          input.generation <= 0 ||
+          !input.ownerJobToken
+        ) {
+          return { status: "stale_generation" } as SeparationCommitResult;
+        }
+
+        let targetCheckpoint: SeparationCheckpoint | undefined;
+        if (input.totalChunks > 0) {
+          targetCheckpoint = await idbRequestPromise<SeparationCheckpoint | undefined>(
+            cpStore.get(input.taskId),
+          );
+          if (!targetCheckpoint) {
+            return { status: "stale_generation" } as SeparationCommitResult;
+          }
+          if (targetCheckpoint.sourceAudioHash !== input.sourceAudioHash) {
+            return { status: "source_mismatch" } as SeparationCommitResult;
+          }
+          if (
+            targetCheckpoint.modelVersion !== input.modelVersion ||
+            targetCheckpoint.processingVersion !== input.processingVersion
+          ) {
+            return { status: "stale_generation" } as SeparationCommitResult;
+          }
+          if (targetCheckpoint.status === "cancelled") {
+            return { status: "transition_rejected" } as SeparationCommitResult;
+          }
+          if (
+            targetCheckpoint.status !== "completed" ||
+            targetCheckpoint.nextChunkIndex < targetCheckpoint.totalChunks ||
+            targetCheckpoint.totalChunks !== input.totalChunks ||
+            targetCheckpoint.totalChunks <= 0
+          ) {
+            return { status: "transition_rejected" } as SeparationCommitResult;
+          }
+
+          const chunkKeys = await getTaskChunkKeysInStore(chunkStore, input.taskId);
+          if (chunkKeys.length < targetCheckpoint.totalChunks) {
+            return { status: "transition_rejected" } as SeparationCommitResult;
+          }
+
+          const maxKnownCheckpointGen = Math.max(
+            targetCheckpoint.lastExecutionGeneration ?? 0,
+            targetCheckpoint.finalizationFence?.generation ?? 0,
+            targetCheckpoint.lease?.generation ?? 0,
+          );
+          if (maxKnownCheckpointGen > 0 && input.generation < maxKnownCheckpointGen) {
+            return { status: "stale_generation" } as SeparationCommitResult;
+          }
+          if (
+            targetCheckpoint.lease &&
+            (targetCheckpoint.lease.generation !== input.generation ||
+              targetCheckpoint.lease.ownerJobToken !== input.ownerJobToken)
+          ) {
+            return { status: "stale_generation" } as SeparationCommitResult;
+          }
+          if (
+            targetCheckpoint.finalizationFence &&
+            (targetCheckpoint.finalizationFence.generation !== input.generation ||
+              targetCheckpoint.finalizationFence.ownerJobToken !== input.ownerJobToken)
+          ) {
+            return { status: "stale_generation" } as SeparationCommitResult;
+          }
+          if (
+            typeof targetCheckpoint.finalizedGeneration === "number" &&
+            input.generation < targetCheckpoint.finalizedGeneration
+          ) {
+            return { status: "stale_generation" } as SeparationCommitResult;
+          }
+        } else {
+          if (!input.cacheKey) {
+            return { status: "transition_rejected" } as SeparationCommitResult;
+          }
+          const fastCache = await idbRequestPromise<StemCacheRecord | undefined>(
+            sepStore.get(input.cacheKey),
+          );
+          if (!fastCache) {
+            return { status: "transition_rejected" } as SeparationCommitResult;
+          }
+          if (fastCache.sourceAudioHash !== input.sourceAudioHash) {
+            return { status: "source_mismatch" } as SeparationCommitResult;
+          }
+          if (
+            fastCache.modelVersion !== input.modelVersion ||
+            fastCache.processingVersion !== input.processingVersion
+          ) {
+            return { status: "stale_generation" } as SeparationCommitResult;
+          }
+        }
+
+        if (
+          existing.separationStatus === "cancelled" &&
+          existing.separationTaskId === input.taskId &&
+          !existing.separationUserAuthorized
+        ) {
+          return { status: "transition_rejected" } as SeparationCommitResult;
+        }
+
+        if (existing.separationTaskId && existing.separationTaskId !== input.taskId) {
+          if (input.allowReplaceCompleted) {
+            if (
+              input.expectedPreviousTaskId &&
+              existing.separationTaskId !== input.expectedPreviousTaskId
+            ) {
+              return { status: "stale_generation" } as SeparationCommitResult;
+            }
+          } else {
+            const existingCp = await idbRequestPromise<SeparationCheckpoint | undefined>(
+              cpStore.get(existing.separationTaskId),
+            );
+            const hasActiveOrNewerTask = Boolean(
+              existing.separationStatus === "completed" ||
+                existingCp?.status === "running" ||
+                existingCp?.status === "paused" ||
+                existingCp?.status === "completed",
+            );
+            if (hasActiveOrNewerTask) {
+              return { status: "stale_generation" } as SeparationCommitResult;
+            }
+          }
+        }
+
         if (
           existing.separationTaskId === input.taskId &&
-          existing.separationMode === input.mode &&
-          existing.cacheKey === input.cacheKey
+          typeof existing.separationGeneration === "number"
         ) {
-          return { status: "already_committed", record: existing } as SeparationCommitResult;
+          if (input.generation < existing.separationGeneration) {
+            return { status: "stale_generation" } as SeparationCommitResult;
+          }
+          if (
+            input.generation === existing.separationGeneration &&
+            existing.separationOwnerJobToken &&
+            existing.separationOwnerJobToken !== input.ownerJobToken
+          ) {
+            return { status: "stale_generation" } as SeparationCommitResult;
+          }
         }
-        return { status: "transition_rejected" } as SeparationCommitResult;
-      }
-      if (!canTransitionSeparationStatus(existing.separationStatus ?? "not_started", "completed")) {
-        return { status: "transition_rejected" } as SeparationCommitResult;
-      }
-      const stemChannels = input.stemRoles.map((stemType) => {
-        const previous = existing.stemChannels.find((channel) => channel.stemType === stemType);
-        return previous ?? { stemType, volume: 1, muted: false, solo: false };
-      });
-      const record: PersistedSongRecord = {
-        ...existing,
-        separationMode: input.mode,
-        separationStatus: "completed",
-        separationTaskId: input.taskId,
-        separationCompletedChunks: input.totalChunks,
-        separationTotalChunks: input.totalChunks,
-        separationCommittedBytes: input.committedBytes,
-        separationUserAuthorized: true,
-        cacheKey: input.cacheKey,
-        playbackSource: "stems",
-        stemChannels,
-        revision: (existing.revision ?? 0) + 1,
-        updatedAt: Date.now(),
-        updatedByTabId: tabId,
-      };
-      await idbRequestPromise(store.put(record));
-      return { status: "committed", record } as SeparationCommitResult;
-    });
+
+        if (existing.separationStatus === "completed") {
+          if (
+            existing.separationTaskId === input.taskId &&
+            existing.separationMode === input.mode &&
+            existing.cacheKey === input.cacheKey
+          ) {
+            if (
+              targetCheckpoint &&
+              (!targetCheckpoint.finalizedAt || targetCheckpoint.retryState)
+            ) {
+              await idbRequestPromise(
+                cpStore.put({
+                  ...targetCheckpoint,
+                  finalizedAt: targetCheckpoint.finalizedAt ?? now,
+                  finalizedGeneration: targetCheckpoint.finalizedGeneration ?? input.generation,
+                  finalizedOwnerJobToken:
+                    targetCheckpoint.finalizedOwnerJobToken ?? input.ownerJobToken,
+                  retryState: null,
+                  updatedAt: now,
+                } satisfies SeparationCheckpoint),
+              );
+            }
+            return { status: "already_committed", record: existing } as SeparationCommitResult;
+          }
+          if (!input.allowReplaceCompleted) {
+            return { status: "transition_rejected" } as SeparationCommitResult;
+          }
+        } else if (
+          !canTransitionSeparationStatus(existing.separationStatus ?? "not_started", "completed")
+        ) {
+          return { status: "transition_rejected" } as SeparationCommitResult;
+        }
+
+        const stemChannels = input.stemRoles.map((stemType) => {
+          const previous = existing.stemChannels.find((channel) => channel.stemType === stemType);
+          return previous ?? { stemType, volume: 1, muted: false, solo: false };
+        });
+
+        const record: PersistedSongRecord = {
+          ...existing,
+          separationMode: input.mode,
+          separationStatus: "completed",
+          separationTaskId: input.taskId,
+          separationCompletedChunks: input.totalChunks,
+          separationTotalChunks: input.totalChunks,
+          separationCommittedBytes: input.committedBytes,
+          separationUserAuthorized: true,
+          separationGeneration: input.generation,
+          separationOwnerJobToken: input.ownerJobToken,
+          separationFinalizedAt: now,
+          cacheKey: input.cacheKey,
+          playbackSource: "stems",
+          stemChannels,
+          revision: (existing.revision ?? 0) + 1,
+          updatedAt: now,
+          updatedByTabId: tabId,
+        };
+        await idbRequestPromise(store.put(record));
+
+        if (targetCheckpoint) {
+          const prevRefs =
+            targetCheckpoint.referencedBySongIds ??
+            (targetCheckpoint.songId ? [targetCheckpoint.songId] : []);
+          const nextRefs = Array.from(new Set([...prevRefs, input.songId]));
+          const nextModes: Record<string, "two_stem" | "four_stem"> = {
+            ...(targetCheckpoint.referencedModesBySongId ??
+              (targetCheckpoint.songId
+                ? { [targetCheckpoint.songId]: targetCheckpoint.requestedMode }
+                : {})),
+            [input.songId]: input.mode,
+          };
+          const updatedCp: SeparationCheckpoint = {
+            ...targetCheckpoint,
+            requestedMode:
+              targetCheckpoint.songId === input.songId ? input.mode : targetCheckpoint.requestedMode,
+            referencedBySongIds: nextRefs,
+            referencedModesBySongId: nextModes,
+            lease: null,
+            lastExecutionGeneration: Math.max(
+              targetCheckpoint.lastExecutionGeneration ?? 0,
+              input.generation,
+            ),
+            finalizationFence: {
+              taskId: targetCheckpoint.taskId,
+              generation: input.generation,
+              ownerJobToken: input.ownerJobToken,
+              ownerTabId: tabId,
+              updatedAt: now,
+            },
+            finalizedAt: now,
+            finalizedGeneration: input.generation,
+            finalizedOwnerJobToken: input.ownerJobToken,
+            retryState: null,
+            updatedAt: now,
+          };
+          await idbRequestPromise(cpStore.put(updatedCp));
+        }
+
+        return { status: "committed", record } as SeparationCommitResult;
+      },
+    );
     if (outcome.status === "committed") {
       postSyncMessage({ type: "song-updated", tabId, songId: input.songId, record: outcome.record });
     }
@@ -577,7 +800,7 @@ export async function saveSongWithAudioFile(input: {
 
 export async function saveSongStateRecord(
   song: BandSong,
-  options?: { force?: boolean },
+  options?: { force?: boolean; allowResetSeparation?: boolean },
 ): Promise<SaveSongResult> {
   if (!song.sourceAudioHash) {
     return {
@@ -610,7 +833,7 @@ export async function saveSongStateRecord(
         }
 
         const nextRevision = Math.max(existing?.revision ?? 0, song.revision ?? 0) + 1;
-        const record = serializePersistedSong(song, {
+        let record = serializePersistedSong(song, {
           audioKey: sourceAudioHash,
           sourceAudioHash,
           modelVersion: DEMUCS_MODEL_VERSION,
@@ -619,6 +842,53 @@ export async function saveSongStateRecord(
           updatedAt: Date.now(),
           updatedByTabId: tabId,
         });
+
+        // 防止延遲保存其他歌曲設定（BPM/Key/音量/Loop）時使用過期分軌快照覆蓋較新或已完成的分離欄位
+        if (existing && !options?.allowResetSeparation) {
+          const dbCompletedStaleIncoming =
+            existing.separationStatus === "completed" && record.separationStatus !== "completed";
+          const dbNewerGeneration =
+            typeof existing.separationGeneration === "number" &&
+            (typeof record.separationGeneration !== "number" ||
+              existing.separationGeneration > record.separationGeneration);
+          const dbHigherProgress =
+            existing.separationTaskId &&
+            existing.separationTaskId === record.separationTaskId &&
+            (existing.separationCompletedChunks ?? 0) > (record.separationCompletedChunks ?? 0);
+          const dbCompletedReplacedByStaleNonCompleted =
+            existing.separationStatus === "completed" &&
+            existing.separationTaskId !== record.separationTaskId &&
+            record.separationStatus !== "completed";
+
+          if (
+            dbCompletedStaleIncoming ||
+            dbNewerGeneration ||
+            dbHigherProgress ||
+            dbCompletedReplacedByStaleNonCompleted
+          ) {
+            record = {
+              ...record,
+              separationMode: existing.separationMode,
+              separationStatus: existing.separationStatus,
+              separationTaskId: existing.separationTaskId,
+              separationCompletedChunks: existing.separationCompletedChunks,
+              separationTotalChunks: existing.separationTotalChunks,
+              separationCommittedBytes: existing.separationCommittedBytes,
+              separationUserAuthorized: existing.separationUserAuthorized,
+              separationGeneration: existing.separationGeneration,
+              separationOwnerJobToken: existing.separationOwnerJobToken,
+              separationFinalizedAt: existing.separationFinalizedAt,
+              cacheKey: existing.cacheKey,
+              playbackSource:
+                existing.separationStatus === "completed" && record.stemChannels.length === 0
+                  ? existing.playbackSource
+                  : record.playbackSource,
+              stemChannels:
+                record.stemChannels.length > 0 ? record.stemChannels : existing.stemChannels,
+            };
+          }
+        }
+
         await idbRequestPromise(songsStore.put(record));
 
         const existingMeta = await idbRequestPromise<PersistedSessionMetaRecord | undefined>(

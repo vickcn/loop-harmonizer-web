@@ -205,6 +205,8 @@ function formatSeparationFocusStageLabel(stage: SeparationTaskStage): string {
       return "下載模型權重（本機快取）";
     case "processing":
       return "Demucs AI 推論計算中";
+    case "finalizing":
+      return "正在寫入與驗證分軌結果";
     case "cancelling":
       return "正在停止 Worker 與清理暫存";
     case "cancelled":
@@ -370,19 +372,55 @@ export function BandMixer() {
     setSession((previous) => {
       let changed = false;
       const songs = previous.songs.map((song) => {
-        const job = backgroundSeparationJobs.find((candidate) => candidate.songId === song.id);
+        const matchingJobs = backgroundSeparationJobs.filter((candidate) => candidate.songId === song.id);
+        const job = matchingJobs.reduce<typeof matchingJobs[number] | undefined>((best, candidate) => {
+          if (!best) return candidate;
+          const bestActive =
+            best.stage === "preparing" ||
+            best.stage === "downloading" ||
+            best.stage === "processing" ||
+            best.stage === "finalizing" ||
+            best.stage === "pausing" ||
+            best.stage === "cancelling";
+          const candActive =
+            candidate.stage === "preparing" ||
+            candidate.stage === "downloading" ||
+            candidate.stage === "processing" ||
+            candidate.stage === "finalizing" ||
+            candidate.stage === "pausing" ||
+            candidate.stage === "cancelling";
+          if (candActive !== bestActive) return candActive ? candidate : best;
+          return candidate.updatedAt >= best.updatedAt ? candidate : best;
+        }, undefined);
         if (!job) return song;
         if (song.separationStatus === "completed" && job.stage !== "completed") return song;
         const status: BandSong["separationStatus"] = mapJobStageToSongSeparationStatus(job.stage);
         const mappedStage: SeparationTaskStage =
           job.stage === "interrupted" ? "idle" : job.stage;
+        const nextTaskId =
+          job.stage !== "completed" || Boolean(song.separationTaskId)
+            ? job.taskId
+            : song.separationTaskId;
+        const nextProgress = job.stage === "completed" ? 1 : job.progress;
+        const nextActivelyFinalizing = Boolean(job.isActivelyFinalizing);
+        const nextAutoResumeExhausted = Boolean(job.autoResumeExhausted);
+        const nextRequiresManualAction = Boolean(job.requiresManualAction);
+        const nextForeignActive = Boolean(job.isForeignActive);
         if (
           song.separationStatus === status &&
           song.separationStage === mappedStage &&
-          song.separationProgress === job.progress &&
+          song.separationProgress === nextProgress &&
           song.separationCompletedChunks === job.completedChunks &&
           song.separationTotalChunks === job.totalChunks &&
-          song.separationMessage === job.message
+          song.separationCommittedBytes === job.committedBytes &&
+          song.separationMessage === job.message &&
+          song.separationTaskId === nextTaskId &&
+          song.separationRetryPhase === job.retryPhase &&
+          song.separationWaitReason === job.retryWaitReason &&
+          Boolean(song.separationActivelyFinalizing) === nextActivelyFinalizing &&
+          Boolean(song.separationAutoResumeExhausted) === nextAutoResumeExhausted &&
+          Boolean(song.separationRequiresManualAction) === nextRequiresManualAction &&
+          Boolean(song.separationForeignActive) === nextForeignActive
         ) {
           return song;
         }
@@ -391,11 +429,18 @@ export function BandMixer() {
           ...song,
           separationStatus: status,
           separationStage: mappedStage,
-          separationProgress: job.stage === "completed" ? 1 : job.progress,
+          separationProgress: nextProgress,
           separationCompletedChunks: job.completedChunks,
           separationTotalChunks: job.totalChunks,
           separationCommittedBytes: job.committedBytes,
           separationMessage: job.message,
+          separationTaskId: nextTaskId,
+          separationRetryPhase: job.retryPhase,
+          separationWaitReason: job.retryWaitReason,
+          separationActivelyFinalizing: nextActivelyFinalizing,
+          separationAutoResumeExhausted: nextAutoResumeExhausted,
+          separationRequiresManualAction: nextRequiresManualAction,
+          separationForeignActive: nextForeignActive,
         };
       });
       return changed ? { ...previous, songs } : previous;
@@ -972,7 +1017,10 @@ export function BandMixer() {
 
       const latestSong = sessionRef.current.songs.find((candidate) => candidate.id === song.id) ?? song;
       if (validation?.checkpoint) {
-        if (isValidationCompleted(validation)) {
+        if (
+          isValidationCompleted(validation) &&
+          Boolean(validation.checkpoint.finalizedAt || latestSong.separationStatus === "completed")
+        ) {
           const resolvedMode =
             latestSong.separationMode ?? validation.checkpoint.requestedMode ?? preferredMode;
           const cacheKey = createSeparationCacheKey({
@@ -1000,6 +1048,26 @@ export function BandMixer() {
             },
           );
           void refreshCacheStats();
+          return;
+        }
+        if (isValidationCompleted(validation)) {
+          patchSongMetadataOnly(
+            song.id,
+            {
+              separationStatus: "processing",
+              separationStage: "finalizing",
+              separationTaskId: validation.checkpoint.taskId,
+              separationProgress: 0.99,
+              separationCompletedChunks: validation.checkpoint.totalChunks,
+              separationTotalChunks: validation.checkpoint.totalChunks,
+              separationCommittedBytes: validation.checkpoint.committedBytes,
+              separationMessage: "分軌已完成，等待保存",
+            },
+            {
+              source: "BandMixer.restoreCachedStems",
+              checkpointStatus: validation.checkpoint.status,
+            },
+          );
           return;
         }
 
@@ -1391,7 +1459,10 @@ export function BandMixer() {
       if (isCancelled() || removedSongIdsRef.current.has(record.songId)) return;
 
       if (cpValidation?.checkpoint) {
-        if (isValidationCompleted(cpValidation)) {
+        if (
+          isValidationCompleted(cpValidation) &&
+          Boolean(cpValidation.checkpoint.finalizedAt || record.separationStatus === "completed")
+        ) {
           const resolvedMode =
             record.separationMode ?? cpValidation.checkpoint.requestedMode ?? "four_stem";
           const resolvedCacheKey =
@@ -1442,10 +1513,24 @@ export function BandMixer() {
           );
           return;
         }
-        lazySong = {
-          ...lazySong,
-          ...deriveSeparationStateFromValidation({ validation: cpValidation }),
-        };
+        if (isValidationCompleted(cpValidation)) {
+          lazySong = {
+            ...lazySong,
+            separationStatus: "processing",
+            separationStage: "finalizing",
+            separationTaskId: cpValidation.checkpoint.taskId,
+            separationProgress: 0.99,
+            separationCompletedChunks: cpValidation.checkpoint.totalChunks,
+            separationTotalChunks: cpValidation.checkpoint.totalChunks,
+            separationCommittedBytes: cpValidation.checkpoint.committedBytes,
+            separationMessage: "分軌已完成，等待保存",
+          };
+        } else {
+          lazySong = {
+            ...lazySong,
+            ...deriveSeparationStateFromValidation({ validation: cpValidation }),
+          };
+        }
       }
 
       setSession((previous) => {
@@ -1520,7 +1605,13 @@ export function BandMixer() {
       },
       true,
     );
-    if (isValidationCompleted(cpValidation) && cpValidation?.checkpoint && !isCancelled() && !removedSongIdsRef.current.has(record.songId)) {
+    if (
+      isValidationCompleted(cpValidation) &&
+      cpValidation?.checkpoint &&
+      Boolean(cpValidation.checkpoint.finalizedAt || record.separationStatus === "completed") &&
+      !isCancelled() &&
+      !removedSongIdsRef.current.has(record.songId)
+    ) {
       const latest = sessionRef.current.songs.find((item) => item.id === record.songId) ?? restoredSong;
       const resolvedMode =
         record.separationMode ?? cpValidation.checkpoint.requestedMode ?? "four_stem";
@@ -1546,6 +1637,31 @@ export function BandMixer() {
         resolvedCacheKey,
         `分段分離完成（共 ${cpValidation.checkpoint.totalChunks} 段按需播放）。`,
         { preferredSource: record.playbackSource, skipPersist: true },
+      );
+      return;
+    }
+    if (
+      isValidationCompleted(cpValidation) &&
+      cpValidation?.checkpoint &&
+      !isCancelled() &&
+      !removedSongIdsRef.current.has(record.songId)
+    ) {
+      patchSongMetadataOnly(
+        record.songId,
+        {
+          separationStatus: "processing",
+          separationStage: "finalizing",
+          separationTaskId: cpValidation.checkpoint.taskId,
+          separationProgress: 0.99,
+          separationCompletedChunks: cpValidation.checkpoint.totalChunks,
+          separationTotalChunks: cpValidation.checkpoint.totalChunks,
+          separationCommittedBytes: cpValidation.checkpoint.committedBytes,
+          separationMessage: "分軌已完成，等待保存",
+        },
+        {
+          source: "BandMixer.hydrateOnePersistedSong.finalizing",
+          checkpointStatus: cpValidation.checkpoint.status,
+        },
       );
       return;
     }
@@ -1767,7 +1883,9 @@ export function BandMixer() {
               : null;
           if (cancelled) return;
 
-          const verifiedCompletedCheckpoint = isValidationCompleted(cpValidation);
+          const verifiedCompletedCheckpoint =
+            isValidationCompleted(cpValidation) &&
+            Boolean(cpValidation?.checkpoint?.finalizedAt || remoteRecord.separationStatus === "completed");
           const reconciled = reconcileCrossTabSongUpdate(
             latestLocal,
             {
@@ -1970,7 +2088,7 @@ export function BandMixer() {
         }).catch(() => null);
         if (cancelled || !validation?.checkpoint) return;
 
-        if (isValidationCompleted(validation)) {
+        if (isValidationCompleted(validation) && Boolean(validation.checkpoint.finalizedAt)) {
           const resolvedMode =
             matchedSong.separationMode ?? validation.checkpoint.requestedMode ?? "four_stem";
           const resolvedCacheKey =
@@ -1998,6 +2116,23 @@ export function BandMixer() {
             { preferredSource: matchedSong.playbackSource, skipPersist: true },
           );
           void refreshCacheStats();
+        } else if (isValidationCompleted(validation)) {
+          patchSongMetadataOnly(
+            matchedSong.id,
+            {
+              separationStatus: "processing",
+              separationStage: "finalizing",
+              separationProgress: 0.99,
+              separationCompletedChunks: validation.checkpoint.totalChunks,
+              separationTotalChunks: validation.checkpoint.totalChunks,
+              separationCommittedBytes: validation.checkpoint.committedBytes,
+              separationMessage: "分軌已完成，等待保存",
+            },
+            {
+              source: "BandMixer.leaseBroadcast",
+              checkpointStatus: validation.checkpoint.status,
+            },
+          );
         } else {
           patchSongMetadataOnly(
             matchedSong.id,
@@ -2879,6 +3014,96 @@ export function BandMixer() {
     await separateSong(song, mode, { isAutoResume: false });
   };
 
+  const retrySongFinalization = async (song: BandSong) => {
+    const matchingJob = backgroundSeparationJobs.find(
+      (job) => job.songId === song.id && job.stage === "finalizing",
+    );
+    const taskId =
+      song.separationTaskId ||
+      matchingJob?.taskId ||
+      (song.sourceAudioHash
+        ? createCheckpointTaskId(
+            song.id,
+            song.sourceAudioHash,
+            DEMUCS_MODEL_VERSION,
+            SEPARATION_PROCESSING_VERSION,
+          )
+        : null);
+    if (!taskId) return;
+    const outcome = await sharedSeparationJobManager.retryFinalization(taskId);
+    if (outcome?.status === "completed") {
+      const latest = sessionRef.current.songs.find((item) => item.id === song.id) ?? song;
+      const summary = outcome.chunkedTask;
+      const resolvedMode = outcome.mode ?? latest.separationMode ?? "four_stem";
+      const hydrationKey = `${outcome.taskId}:${outcome.generation}:${resolvedMode}`;
+      if (summary) {
+        hydratedCompletedJobsRef.current.add(hydrationKey);
+        const installed = await installChunkedStemSet(
+          latest,
+          summary,
+          outcome.cacheKey || latest.cacheKey || "",
+          outcome.message || `分段分離完成（共 ${summary.totalChunks} 段按需播放）。`,
+          {
+            preferredSource: latest.playbackSource === "original" ? "stems" : latest.playbackSource,
+            skipPersist: true,
+          },
+        );
+        if (separationFocusRef.current?.active && separationFocusRef.current.songId === latest.id) {
+          await finishSeparationFocus({
+            songId: latest.id,
+            outcome: "completed",
+            message: outcome.message || "分段分離已完成。",
+            completedSong: installed,
+          });
+        }
+      } else {
+        const validation = await verifyAuthoritativeCheckpointForSong(latest, true).catch(() => null);
+        if (isValidationCompleted(validation) && validation?.checkpoint) {
+          hydratedCompletedJobsRef.current.add(hydrationKey);
+          const resolvedCacheKey =
+            outcome.cacheKey ||
+            latest.cacheKey ||
+            (latest.sourceAudioHash
+              ? createSeparationCacheKey({
+                  sourceAudioHash: latest.sourceAudioHash,
+                  modelVersion: DEMUCS_MODEL_VERSION,
+                  separationMode: resolvedMode,
+                  processingVersion: SEPARATION_PROCESSING_VERSION,
+                })
+              : "");
+          const installed = await installChunkedStemSet(
+            latest,
+            {
+              taskId: validation.checkpoint.taskId,
+              mode: resolvedMode,
+              sampleRate: validation.checkpoint.sampleRate,
+              totalSamples: validation.checkpoint.totalSamples,
+              totalChunks: validation.checkpoint.totalChunks,
+              committedBytes: validation.checkpoint.committedBytes,
+              durationSeconds:
+                validation.checkpoint.totalSamples / validation.checkpoint.sampleRate,
+            },
+            resolvedCacheKey,
+            outcome.message || `分段分離完成（共 ${validation.checkpoint.totalChunks} 段按需播放）。`,
+            {
+              preferredSource: latest.playbackSource === "original" ? "stems" : latest.playbackSource,
+              skipPersist: true,
+            },
+          );
+          if (separationFocusRef.current?.active && separationFocusRef.current.songId === latest.id) {
+            await finishSeparationFocus({
+              songId: latest.id,
+              outcome: "completed",
+              message: outcome.message || "分段分離已完成。",
+              completedSong: installed,
+            });
+          }
+        }
+      }
+      void refreshCacheStats();
+    }
+  };
+
   type CleanupActionResult =
     | { status: "success"; message?: string }
     | { status: "blocked"; reason: string }
@@ -3070,7 +3295,7 @@ export function BandMixer() {
     }));
     applySongToEngine(clearedSong);
     if (clearedSong.sourceAudioHash && clearedSong.persistenceStatus !== "missing_audio") {
-      await saveSongStateRecord(clearedSong).catch(() => undefined);
+      await saveSongStateRecord(clearedSong, { allowResetSeparation: true }).catch(() => undefined);
     } else {
       persistSongDebounced(latestSong.id, 0);
     }
@@ -3607,12 +3832,37 @@ export function BandMixer() {
     }
 
     // outcome.status === "failed"
-    showCardFeedback(song.id, outcome.message);
+    const activeJobAfterFail = sharedSeparationJobManager.getJob(outcome.taskId);
+    const isFinalizingWait =
+      outcome.retryPhase === "finalization" || activeJobAfterFail?.stage === "finalizing";
+    showCardFeedback(song.id, activeJobAfterFail?.message ?? outcome.message);
     await finishSeparationFocus({
       songId: song.id,
       outcome: "failed",
-      message: outcome.message,
+      message: activeJobAfterFail?.message ?? outcome.message,
     });
+    if (isFinalizingWait && activeJobAfterFail) {
+      patchSongMetadataOnly(
+        song.id,
+        {
+          separationStatus: "processing",
+          separationStage: "finalizing",
+          separationTaskId: activeJobAfterFail.taskId,
+          separationProgress: activeJobAfterFail.progress,
+          separationCompletedChunks: activeJobAfterFail.completedChunks,
+          separationTotalChunks: activeJobAfterFail.totalChunks,
+          separationCommittedBytes: activeJobAfterFail.committedBytes,
+          separationMessage: activeJobAfterFail.message,
+          separationRetryPhase: activeJobAfterFail.retryPhase,
+          separationWaitReason: activeJobAfterFail.retryWaitReason,
+          separationActivelyFinalizing: Boolean(activeJobAfterFail.isActivelyFinalizing),
+          separationAutoResumeExhausted: Boolean(activeJobAfterFail.autoResumeExhausted),
+          separationRequiresManualAction: Boolean(activeJobAfterFail.requiresManualAction),
+          separationForeignActive: Boolean(activeJobAfterFail.isForeignActive),
+        },
+        { source: "BandMixer.separateSong.finalizingWait" },
+      );
+    }
   };
 
   const requestStartSeparation = (
@@ -3654,7 +3904,11 @@ export function BandMixer() {
         if (!isAbort) {
           showCardFeedback(latestSong.id, `音軌分離失敗：${message}`);
           const currentSong = sessionRef.current.songs.find((item) => item.id === latestSong.id);
-          if (currentSong && currentSong.separationStatus !== "completed") {
+          if (
+            currentSong &&
+            currentSong.separationStatus !== "completed" &&
+            currentSong.separationStage !== "finalizing"
+          ) {
             patchSongMetadataOnly(
               latestSong.id,
               {
@@ -4871,6 +5125,7 @@ export function BandMixer() {
                 onClearSongCache={() => requestClearSongCache(song)}
                 onPauseSeparation={() => void pauseSongSeparation(song)}
                 onResumeSeparation={() => void resumeSongSeparation(song)}
+                onRetryFinalization={() => void retrySongFinalization(song)}
                 onClearSeparationData={(scope) => requestClearSongSeparationData(song, scope)}
                 onAbortSeparation={() => void abortSongSeparation(song)}
                 onRestoreSnapshot={() => restoreSongSnapshot(song)}

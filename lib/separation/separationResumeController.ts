@@ -2,6 +2,8 @@ import type { TaskAdmissionDecision } from "../band/resourceGuard.ts";
 import { DEMUCS_MODEL_VERSION, SEPARATION_PROCESSING_VERSION } from "../storage/cacheKeys.ts";
 import { idbRequestPromise, withIdbTransaction } from "../storage/indexedDb.ts";
 import {
+  type FinalizationFence,
+  type PersistedCheckpointRetryState,
   type SeparationCheckpoint,
   type SeparationCheckpointStatus,
   type SeparationLeaseInfo,
@@ -299,6 +301,22 @@ export async function validateAndPrepareResume(
     const isCompletedNow =
       validPrefixCount >= checkpoint.totalChunks &&
       committedEndSample >= checkpoint.totalSamples;
+    const preservedGen = Math.max(
+      checkpoint.lastExecutionGeneration ?? 0,
+      checkpoint.finalizationFence?.generation ?? 0,
+      checkpoint.lease?.generation ?? 0,
+    );
+    const preservedFence: FinalizationFence | null =
+      checkpoint.finalizationFence ??
+      (checkpoint.lease
+        ? {
+            taskId: checkpoint.taskId,
+            generation: checkpoint.lease.generation,
+            ownerJobToken: checkpoint.lease.ownerJobToken,
+            ownerTabId: checkpoint.lease.ownerTabId,
+            updatedAt: nowTs,
+          }
+        : null);
     effectiveCheckpoint = {
       ...checkpoint,
       nextChunkIndex: validPrefixCount,
@@ -311,6 +329,8 @@ export async function validateAndPrepareResume(
           ? "interrupted"
           : checkpoint.status,
       lease: isCompletedNow ? null : checkpoint.lease,
+      lastExecutionGeneration: preservedGen > 0 ? preservedGen : checkpoint.lastExecutionGeneration,
+      finalizationFence: preservedFence,
       updatedAt: nowTs,
     };
 
@@ -349,11 +369,29 @@ export async function validateAndPrepareResume(
   ) {
     if (effectiveCheckpoint.status !== "completed") {
       const prevStatus = effectiveCheckpoint.status;
+      const upgradedGen = Math.max(
+        effectiveCheckpoint.lastExecutionGeneration ?? 0,
+        effectiveCheckpoint.finalizationFence?.generation ?? 0,
+        effectiveCheckpoint.lease?.generation ?? 0,
+      );
+      const upgradedFence: FinalizationFence | null =
+        effectiveCheckpoint.finalizationFence ??
+        (effectiveCheckpoint.lease
+          ? {
+              taskId: effectiveCheckpoint.taskId,
+              generation: effectiveCheckpoint.lease.generation,
+              ownerJobToken: effectiveCheckpoint.lease.ownerJobToken,
+              ownerTabId: effectiveCheckpoint.lease.ownerTabId,
+              updatedAt: nowTs,
+            }
+          : null);
       effectiveCheckpoint = {
         ...effectiveCheckpoint,
         status: "completed",
         overlapCarryBuffer: null,
         lease: null,
+        lastExecutionGeneration: upgradedGen > 0 ? upgradedGen : effectiveCheckpoint.lastExecutionGeneration,
+        finalizationFence: upgradedFence,
         updatedAt: nowTs,
       };
       recordSeparationDiagnostic({
@@ -655,7 +693,12 @@ export class SeparationJobLeaseManager {
           };
         }
 
-        const nextGeneration = (currentLease?.generation ?? 0) + 1;
+        const nextGeneration =
+          Math.max(
+            existing.lastExecutionGeneration ?? 0,
+            currentLease?.generation ?? 0,
+            existing.finalizationFence?.generation ?? 0,
+          ) + 1;
         const lease: SeparationLeaseInfo = {
           ownerTabId,
           ownerJobToken,
@@ -663,10 +706,19 @@ export class SeparationJobLeaseManager {
           acquiredAt: now,
           leaseExpiresAt: now + ttlMs,
         };
+        const fence: FinalizationFence = {
+          taskId,
+          generation: nextGeneration,
+          ownerJobToken,
+          ownerTabId,
+          updatedAt: now,
+        };
         const updated: SeparationCheckpoint = {
           ...existing,
           status: "running",
           lease,
+          lastExecutionGeneration: nextGeneration,
+          finalizationFence: fence,
           updatedAt: now,
         };
         await idbRequestPromise(store.put(updated));
@@ -789,6 +841,7 @@ export class SeparationJobLeaseManager {
     lease: Pick<SeparationLeaseInfo, "ownerTabId" | "ownerJobToken" | "generation">,
     nextStatus?: SeparationCheckpointStatus,
     now = Date.now(),
+    options?: { suppressCompletedBroadcast?: boolean },
   ): Promise<boolean> {
     let resolvedStatus: SeparationCheckpointStatus | undefined = nextStatus;
     let alreadyCompletedWithoutLease = false;
@@ -856,10 +909,28 @@ export class SeparationJobLeaseManager {
           ? "completed"
           : (nextStatus ?? existing.status);
       resolvedStatus = finalStatus;
+      const preservedGen = Math.max(
+        existing.lastExecutionGeneration ?? 0,
+        existing.finalizationFence?.generation ?? 0,
+        existing.lease.generation,
+        lease.generation,
+      );
+      const preservedFence: FinalizationFence =
+        existing.finalizationFence && existing.finalizationFence.generation >= lease.generation
+          ? existing.finalizationFence
+          : {
+              taskId,
+              generation: preservedGen,
+              ownerJobToken: lease.ownerJobToken,
+              ownerTabId: lease.ownerTabId,
+              updatedAt: now,
+            };
       const next: SeparationCheckpoint = {
         ...existing,
         status: finalStatus,
         lease: null,
+        lastExecutionGeneration: preservedGen,
+        finalizationFence: preservedFence,
         updatedAt: now,
       };
       await idbRequestPromise(store.put(next));
@@ -869,7 +940,9 @@ export class SeparationJobLeaseManager {
     if (released || (alreadyCompletedWithoutLease && resolvedStatus === "completed")) {
       const broadcastType =
         resolvedStatus === "completed"
-          ? "task-completed"
+          ? options?.suppressCompletedBroadcast
+            ? "lease-released"
+            : "task-completed"
           : resolvedStatus === "cancelled"
             ? "task-cancelled"
             : resolvedStatus === "paused"
@@ -886,6 +959,436 @@ export class SeparationJobLeaseManager {
       });
     }
     return released;
+  }
+
+  /**
+   * 取得或驗證最終提交（Finalization）的持久化執行柵欄（FinalizationFence）。
+   * 即使最後一段 Chunk 提交時已釋放進行中 Lease，仍可在單一 IndexedDB 交易內保證世代單調遞增與 Token 唯一性。
+   */
+  async acquireFinalizationOwnership(
+    taskId: string,
+    ownerTabId: string,
+    options?: {
+      preferredGeneration?: number;
+      preferredJobToken?: string;
+      strictExpectedOwnership?: boolean;
+      now?: number;
+    },
+  ): Promise<
+    | { acquired: true; fence: FinalizationFence; checkpoint: SeparationCheckpoint }
+    | {
+        acquired: false;
+        code: "missing" | "cancelled" | "foreign_lease" | "stale_generation";
+        reason: string;
+      }
+  > {
+    const now = options?.now ?? Date.now();
+    return withIdbTransaction("separationCheckpoints", "readwrite", async (tx) => {
+      const store = tx.objectStore("separationCheckpoints");
+      const existing = (await idbRequestPromise(store.get(taskId))) as
+        | SeparationCheckpoint
+        | undefined;
+      if (!existing) {
+        return {
+          acquired: false as const,
+          code: "missing" as const,
+          reason: `找不到分離任務 Checkpoint：${taskId}`,
+        };
+      }
+      if (existing.status === "cancelled") {
+        return {
+          acquired: false as const,
+          code: "cancelled" as const,
+          reason: "任務已取消，禁止最終提交。",
+        };
+      }
+      if (
+        existing.lease &&
+        existing.lease.ownerTabId !== ownerTabId &&
+        existing.lease.leaseExpiresAt > now
+      ) {
+        return {
+          acquired: false as const,
+          code: "foreign_lease" as const,
+          reason: `其他分頁（${existing.lease.ownerTabId.slice(0, 8)}）正持有有效執行鎖。`,
+        };
+      }
+
+      const currentMaxGen = Math.max(
+        existing.lastExecutionGeneration ?? 0,
+        existing.finalizationFence?.generation ?? 0,
+        existing.lease?.generation ?? 0,
+      );
+      const existingFence = existing.finalizationFence;
+      const hasPreferred =
+        typeof options?.preferredGeneration === "number" &&
+        options.preferredGeneration > 0 &&
+        Boolean(options.preferredJobToken);
+
+      if (hasPreferred) {
+        const prefGen = options!.preferredGeneration!;
+        const prefToken = options!.preferredJobToken!;
+        const matchesFence =
+          Boolean(
+            existingFence &&
+              existingFence.generation === prefGen &&
+              existingFence.ownerJobToken === prefToken &&
+              prefGen >= currentMaxGen,
+          );
+        const matchesLease =
+          Boolean(
+            existing.lease &&
+              existing.lease.generation === prefGen &&
+              existing.lease.ownerJobToken === prefToken &&
+              prefGen >= currentMaxGen,
+          );
+        if (matchesFence || matchesLease) {
+          const verifiedFence: FinalizationFence = {
+            taskId,
+            generation: prefGen,
+            ownerJobToken: prefToken,
+            ownerTabId,
+            updatedAt: now,
+          };
+          if (
+            !existingFence ||
+            existingFence.generation !== verifiedFence.generation ||
+            existingFence.ownerJobToken !== verifiedFence.ownerJobToken
+          ) {
+            const updated: SeparationCheckpoint = {
+              ...existing,
+              lastExecutionGeneration: Math.max(currentMaxGen, verifiedFence.generation),
+              finalizationFence: verifiedFence,
+              updatedAt: now,
+            };
+            await idbRequestPromise(store.put(updated));
+            return { acquired: true as const, fence: verifiedFence, checkpoint: updated };
+          }
+          return { acquired: true as const, fence: existingFence, checkpoint: existing };
+        }
+        // 若 Checkpoint 已由更新世代或不同 ownerJobToken 接管，禁止舊執行者假借接管升級世代
+        if (options?.strictExpectedOwnership !== false && currentMaxGen > 0) {
+          return {
+            acquired: false as const,
+            code: "stale_generation" as const,
+            reason: `執行權世代或識別已過期（預期世代 ${currentMaxGen}，收到 ${prefGen}）。`,
+          };
+        }
+      }
+
+      const nextGeneration = currentMaxGen + 1;
+      const nextToken = createJobToken();
+      const fence: FinalizationFence = {
+        taskId,
+        generation: nextGeneration,
+        ownerJobToken: nextToken,
+        ownerTabId,
+        updatedAt: now,
+      };
+      const updated: SeparationCheckpoint = {
+        ...existing,
+        lastExecutionGeneration: nextGeneration,
+        finalizationFence: fence,
+        updatedAt: now,
+      };
+      await idbRequestPromise(store.put(updated));
+      return {
+        acquired: true as const,
+        fence,
+        checkpoint: updated,
+      };
+    });
+  }
+
+  /**
+   * 跨分頁原子同步 Checkpoint 上的初始重試資格狀態（例如初次失敗設定 attempts=0 與 5 秒退避）。
+   */
+  async upsertCheckpointRetryState(
+    taskId: string,
+    state: PersistedCheckpointRetryState,
+  ): Promise<PersistedCheckpointRetryState | null> {
+    return withIdbTransaction("separationCheckpoints", "readwrite", async (tx) => {
+      const store = tx.objectStore("separationCheckpoints");
+      const existing = (await idbRequestPromise(store.get(taskId))) as
+        | SeparationCheckpoint
+        | undefined;
+      if (!existing) return null;
+      const updated: SeparationCheckpoint = {
+        ...existing,
+        retryState: state,
+        updatedAt: Math.max(existing.updatedAt, state.updatedAt),
+      };
+      await idbRequestPromise(store.put(updated));
+      return state;
+    });
+  }
+
+  async clearCheckpointRetryState(taskId: string, now = Date.now()): Promise<void> {
+    await withIdbTransaction("separationCheckpoints", "readwrite", async (tx) => {
+      const store = tx.objectStore("separationCheckpoints");
+      const existing = (await idbRequestPromise(store.get(taskId))) as
+        | SeparationCheckpoint
+        | undefined;
+      if (!existing || !existing.retryState) return;
+      await idbRequestPromise(
+        store.put({
+          ...existing,
+          retryState: null,
+          updatedAt: now,
+        } satisfies SeparationCheckpoint),
+      );
+    }).catch(() => undefined);
+  }
+
+  /**
+   * 在單一 IndexedDB 交易內檢查並預留一次自動續跑／保存重試名額。
+   * - 防止多分頁在無 Web Locks 環境下同時讀取相同的 attempts 並各自消耗重試次數。
+   * - 在實際執行前即寫入 reservation（含預扣 attempts），避免頁面中途崩潰／重整後無限取回同一名額。
+   */
+  async reserveAutoResumeAttempt(
+    taskId: string,
+    ownerTabId: string,
+    options: {
+      maxAttempts: number;
+      fallbackEntry?: PersistedCheckpointRetryState | null;
+      now?: number;
+      reservationTtlMs?: number;
+    },
+  ): Promise<
+    | {
+        reserved: true;
+        reservationToken: string;
+        previousAttempts: number;
+        reservedAttempts: number;
+        state: PersistedCheckpointRetryState;
+        checkpoint: SeparationCheckpoint;
+      }
+    | {
+        reserved: false;
+        reason:
+          | "no_checkpoint"
+          | "cancelled"
+          | "foreign_lease"
+          | "foreign_reservation"
+          | "exhausted"
+          | "permanently_blocked"
+          | "not_eligible_yet";
+        state?: PersistedCheckpointRetryState;
+        checkpoint?: SeparationCheckpoint;
+      }
+  > {
+    const now = options.now ?? Date.now();
+    const reservationTtlMs = options.reservationTtlMs ?? 60_000;
+    return withIdbTransaction("separationCheckpoints", "readwrite", async (tx) => {
+      const store = tx.objectStore("separationCheckpoints");
+      const existing = (await idbRequestPromise(store.get(taskId))) as
+        | SeparationCheckpoint
+        | undefined;
+      if (!existing) {
+        return { reserved: false as const, reason: "no_checkpoint" as const };
+      }
+      if (existing.status === "cancelled") {
+        return {
+          reserved: false as const,
+          reason: "cancelled" as const,
+          checkpoint: existing,
+        };
+      }
+      if (
+        existing.lease &&
+        existing.lease.ownerTabId !== ownerTabId &&
+        existing.lease.leaseExpiresAt > now
+      ) {
+        return {
+          reserved: false as const,
+          reason: "foreign_lease" as const,
+          checkpoint: existing,
+        };
+      }
+
+      const defaultPhase: "inference" | "finalization" =
+        existing.status === "completed" ||
+        (existing.totalChunks > 0 && existing.nextChunkIndex >= existing.totalChunks)
+          ? "finalization"
+          : "inference";
+
+      let state: PersistedCheckpointRetryState = existing.retryState ??
+        options.fallbackEntry ?? {
+          attempts: 0,
+          nextEligibleAt: 0,
+          baselineCompletedChunks: existing.nextChunkIndex,
+          retryPhase: defaultPhase,
+          backoffCursor: 0,
+          updatedAt: now,
+        };
+
+      // 若為推論階段且有實質 Chunk 進展，才重置連續失敗計數；finalization 不得重複重置
+      if (
+        state.retryPhase === "inference" &&
+        defaultPhase === "inference" &&
+        existing.nextChunkIndex > state.baselineCompletedChunks
+      ) {
+        state = {
+          attempts: 0,
+          nextEligibleAt: 0,
+          baselineCompletedChunks: existing.nextChunkIndex,
+          retryPhase: "inference",
+          backoffCursor: 0,
+          updatedAt: now,
+        };
+      }
+
+      if (state.permanentlyBlockedReason) {
+        return {
+          reserved: false as const,
+          reason: "permanently_blocked" as const,
+          state,
+          checkpoint: existing,
+        };
+      }
+      if (state.attempts >= options.maxAttempts) {
+        return {
+          reserved: false as const,
+          reason: "exhausted" as const,
+          state,
+          checkpoint: existing,
+        };
+      }
+      if (
+        state.reservationToken &&
+        state.reservationTabId &&
+        state.reservationTabId !== ownerTabId &&
+        (state.reservationExpiresAt ?? 0) > now
+      ) {
+        return {
+          reserved: false as const,
+          reason: "foreign_reservation" as const,
+          state,
+          checkpoint: existing,
+        };
+      }
+      const effectiveEligible = Math.max(state.nextEligibleAt, state.blockedUntilAt ?? 0);
+      if (effectiveEligible > now) {
+        return {
+          reserved: false as const,
+          reason: "not_eligible_yet" as const,
+          state,
+          checkpoint: existing,
+        };
+      }
+
+      const reservationToken = createJobToken();
+      const previousAttempts = state.attempts;
+      const reservedAttempts = previousAttempts + 1;
+      const nextState: PersistedCheckpointRetryState = {
+        ...state,
+        attempts: reservedAttempts,
+        retryPhase: defaultPhase,
+        reservationToken,
+        reservationTabId: ownerTabId,
+        reservationExpiresAt: now + reservationTtlMs,
+        updatedAt: now,
+      };
+      const updatedCp: SeparationCheckpoint = {
+        ...existing,
+        retryState: nextState,
+        updatedAt: now,
+      };
+      await idbRequestPromise(store.put(updatedCp));
+      return {
+        reserved: true as const,
+        reservationToken,
+        previousAttempts,
+        reservedAttempts,
+        state: nextState,
+        checkpoint: updatedCp,
+      };
+    });
+  }
+
+  /**
+   * 僅在等待資源／執行鎖／頁面隱藏等未真正開始推論或保存的情況下，原子返還預留的額度，不消耗重試次數。
+   */
+  async releaseAutoResumeReservation(
+    taskId: string,
+    reservationToken: string,
+    options: {
+      previousAttempts: number;
+      waitReason: string;
+      blockedUntilAt?: number;
+      now?: number;
+    },
+  ): Promise<PersistedCheckpointRetryState | null> {
+    const now = options.now ?? Date.now();
+    return withIdbTransaction("separationCheckpoints", "readwrite", async (tx) => {
+      const store = tx.objectStore("separationCheckpoints");
+      const existing = (await idbRequestPromise(store.get(taskId))) as
+        | SeparationCheckpoint
+        | undefined;
+      if (!existing || !existing.retryState) return null;
+      if (existing.retryState.reservationToken !== reservationToken) {
+        return existing.retryState;
+      }
+      const nextState: PersistedCheckpointRetryState = {
+        ...existing.retryState,
+        attempts: options.previousAttempts,
+        waitReason: options.waitReason,
+        blockedUntilAt: options.blockedUntilAt,
+        reservationToken: null,
+        reservationTabId: null,
+        reservationExpiresAt: null,
+        updatedAt: now,
+      };
+      await idbRequestPromise(
+        store.put({
+          ...existing,
+          retryState: nextState,
+          updatedAt: now,
+        } satisfies SeparationCheckpoint),
+      );
+      return nextState;
+    });
+  }
+
+  /**
+   * 提交重試執行結果（成功清除、永久阻擋、或寫入下一次退避時間）。
+   */
+  async finalizeAutoResumeAttemptOutcome(
+    taskId: string,
+    reservationToken: string,
+    nextState: PersistedCheckpointRetryState | null,
+    now = Date.now(),
+  ): Promise<PersistedCheckpointRetryState | null> {
+    return withIdbTransaction("separationCheckpoints", "readwrite", async (tx) => {
+      const store = tx.objectStore("separationCheckpoints");
+      const existing = (await idbRequestPromise(store.get(taskId))) as
+        | SeparationCheckpoint
+        | undefined;
+      if (!existing) return nextState;
+      if (
+        existing.retryState?.reservationToken &&
+        existing.retryState.reservationToken !== reservationToken
+      ) {
+        return existing.retryState;
+      }
+      const cleaned = nextState
+        ? {
+            ...nextState,
+            reservationToken: null,
+            reservationTabId: null,
+            reservationExpiresAt: null,
+            updatedAt: now,
+          }
+        : null;
+      await idbRequestPromise(
+        store.put({
+          ...existing,
+          retryState: cleaned,
+          updatedAt: now,
+        } satisfies SeparationCheckpoint),
+      );
+      return cleaned;
+    });
   }
 }
 

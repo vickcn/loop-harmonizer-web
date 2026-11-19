@@ -134,7 +134,7 @@ export class SeparationTaskController {
   }
 
   isTerminal(): boolean {
-    return TERMINAL_STAGES.has(this.stage);
+    return this.settled || TERMINAL_STAGES.has(this.stage);
   }
 
   isCancellingOrCancelled(): boolean {
@@ -258,6 +258,18 @@ export class SeparationTaskController {
     this.settled = true;
     this.emit("failed", this.lastEmitProgress >= 0 ? this.lastEmitProgress : 0, message);
     this.onSettled?.("failed");
+  }
+
+  /**
+   * 當 Demucs 重型運算已結束或交由純持久化重試保存（finalization）接手時，
+   * 立即結算 Controller 並釋放 Coordinator 的重型運算名額，避免阻塞後續重試；
+   * 同時不發射 failed 事件覆寫 JobManager 的 finalizing 階段。
+   */
+  settleForFinalizationPending(): void {
+    if (this.settled) return;
+    this.settled = true;
+    void this.runCleanups().catch(() => undefined);
+    this.onSettled?.(this.stage);
   }
 
   /**

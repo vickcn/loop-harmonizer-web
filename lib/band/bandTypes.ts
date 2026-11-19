@@ -91,6 +91,15 @@ export type BandSong = {
   separationCommittedBytes?: number;
   separationUserAuthorized?: boolean;
   separationUsesChunkPlayback?: boolean;
+  separationRetryPhase?: "inference" | "finalization";
+  separationWaitReason?: string;
+  separationActivelyFinalizing?: boolean;
+  separationAutoResumeExhausted?: boolean;
+  separationRequiresManualAction?: boolean;
+  separationForeignActive?: boolean;
+  separationGeneration?: number;
+  separationOwnerJobToken?: string | null;
+  separationFinalizedAt?: number | null;
   playbackSource: SongPlaybackSource;
   cacheKey: string | null;
   sourceAudioHash?: string | null;
