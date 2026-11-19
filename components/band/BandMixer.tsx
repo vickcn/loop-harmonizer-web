@@ -132,6 +132,7 @@ import {
 } from "@/lib/storage/songSessionStore";
 import { SongCard } from "./SongCard";
 import { IconActionButton } from "./IconActionButton";
+import { GoogleDrivePickerButton } from "./GoogleDrivePickerButton";
 import { ResourceGuardModal, type ResourceGuardConfirmSelection } from "./ResourceGuardModal";
 import { ConfirmDeleteDialog } from "./ConfirmDeleteDialog";
 import {
@@ -4642,6 +4643,12 @@ export function BandMixer() {
             </>
           ) : "＋ 載入歌曲 (Alt+N)"}
         </button>
+        <GoogleDrivePickerButton
+          multiple
+          disabled={loading || focusLocked}
+          onFilesPicked={(files) => handleFiles(files)}
+          onError={(message) => showShortcutHint(message)}
+        />
         <input
           ref={fileInputRef}
           type="file"

@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { AudioSourceMeta } from "@/lib/types";
+import { GoogleDrivePickerButton } from "@/components/band/GoogleDrivePickerButton";
 
 type Props = {
   audioSource: AudioSourceMeta;
@@ -13,8 +14,10 @@ export function FileLoader({ audioSource, onFileConfirmed, onAudioBpmChange }: P
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [pendingBpm, setPendingBpm] = useState("120");
   const [editBpm, setEditBpm] = useState("");
+  const [driveError, setDriveError] = useState("");
 
   const handleFileChange = (file: File) => {
+    setDriveError("");
     setPendingFile(file);
     const initial = audioSource.userConfirmedBpm ?? audioSource.detectedBpm ?? 120;
     setPendingBpm(String(Math.round(initial)));
@@ -32,12 +35,26 @@ export function FileLoader({ audioSource, onFileConfirmed, onAudioBpmChange }: P
     <div className="card grid">
       <h2 style={{ margin: 0 }}>Loop 載入</h2>
 
-      <input
-        className="input"
-        type="file"
-        accept="audio/*"
-        onChange={(e) => e.target.files?.[0] && handleFileChange(e.target.files[0])}
-      />
+      <div className="row" style={{ gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+        <input
+          className="input"
+          type="file"
+          accept="audio/*"
+          style={{ flex: "1 1 200px" }}
+          onChange={(e) => e.target.files?.[0] && handleFileChange(e.target.files[0])}
+        />
+        <GoogleDrivePickerButton
+          onFilesPicked={(files) => {
+            if (files[0]) handleFileChange(files[0]);
+          }}
+          onError={(msg) => setDriveError(msg)}
+        />
+      </div>
+      {driveError && (
+        <div className="small" style={{ color: "#f87171" }} role="alert">
+          {driveError}
+        </div>
+      )}
 
       {/* 已確認狀態：可在線微調 BPM */}
       {audioSource.userConfirmedBpm && !pendingFile && (() => {
