@@ -33,6 +33,7 @@ export interface ChunkedStemMixBufferOptions {
   totalSamples: number;
   sampleRate: number;
   entries: ChunkMixTrackEntry[];
+  stemLayout?: "four_stem" | "two_stem_direct";
   strideSamples?: number;
   maxResidentChunks?: number;
   loop?: boolean;
@@ -57,6 +58,7 @@ export class ChunkedStemMixBuffer implements SoundTouchBufferLike {
   readonly totalChunks: number;
   readonly maxResidentChunks: number;
   readonly entries: ChunkMixTrackEntry[];
+  readonly stemLayout: "four_stem" | "two_stem_direct";
 
   private readonly loadChunkFn: (
     taskId: string,
@@ -81,6 +83,7 @@ export class ChunkedStemMixBuffer implements SoundTouchBufferLike {
     this.totalChunks = computeTotalChunks(this.length, this.strideSamples);
     this.maxResidentChunks = Math.max(3, options.maxResidentChunks ?? DEFAULT_MAX_RESIDENT_PLAYBACK_CHUNKS);
     this.entries = options.entries;
+    this.stemLayout = options.stemLayout ?? "four_stem";
     this.loopEnabled = Boolean(options.loop);
     this.loadChunkFn = options.loadChunk ?? getChunkRecord;
   }
@@ -259,11 +262,18 @@ export class ChunkedStemMixBuffer implements SoundTouchBufferLike {
       for (const entry of activeEntries) {
         const gain = entry.gain;
         if (entry.role === "instrumental") {
-          const d = channel === 0 ? chunk.stems.drums.left : chunk.stems.drums.right;
-          const b = channel === 0 ? chunk.stems.bass.left : chunk.stems.bass.right;
-          const o = channel === 0 ? chunk.stems.other.left : chunk.stems.other.right;
-          for (let i = 0; i < chunk.frameCount; i++) {
-            out[chunk.startSample + i] += (d[i] + b[i] + o[i]) * gain;
+          if (this.stemLayout === "two_stem_direct") {
+            const direct = channel === 0 ? chunk.stems.drums.left : chunk.stems.drums.right;
+            for (let i = 0; i < chunk.frameCount; i++) {
+              out[chunk.startSample + i] += direct[i] * gain;
+            }
+          } else {
+            const d = channel === 0 ? chunk.stems.drums.left : chunk.stems.drums.right;
+            const b = channel === 0 ? chunk.stems.bass.left : chunk.stems.bass.right;
+            const o = channel === 0 ? chunk.stems.other.left : chunk.stems.other.right;
+            for (let i = 0; i < chunk.frameCount; i++) {
+              out[chunk.startSample + i] += (d[i] + b[i] + o[i]) * gain;
+            }
           }
         } else {
           const srcPair = chunk.stems[entry.role];
@@ -319,17 +329,28 @@ export class ChunkedStemMixBuffer implements SoundTouchBufferLike {
       for (const entry of activeEntries) {
         const gain = entry.gain;
         if (entry.role === "instrumental") {
-          const dL = chunk.stems.drums.left;
-          const dR = chunk.stems.drums.right;
-          const bL = chunk.stems.bass.left;
-          const bR = chunk.stems.bass.right;
-          const oL = chunk.stems.other.left;
-          const oR = chunk.stems.other.right;
-          for (let i = 0; i < count; i++) {
-            const ci = localChunkOffset + i;
-            const ti = (targetFrameOffset + i) * 2;
-            target[ti] += (dL[ci] + bL[ci] + oL[ci]) * gain;
-            target[ti + 1] += (dR[ci] + bR[ci] + oR[ci]) * gain;
+          if (this.stemLayout === "two_stem_direct") {
+            const sL = chunk.stems.drums.left;
+            const sR = chunk.stems.drums.right;
+            for (let i = 0; i < count; i++) {
+              const ci = localChunkOffset + i;
+              const ti = (targetFrameOffset + i) * 2;
+              target[ti] += sL[ci] * gain;
+              target[ti + 1] += sR[ci] * gain;
+            }
+          } else {
+            const dL = chunk.stems.drums.left;
+            const dR = chunk.stems.drums.right;
+            const bL = chunk.stems.bass.left;
+            const bR = chunk.stems.bass.right;
+            const oL = chunk.stems.other.left;
+            const oR = chunk.stems.other.right;
+            for (let i = 0; i < count; i++) {
+              const ci = localChunkOffset + i;
+              const ti = (targetFrameOffset + i) * 2;
+              target[ti] += (dL[ci] + bL[ci] + oL[ci]) * gain;
+              target[ti + 1] += (dR[ci] + bR[ci] + oR[ci]) * gain;
+            }
           }
         } else {
           const stem = chunk.stems[entry.role];

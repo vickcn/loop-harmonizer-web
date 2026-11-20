@@ -21,7 +21,14 @@ export function setExternalCdnBudgetBytes(bytes: number): number {
   return configuredExternalCdnBudgetBytes;
 }
 
-export type NetworkAssetOrigin = "vercel-static" | "external-cdn" | "local-cache" | "unknown";
+export type NetworkAssetOrigin =
+  | "vercel-static"
+  | "external-cdn"
+  | "google-sdk"
+  | "google-drive-download"
+  | "google-drive-upload"
+  | "local-cache"
+  | "unknown";
 export type NetworkCacheStatus = "cache-storage-hit" | "http-cache-hit" | "uncached" | "unknown";
 
 export type KnownNetworkAssetEntry = {
@@ -497,6 +504,9 @@ export type NetworkBudgetLedgerSnapshot = {
   budgetBytes: number;
   vercelStaticBytes: number;
   externalCdnBytes: number;
+  googleSdkBytes: number;
+  googleDriveDownloadBytes: number;
+  googleDriveUploadBytes: number;
   totalBytes: number;
   transfers: Array<{
     url: string;
@@ -510,6 +520,9 @@ export class NetworkBudgetLedger {
   private readonly budgetBytes: number;
   private vercelStaticBytes = 0;
   private externalCdnBytes = 0;
+  private googleSdkBytes = 0;
+  private googleDriveDownloadBytes = 0;
+  private googleDriveUploadBytes = 0;
   private readonly recordedUrls = new Set<string>();
   private readonly transfers: NetworkBudgetLedgerSnapshot["transfers"] = [];
 
@@ -520,7 +533,13 @@ export class NetworkBudgetLedger {
   recordTransfer(url: string, bytes: number, explicitOrigin?: NetworkAssetOrigin): void {
     const normalized = normalizeAssetUrlPath(url);
     if (!normalized || bytes <= 0) return;
-    if (this.recordedUrls.has(normalized)) return;
+    if (
+      explicitOrigin !== "google-drive-download" &&
+      explicitOrigin !== "google-drive-upload" &&
+      this.recordedUrls.has(normalized)
+    ) {
+      return;
+    }
     this.recordedUrls.add(normalized);
 
     const origin = explicitOrigin ?? classifyUrlOrigin(normalized);
@@ -528,6 +547,12 @@ export class NetworkBudgetLedger {
       this.vercelStaticBytes += bytes;
     } else if (origin === "external-cdn") {
       this.externalCdnBytes += bytes;
+    } else if (origin === "google-sdk") {
+      this.googleSdkBytes += bytes;
+    } else if (origin === "google-drive-download") {
+      this.googleDriveDownloadBytes += bytes;
+    } else if (origin === "google-drive-upload") {
+      this.googleDriveUploadBytes += bytes;
     }
     this.transfers.push({
       url: normalized,
@@ -537,12 +562,27 @@ export class NetworkBudgetLedger {
     });
   }
 
+  recordDriveTransfer(direction: "download" | "upload", bytes: number, label = "drive-transfer"): void {
+    if (!Number.isFinite(bytes) || bytes <= 0) return;
+    const origin: NetworkAssetOrigin =
+      direction === "download" ? "google-drive-download" : "google-drive-upload";
+    this.recordTransfer(`drive://${direction}/${label}`, Math.round(bytes), origin);
+  }
+
   getSnapshot(): NetworkBudgetLedgerSnapshot {
     return {
       budgetBytes: this.budgetBytes,
       vercelStaticBytes: this.vercelStaticBytes,
       externalCdnBytes: this.externalCdnBytes,
-      totalBytes: this.vercelStaticBytes + this.externalCdnBytes,
+      googleSdkBytes: this.googleSdkBytes,
+      googleDriveDownloadBytes: this.googleDriveDownloadBytes,
+      googleDriveUploadBytes: this.googleDriveUploadBytes,
+      totalBytes:
+        this.vercelStaticBytes +
+        this.externalCdnBytes +
+        this.googleSdkBytes +
+        this.googleDriveDownloadBytes +
+        this.googleDriveUploadBytes,
       transfers: [...this.transfers],
     };
   }

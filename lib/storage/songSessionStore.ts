@@ -19,6 +19,7 @@ import {
   releaseCheckpointReferenceAndMaybeGc,
   runCheckpointGarbageCollection,
 } from "./separationCheckpointStore.ts";
+import { releaseImportedStemReferenceAndMaybeGc } from "./importedStemStore.ts";
 import { getTaskChunkKeysInStore } from "./separationChunkStore.ts";
 import { canTransitionSeparationStatus } from "../separation/separationStateRecovery.ts";
 
@@ -978,6 +979,10 @@ export async function removePersistedSong(input: {
         const targetAudioHash = existingRecord?.sourceAudioHash ?? input.song.sourceAudioHash ?? null;
         const targetTaskId = existingRecord?.separationTaskId ?? input.song.separationTaskId ?? null;
         const targetCacheKey = existingRecord?.cacheKey ?? input.song.cacheKey ?? null;
+        const targetImportId =
+          existingRecord?.importedStemOrigin?.importId ??
+          input.song.importedStemOrigin?.importId ??
+          null;
 
         await idbRequestPromise(songsStore.delete(input.song.id));
 
@@ -1045,6 +1050,7 @@ export async function removePersistedSong(input: {
           targetTaskId,
           targetAudioHash,
           targetCacheKey,
+          targetImportId,
         };
       },
     );
@@ -1059,6 +1065,14 @@ export async function removePersistedSong(input: {
           ? [...input.inMemoryRemainingSongs]
           : undefined,
         source: "removePersistedSong",
+      }).catch(() => undefined);
+    }
+
+    if (input.deleteLocalData && res.targetImportId) {
+      await releaseImportedStemReferenceAndMaybeGc({
+        importId: res.targetImportId,
+        songId: input.song.id,
+        knownInMemorySongs: input.inMemoryRemainingSongs,
       }).catch(() => undefined);
     }
 

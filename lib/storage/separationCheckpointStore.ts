@@ -26,6 +26,11 @@ import {
   idbRequestPromise,
   withIdbTransaction,
 } from "./indexedDb.ts";
+import {
+  getPinnedDriveTransferTaskIds,
+  isTaskPinnedByDriveTransfer,
+} from "./driveTransferStore.ts";
+import type { ImportedStemRecord } from "./importedStemStore.ts";
 import { recordSeparationDiagnostic } from "../separation/separationStateRecovery.ts";
 
 export type SeparationCheckpointStatus =
@@ -969,7 +974,7 @@ export async function releaseCheckpointReferenceAndMaybeGc(
           timestamp: now,
         });
 
-        if (refSongIds.length > 0 || leaseActive) {
+        if (refSongIds.length > 0 || leaseActive || isTaskPinnedByDriveTransfer(cp.taskId)) {
           const updatedCp: SeparationCheckpoint = {
             ...cp,
             referencedBySongIds: refSongIds,
@@ -979,7 +984,9 @@ export async function releaseCheckpointReferenceAndMaybeGc(
           await idbRequestPromise(cpStore.put(updatedCp));
           survivingCheckpoints.set(cp.taskId, updatedCp);
           preservedTaskIds.push(cp.taskId);
-          if (leaseActive) blockedByLeaseTaskIds.push(cp.taskId);
+          if (leaseActive || isTaskPinnedByDriveTransfer(cp.taskId)) {
+            blockedByLeaseTaskIds.push(cp.taskId);
+          }
 
           pendingDiagnostics.push({
             event: "checkpoint-delete-blocked",
@@ -1108,12 +1115,13 @@ export async function runCheckpointGarbageCollection(params?: {
   const pendingDiagnostics: Array<Parameters<typeof recordSeparationDiagnostic>[0]> = [];
 
   const result = await withIdbTransaction(
-    ["songs", "separationCheckpoints", "separationChunks"],
+    ["songs", "separationCheckpoints", "separationChunks", "importedStems"],
     "readwrite",
     async (tx) => {
       const songStore = tx.objectStore("songs");
       const cpStore = tx.objectStore("separationCheckpoints");
       const chunkStore = tx.objectStore("separationChunks");
+      const impStore = tx.objectStore("importedStems");
 
       const persistedSongs = (await idbRequestPromise(
         songStore.getAll(),
@@ -1121,6 +1129,9 @@ export async function runCheckpointGarbageCollection(params?: {
       const allCps = (await idbRequestPromise(
         cpStore.getAll(),
       )) as SeparationCheckpoint[];
+      const allImportedStems = (await idbRequestPromise(
+        impStore.getAll(),
+      )) as ImportedStemRecord[];
       const chunkKeysByTaskId = await collectChunkPrimaryKeysGroupedByTaskIdInStore(chunkStore);
 
       const completedCheckpointTaskIds = new Set(
@@ -1133,7 +1144,11 @@ export async function runCheckpointGarbageCollection(params?: {
         removedIds,
       });
 
-      const knownCheckpointIds = new Set(allCps.map((c) => c.taskId));
+      const knownCheckpointIds = new Set([
+        ...allCps.map((c) => c.taskId),
+        ...allImportedStems.map((imp) => imp.importId),
+        ...getPinnedDriveTransferTaskIds(),
+      ]);
       const blockedByLeaseTaskIds: string[] = [];
       let deletedCheckpoints = 0;
       let deletedChunks = 0;
@@ -1147,8 +1162,9 @@ export async function runCheckpointGarbageCollection(params?: {
           removedIds,
         });
         const leaseActive = isCheckpointLeaseActive(cp, now);
+        const transferPinned = isTaskPinnedByDriveTransfer(cp.taskId);
         if (refSongIds.length > 0) continue;
-        if (leaseActive) {
+        if (leaseActive || transferPinned) {
           blockedByLeaseTaskIds.push(cp.taskId);
           pendingDiagnostics.push({
             event: "checkpoint-delete-blocked",
@@ -1373,15 +1389,22 @@ export async function deleteAllIncompleteCheckpoints(options?: {
   const pendingDiagnostics: Array<Parameters<typeof recordSeparationDiagnostic>[0]> = [];
 
   const result = await withIdbTransaction(
-    ["separationChunks", "separationCheckpoints"],
+    ["separationChunks", "separationCheckpoints", "importedStems"],
     "readwrite",
     async (tx) => {
       const chunkStore = tx.objectStore("separationChunks");
       const cpStore = tx.objectStore("separationCheckpoints");
+      const impStore = tx.objectStore("importedStems");
       const allCps = (await idbRequestPromise(cpStore.getAll())) as SeparationCheckpoint[];
+      const allImportedStems = (await idbRequestPromise(
+        impStore.getAll(),
+      )) as ImportedStemRecord[];
       const chunkKeysByTaskId = await collectChunkPrimaryKeysGroupedByTaskIdInStore(chunkStore);
 
-      const protectedTaskIds = new Set<string>();
+      const protectedTaskIds = new Set<string>([
+        ...allImportedStems.map((imp) => imp.importId),
+        ...getPinnedDriveTransferTaskIds(),
+      ]);
       const incompleteTaskIds = new Set<string>();
       const blockedByLeaseTaskIds: string[] = [];
       let completedCount = 0;
@@ -1390,7 +1413,7 @@ export async function deleteAllIncompleteCheckpoints(options?: {
         if (cp.status === "completed") {
           protectedTaskIds.add(cp.taskId);
           completedCount++;
-        } else if (isCheckpointLeaseActive(cp, now)) {
+        } else if (isCheckpointLeaseActive(cp, now) || isTaskPinnedByDriveTransfer(cp.taskId)) {
           protectedTaskIds.add(cp.taskId);
           blockedByLeaseTaskIds.push(cp.taskId);
           pendingDiagnostics.push({
@@ -1400,9 +1423,11 @@ export async function deleteAllIncompleteCheckpoints(options?: {
             songId: cp.songId,
             checkpointStatus: cp.status,
             leaseOwner: cp.lease?.ownerTabId ?? null,
-            leaseState: "active",
+            leaseState: isTaskPinnedByDriveTransfer(cp.taskId) ? "drive_transfer_pinned" : "active",
             outcome: "blocked",
-            note: "skipped active lease during global temp cleanup",
+            note: isTaskPinnedByDriveTransfer(cp.taskId)
+              ? "skipped checkpoint pinned by active Drive transfer"
+              : "skipped active lease during global temp cleanup",
             timestamp: now,
           });
         } else {

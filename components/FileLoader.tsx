@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { AudioSourceMeta } from "@/lib/types";
 import { GoogleDrivePickerButton } from "@/components/band/GoogleDrivePickerButton";
+import { GoogleAccountButton } from "@/components/google/GoogleAccountButton";
 
 type Props = {
   audioSource: AudioSourceMeta;
@@ -33,7 +34,10 @@ export function FileLoader({ audioSource, onFileConfirmed, onAudioBpmChange }: P
 
   return (
     <div className="card grid">
-      <h2 style={{ margin: 0 }}>Loop 載入</h2>
+      <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+        <h2 style={{ margin: 0 }}>Loop 載入</h2>
+        <GoogleAccountButton onError={(msg) => setDriveError(msg)} />
+      </div>
 
       <div className="row" style={{ gap: 8, flexWrap: "wrap", alignItems: "center" }}>
         <input

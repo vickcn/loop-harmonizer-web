@@ -24,6 +24,7 @@ wheels/
 MANIFEST
 *.*workspace
 **.env**
+!.env.example
 **.patch
 
 # PyInstaller
@@ -165,6 +166,8 @@ logs/
 memo*
 *.tmp*
 *old*
+!*Folder*
+!*folder*
 lib/audioEngine.ts.old.bak.ts
 lib/audioEngine.ts.old.bak
 env*

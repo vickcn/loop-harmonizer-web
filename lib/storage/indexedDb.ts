@@ -1,9 +1,12 @@
 const DB_NAME = "loop-harmonizer-audio-cache";
-const DB_VERSION = 4;
+const DB_VERSION = 5;
 
 export const INDEXEDDB_VERSION = DB_VERSION;
 export const SEPARATION_CHECKPOINT_HASH_INDEX = "by_sourceAudioHash";
 export const SEPARATION_CHUNK_TASK_INDEX = "by_taskId";
+export const DRIVE_TRANSFER_ACCOUNT_INDEX = "by_ownerAccountId";
+export const DRIVE_TRANSFER_SONG_INDEX = "by_songId";
+export const IMPORTED_STEM_HASH_INDEX = "by_sourceAudioHash";
 
 export type AudioCacheStore =
   | "separations"
@@ -13,7 +16,10 @@ export type AudioCacheStore =
   | "songs"
   | "sessionMeta"
   | "separationCheckpoints"
-  | "separationChunks";
+  | "separationChunks"
+  | "driveAccounts"
+  | "driveTransfers"
+  | "importedStems";
 
 const ALL_STORES: readonly AudioCacheStore[] = [
   "separations",
@@ -24,6 +30,9 @@ const ALL_STORES: readonly AudioCacheStore[] = [
   "sessionMeta",
   "separationCheckpoints",
   "separationChunks",
+  "driveAccounts",
+  "driveTransfers",
+  "importedStems",
 ];
 
 export interface InMemoryIdbHooks {
@@ -146,7 +155,7 @@ export interface UpgradeableDatabaseLike {
 
 /**
  * 向後相容的 IndexedDB schema 升級：
- * - v1~v3 -> v4：僅增量建立 missing stores 與 metadata indexes，絕不清空或覆寫既有音訊/歌曲資料。
+ * - v1~v4 -> v5：僅增量建立 missing stores 與 metadata indexes，絕不清空或覆寫既有音訊/歌曲資料。
  */
 export function applyIndexedDbSchemaUpgrade(
   db: UpgradeableDatabaseLike,
@@ -175,6 +184,30 @@ export function applyIndexedDbSchemaUpgrade(
       !store.indexNames.contains(SEPARATION_CHUNK_TASK_INDEX)
     ) {
       store.createIndex(SEPARATION_CHUNK_TASK_INDEX, "taskId", {
+        unique: false,
+      });
+    }
+    if (
+      storeName === "driveTransfers" &&
+      !store.indexNames.contains(DRIVE_TRANSFER_ACCOUNT_INDEX)
+    ) {
+      store.createIndex(DRIVE_TRANSFER_ACCOUNT_INDEX, "ownerAccountId", {
+        unique: false,
+      });
+    }
+    if (
+      storeName === "driveTransfers" &&
+      !store.indexNames.contains(DRIVE_TRANSFER_SONG_INDEX)
+    ) {
+      store.createIndex(DRIVE_TRANSFER_SONG_INDEX, "songId", {
+        unique: false,
+      });
+    }
+    if (
+      storeName === "importedStems" &&
+      !store.indexNames.contains(IMPORTED_STEM_HASH_INDEX)
+    ) {
+      store.createIndex(IMPORTED_STEM_HASH_INDEX, "sourceAudioHash", {
         unique: false,
       });
     }
@@ -309,6 +342,24 @@ async function runInMemoryTransaction<T>(
                 indexName === SEPARATION_CHUNK_TASK_INDEX
               ) {
                 return obj.taskId;
+              }
+              if (
+                storeName === "driveTransfers" &&
+                indexName === DRIVE_TRANSFER_ACCOUNT_INDEX
+              ) {
+                return obj.ownerAccountId;
+              }
+              if (
+                storeName === "driveTransfers" &&
+                indexName === DRIVE_TRANSFER_SONG_INDEX
+              ) {
+                return obj.songId;
+              }
+              if (
+                storeName === "importedStems" &&
+                indexName === IMPORTED_STEM_HASH_INDEX
+              ) {
+                return obj.sourceAudioHash;
               }
               throw new Error(`資料表 ${storeName} 尚未建立索引：${indexName}`);
             };
