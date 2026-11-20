@@ -30,6 +30,39 @@ export type ProjectSongAvailabilityState =
   | "original_missing"
   | "stems_missing";
 
+export type ArtifactCompatibilityStatus =
+  | "verified"
+  | "insufficient_evidence"
+  | "incompatible";
+
+export interface ArtifactCompatibilityResult {
+  compatible: boolean;
+  status: ArtifactCompatibilityStatus;
+  reason?: string;
+  missingChecksumRoles?: string[];
+  canAttemptRecomputeVerification?: boolean;
+}
+
+export type ProjectRevisionMetaSummary = {
+  fileId: string;
+  fileName?: string;
+  revision?: number;
+  revisionToken: string;
+  parentRevisionId?: string;
+  modifiedTime?: string;
+};
+
+export type PendingProjectRevisionPublish = {
+  revision: number;
+  revisionToken: string;
+  parentRevisionId?: string;
+  revisionFileId: string;
+  targetProjectFileId?: string;
+  localRevisionAtStart: number;
+  localTokenAtStart: string;
+  createdAt: number;
+};
+
 export type ProjectMasterSettings = {
   notes?: string;
 };
@@ -144,6 +177,7 @@ export type BandProject = {
 export type ProjectConflictInfo = {
   detectedAt: number;
   kind: "diverged" | "remote_deleted";
+  conflictSubType?: "pre_write_diverged" | "read_after_write_race" | "sibling_branch" | "remote_deleted";
   localRevision: number;
   localRevisionToken: string;
   localBaseRevision: number;
@@ -152,6 +186,8 @@ export type ProjectConflictInfo = {
   remoteUpdatedAt?: string;
   remoteProjectSnapshot: BandProject | null;
   conflictSnapshotFileId?: string;
+  siblingRevisions?: ProjectRevisionMetaSummary[];
+  parentRevisionId?: string;
   reason: string;
 };
 
@@ -170,6 +206,7 @@ export type PersistedProjectRecord = {
   lastKnownRemoteRevision?: number | null;
   lastKnownRemoteRevisionToken?: string | null;
   lastKnownRemoteDriveVersion?: string | null;
+  pendingRevisionPublish?: PendingProjectRevisionPublish | null;
   dirty: boolean;
   syncStatus: ProjectSyncStatus;
   lastSavedAt: number;

@@ -7,9 +7,11 @@ import {
 import {
   DRIVE_FOLDER_MIME_TYPE,
   DriveApiError,
+  type PaginatedDriveIncompleteReason,
   createDriveFolder,
   getDriveFileMetadata,
   listDriveFiles,
+  listDriveFilesPaginated,
   type DriveRawFileResource,
 } from "./driveClient.ts";
 
@@ -43,6 +45,16 @@ export interface ManagedDriveProjectEntry {
   projectFileVersion?: string;
   projectFileRevisionToken?: string;
   revisionsFolderId?: string;
+}
+
+export interface ManagedProjectsListResult {
+  entries: ManagedDriveProjectEntry[];
+  complete: boolean;
+  truncated: boolean;
+  incompleteReason?: PaginatedDriveIncompleteReason | "partial_failure";
+  errorMessage?: string;
+  folderPagesFetched: number;
+  filePagesFetched: number;
 }
 
 export interface SongRevisionFolders {
@@ -673,14 +685,29 @@ export async function ensureProjectFolder(params: {
   );
 }
 
-export async function listManagedProjects(params: {
+export async function listManagedProjectsPaginated(params: {
   accountId: string;
   accessToken: string;
+  pageSize?: number;
+  maxPages?: number;
+  maxItems?: number;
+  maxRetriesPerPage?: number;
+  retryDelayMs?: readonly number[];
+  strict?: boolean;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
-}): Promise<ManagedDriveProjectEntry[]> {
-  if (!params.accountId || !params.accessToken) return [];
+}): Promise<ManagedProjectsListResult> {
+  if (!params.accountId || !params.accessToken) {
+    return {
+      entries: [],
+      complete: true,
+      truncated: false,
+      folderPagesFetched: 0,
+      filePagesFetched: 0,
+    };
+  }
   const safeAccount = params.accountId.replace(/'/g, "");
+  const pageSize = params.pageSize ?? 100;
 
   // 確保只讀取目前登入帳戶、受 Loop Harmonizer 管理之專案資料夾與 project.json
   const folderQuery = [
@@ -699,19 +726,29 @@ export async function listManagedProjects(params: {
   ].join(" and ");
 
   const [folderRes, fileRes] = await Promise.all([
-    listDriveFiles({
+    listDriveFilesPaginated({
       accessToken: params.accessToken,
       q: folderQuery,
-      pageSize: 100,
+      pageSize,
       orderBy: "modifiedTime desc",
+      maxPages: params.maxPages,
+      maxItems: params.maxItems,
+      maxRetriesPerPage: params.maxRetriesPerPage,
+      retryDelayMs: params.retryDelayMs,
+      throwOnError: params.strict ?? true,
       signal: params.signal,
       fetchImpl: params.fetchImpl,
     }),
-    listDriveFiles({
+    listDriveFilesPaginated({
       accessToken: params.accessToken,
       q: fileQuery,
-      pageSize: 100,
+      pageSize,
       orderBy: "modifiedTime desc",
+      maxPages: params.maxPages,
+      maxItems: params.maxItems,
+      maxRetriesPerPage: params.maxRetriesPerPage,
+      retryDelayMs: params.retryDelayMs,
+      throwOnError: params.strict ?? true,
       signal: params.signal,
       fetchImpl: params.fetchImpl,
     }),
@@ -770,7 +807,40 @@ export async function listManagedProjects(params: {
     });
   }
 
-  return entries;
+  const complete = folderRes.complete && fileRes.complete;
+  const incompleteReason = !folderRes.complete
+    ? folderRes.incompleteReason
+    : !fileRes.complete
+      ? fileRes.incompleteReason
+      : undefined;
+  const errorMessage = !folderRes.complete
+    ? folderRes.errorMessage
+    : !fileRes.complete
+      ? fileRes.errorMessage
+      : undefined;
+
+  return {
+    entries,
+    complete,
+    truncated: !complete,
+    incompleteReason,
+    errorMessage,
+    folderPagesFetched: folderRes.pagesFetched,
+    filePagesFetched: fileRes.pagesFetched,
+  };
+}
+
+export async function listManagedProjects(params: {
+  accountId: string;
+  accessToken: string;
+  signal?: AbortSignal;
+  fetchImpl?: typeof fetch;
+}): Promise<ManagedDriveProjectEntry[]> {
+  const res = await listManagedProjectsPaginated({
+    ...params,
+    strict: true,
+  });
+  return res.entries;
 }
 
 export async function ensureSongOriginalsFolder(params: {

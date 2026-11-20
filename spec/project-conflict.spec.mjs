@@ -312,3 +312,196 @@ test("Conflict detection covers clean remote_ahead, diverged local+remote non-de
     resetInMemoryIdbForTests();
   }
 });
+
+test("P1-4: sibling revision branch detection (even when main project.json points to local write) and two-phase pendingRevisionPublish recovery", async () => {
+  configureInMemoryIdbForTests();
+  clearCachedFolderLayoutForAccount();
+  try {
+    const server = createConflictMockDriveServer();
+    let failNextProjectJsonPatch = false;
+    let injectSiblingAfterStage2 = null;
+
+    const customFetch = async (url, init) => {
+      const u = new URL(String(url));
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (
+        (method === "POST" || method === "PATCH") &&
+        u.pathname.startsWith("/upload/drive/v3/files") &&
+        String(init?.body ?? "").includes('"lhRole":"project_json"')
+      ) {
+        if (failNextProjectJsonPatch) {
+          failNextProjectJsonPatch = false;
+          return new Response("Server Error", { status: 500 });
+        }
+        const res = await server.fetchImpl(url, init);
+        // 模擬 Device A 在 Device B 完成寫入期間，已先一步/同時將同一父版本之 sibling revision 寫進 revisions/
+        if (injectSiblingAfterStage2) {
+          const siblingCfg = injectSiblingAfterStage2;
+          injectSiblingAfterStage2 = null;
+          server.files.set(siblingCfg.fileId, {
+            trashed: false,
+            meta: {
+              id: siblingCfg.fileId,
+              name: `rev_${siblingCfg.revision}_${siblingCfg.revisionToken}.json`,
+              mimeType: "application/json",
+              parents: [siblingCfg.revisionsFolderId],
+              appProperties: {
+                lhApp: "loop-harmonizer",
+                lhRole: "project_revision",
+                lhAccountId: siblingCfg.accountId,
+                lhProjectId: siblingCfg.projectId,
+                lhProjectRevision: String(siblingCfg.revision),
+                lhRevisionToken: siblingCfg.revisionToken,
+                lhParentRevisionId: siblingCfg.parentRevisionId,
+              },
+              modifiedTime: new Date().toISOString(),
+            },
+            json: {
+              ...siblingCfg.baseProject,
+              name: "Device A Branch Mix",
+              revision: siblingCfg.revision,
+              revisionToken: siblingCfg.revisionToken,
+              parentRevisionId: siblingCfg.parentRevisionId,
+              updatedAt: new Date().toISOString(),
+            },
+          });
+        }
+        return res;
+      }
+      return server.fetchImpl(url, init);
+    };
+
+    const auth = {
+      accountId: "google:acc1",
+      accessToken: "token-1",
+      generation: 1,
+      isGenerationValid: (g, a) => g === 1 && a === "google:acc1",
+    };
+
+    // Device A & B 共同基準 v1
+    const created = await createNewProject({
+      name: "Shared Branch Root",
+      storageProvider: "google_drive",
+      auth,
+      syncImmediatelyIfDrive: true,
+      fetchImpl: customFetch,
+    });
+    assert.equal(created.syncOutcome?.status, "synced");
+    const recV1 = created.record;
+    const baseToken = recV1.project.revisionToken;
+
+    // 情境 1：Stage 1 rev_*.json 成功但 Stage 2 project.json 失敗 -> 保留 pendingRevisionPublish，重試不產生孤兒 Revision
+    const recV2 = {
+      ...recV1,
+      localRevision: 2,
+      dirty: true,
+      syncStatus: "dirty",
+      project: {
+        ...recV1.project,
+        name: "Stage 2 Recovery Test",
+        revision: 2,
+        revisionToken: "r2-local-draft",
+      },
+    };
+    await saveProjectRecord(recV2);
+
+    failNextProjectJsonPatch = true;
+    const stage2FailOutcome = await saveProjectToDrive({
+      record: recV2,
+      accountId: auth.accountId,
+      accessToken: auth.accessToken,
+      generation: 1,
+      isGenerationValid: auth.isGenerationValid,
+      fetchImpl: customFetch,
+    });
+    assert.equal(stage2FailOutcome.status, "error");
+
+    const afterStage2Fail = await getProjectRecord(recV1.projectId);
+    assert.ok(afterStage2Fail.pendingRevisionPublish?.revisionFileId);
+    const savedRevFileId = afterStage2Fail.pendingRevisionPublish.revisionFileId;
+    const revCountAfterFail = Array.from(server.files.values()).filter(
+      (f) => f.meta.appProperties?.lhRole === "project_revision",
+    ).length;
+    assert.equal(revCountAfterFail, 2); // r1 + r2
+
+    // 重試：必須重用 savedRevFileId，不額外建立第 3 個孤兒 revision 檔
+    const retryOutcome = await saveProjectToDrive({
+      record: afterStage2Fail,
+      accountId: auth.accountId,
+      accessToken: auth.accessToken,
+      generation: 1,
+      isGenerationValid: auth.isGenerationValid,
+      fetchImpl: customFetch,
+    });
+    assert.equal(retryOutcome.status, "synced");
+    assert.equal(retryOutcome.immutableRevisionFileId, savedRevFileId);
+    assert.equal(
+      Array.from(server.files.values()).filter(
+        (f) => f.meta.appProperties?.lhRole === "project_revision",
+      ).length,
+      2,
+    );
+    assert.equal((await getProjectRecord(recV1.projectId)).pendingRevisionPublish, null);
+
+    // 情境 2：從同一父版本 r2 同時分支（Device B 寫後 project.json 暫時指向 B 自己，但 revisions/ 已存在 A 的 sibling branch）
+    const recSynced2 = retryOutcome.record;
+    const r2ParentToken = recSynced2.project.revisionToken;
+    const recB3 = {
+      ...recSynced2,
+      localRevision: 3,
+      dirty: true,
+      syncStatus: "dirty",
+      project: {
+        ...recSynced2.project,
+        name: "Device B Branch Mix",
+        revision: 3,
+        revisionToken: "r3-device-b-local",
+      },
+    };
+    await saveProjectRecord(recB3);
+
+    injectSiblingAfterStage2 = {
+      fileId: "rev_sibling_a_3",
+      revisionsFolderId: recSynced2.project.driveRevisionsFolderId,
+      accountId: auth.accountId,
+      projectId: recSynced2.projectId,
+      revision: 3,
+      revisionToken: "r3-device-a-sibling",
+      parentRevisionId: r2ParentToken,
+      baseProject: recSynced2.project,
+    };
+
+    const siblingConflict = await saveProjectToDrive({
+      record: recB3,
+      accountId: auth.accountId,
+      accessToken: auth.accessToken,
+      generation: 1,
+      isGenerationValid: auth.isGenerationValid,
+      fetchImpl: customFetch,
+    });
+    assert.equal(siblingConflict.status, "conflict");
+    assert.equal(siblingConflict.conflictInfo.conflictSubType, "sibling_branch");
+    assert.equal(siblingConflict.conflictInfo.remoteProjectSnapshot?.name, "Device A Branch Mix");
+
+    // 雙方 Revision 快照都必須完整保存在 revisions/ 中，絕不自動合併或刪除！
+    const revTokens = Array.from(server.files.values())
+      .filter((f) => f.meta.appProperties?.lhRole === "project_revision")
+      .map((f) => f.meta.appProperties?.lhRevisionToken);
+    assert.ok(revTokens.includes("r3-device-a-sibling"));
+    assert.ok(revTokens.includes(baseToken) || revTokens.includes(r2ParentToken));
+    assert.equal(revTokens.length, 4); // r1 + r2 + r3(A) + r3(B)
+
+    // 驗證從 sibling_branch 衝突載入遠端分支 (Device A) 成功
+    const resolved = await resolveProjectConflict({
+      projectId: recV1.projectId,
+      strategy: "load_remote",
+      auth,
+      fetchImpl: customFetch,
+    });
+    assert.equal(resolved.activeRecord.project.name, "Device A Branch Mix");
+    assert.equal(resolved.activeRecord.syncStatus, "synced");
+  } finally {
+    clearCachedFolderLayoutForAccount();
+    resetInMemoryIdbForTests();
+  }
+});

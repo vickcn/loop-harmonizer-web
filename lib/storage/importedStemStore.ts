@@ -1,6 +1,12 @@
 import type { WavExportFormat } from "../audio/chunkedWavExporter.ts";
 import type { StemSeparationMode } from "../separation/stemTypes.ts";
-import type { PersistedProjectRecord, ProjectSongDerivedFromRef } from "../projects/projectTypes.ts";
+import type {
+  ArtifactCompatibilityResult,
+  PersistedProjectRecord,
+  ProjectSongArtifactRef,
+  ProjectSongDerivedFromRef,
+} from "../projects/projectTypes.ts";
+import { isArtifactRefStrictlyCompatible } from "../projects/projectModel.ts";
 import { isTaskPinnedByDriveTransfer } from "./driveTransferStore.ts";
 import {
   IMPORTED_STEM_HASH_INDEX,
@@ -96,7 +102,7 @@ export async function findImportedStemByHash(params: {
   return matched[0] ?? null;
 }
 
-export async function findImportedStemStrict(params: {
+export async function findImportedStemCandidatesBySpec(params: {
   sourceAudioHash: string;
   mode: StemSeparationMode;
   modelVersion: string;
@@ -107,8 +113,8 @@ export async function findImportedStemStrict(params: {
   expectedRevisionId?: string;
   expectedChecksums?: Record<string, string>;
   expectedDerivedFrom?: ProjectSongDerivedFromRef | null;
-}): Promise<ImportedStemRecord | null> {
-  if (!params.sourceAudioHash) return null;
+}): Promise<Array<{ record: ImportedStemRecord; compatibility: ArtifactCompatibilityResult }>> {
+  if (!params.sourceAudioHash) return [];
   const rows = await withIdbTransaction("importedStems", "readonly", async (tx) => {
     const store = tx.objectStore("importedStems");
     if (
@@ -123,48 +129,100 @@ export async function findImportedStemStrict(params: {
     return all.filter((item) => item.sourceAudioHash === params.sourceAudioHash);
   });
 
-  const matched = rows
-    .filter((item) => {
-      if (item.sourceAudioHash !== params.sourceAudioHash) return false;
-      if (item.requestedMode !== params.mode) return false;
-      if (item.modelVersion !== params.modelVersion) return false;
-      if (item.processingVersion !== params.processingVersion) return false;
-      if (params.sampleRate !== undefined && item.sampleRate !== params.sampleRate) return false;
-      if (params.channelCount !== undefined && item.channelCount !== params.channelCount) {
-        return false;
-      }
-      if (params.totalSamples !== undefined && item.totalSamples !== params.totalSamples) {
-        return false;
-      }
-      if (
-        params.expectedRevisionId &&
-        !params.expectedRevisionId.startsWith("local-") &&
-        item.revisionId !== params.expectedRevisionId
-      ) {
-        return false;
-      }
-      if (params.expectedDerivedFrom && item.derivedFrom) {
-        if (
-          params.expectedDerivedFrom.modelVersion !== item.derivedFrom.modelVersion ||
-          params.expectedDerivedFrom.processingVersion !== item.derivedFrom.processingVersion ||
-          (params.expectedDerivedFrom.sourceRevisionId &&
-            item.derivedFrom.sourceRevisionId &&
-            params.expectedDerivedFrom.sourceRevisionId !== item.derivedFrom.sourceRevisionId)
-        ) {
-          return false;
-        }
-      }
-      if (params.expectedChecksums) {
-        for (const [role, expSum] of Object.entries(params.expectedChecksums)) {
-          const gotSum = item.checksumsByRole?.[role];
-          if (expSum && gotSum && expSum !== gotSum) return false;
-        }
-      }
-      return true;
-    })
-    .sort((a, b) => b.updatedAt - a.updatedAt);
+  const requireExact = Boolean(
+    params.expectedRevisionId && !params.expectedRevisionId.startsWith("local-"),
+  );
+  const candidates: Array<{
+    record: ImportedStemRecord;
+    compatibility: ArtifactCompatibilityResult;
+  }> = [];
 
-  return matched[0] ?? null;
+  for (const item of rows.slice().sort((a, b) => b.updatedAt - a.updatedAt)) {
+    const expectedRef: ProjectSongArtifactRef = {
+      revisionId: params.expectedRevisionId || item.revisionId,
+      sourceAudioHash: params.sourceAudioHash,
+      separationMode: params.mode,
+      modelVersion: params.modelVersion,
+      processingVersion: params.processingVersion,
+      sampleRate: params.sampleRate ?? item.sampleRate,
+      channelCount: (params.channelCount ?? item.channelCount) as 2,
+      totalSamples: params.totalSamples ?? item.totalSamples,
+      artifactChecksums: params.expectedChecksums,
+      derivedFrom: params.expectedDerivedFrom ?? null,
+    };
+    const compat = isArtifactRefStrictlyCompatible(
+      expectedRef,
+      {
+        sourceAudioHash: item.sourceAudioHash,
+        separationMode: item.requestedMode,
+        modelVersion: item.modelVersion,
+        processingVersion: item.processingVersion,
+        sampleRate: item.sampleRate,
+        channelCount: item.channelCount,
+        totalSamples: item.totalSamples,
+        revisionId: item.revisionId,
+        checksumsByRole: item.checksumsByRole,
+        derivedFrom: item.derivedFrom ?? null,
+      },
+      { requireExactRevision: requireExact },
+    );
+    if (compat.status !== "incompatible") {
+      candidates.push({ record: item, compatibility: compat });
+    }
+  }
+  return candidates;
+}
+
+export async function findImportedStemStrict(params: {
+  sourceAudioHash: string;
+  mode: StemSeparationMode;
+  modelVersion: string;
+  processingVersion: string;
+  sampleRate?: number;
+  channelCount?: number;
+  totalSamples?: number;
+  expectedRevisionId?: string;
+  expectedChecksums?: Record<string, string>;
+  expectedDerivedFrom?: ProjectSongDerivedFromRef | null;
+}): Promise<ImportedStemRecord | null> {
+  const candidates = await findImportedStemCandidatesBySpec(params);
+  return candidates.find((c) => c.compatibility.status === "verified")?.record ?? null;
+}
+
+export async function updateImportedStemChecksums(
+  importId: string,
+  checksumsByRole: Record<string, string>,
+): Promise<{ updated: boolean; record: ImportedStemRecord | null; errorMessage?: string }> {
+  if (!importId || Object.keys(checksumsByRole).length === 0) {
+    return { updated: false, record: null, errorMessage: "缺少 importId 或 checksums。" };
+  }
+  try {
+    return await withIdbTransaction("importedStems", "readwrite", async (tx) => {
+      const store = tx.objectStore("importedStems");
+      const existing = (await idbRequestPromise(store.get(importId))) as
+        | ImportedStemRecord
+        | undefined;
+      if (!existing) {
+        return { updated: false, record: null, errorMessage: "找不到目標 ImportedStem 紀錄。" };
+      }
+      const nextRecord: ImportedStemRecord = {
+        ...existing,
+        checksumsByRole: {
+          ...(existing.checksumsByRole ?? {}),
+          ...checksumsByRole,
+        },
+        updatedAt: Date.now(),
+      };
+      await idbRequestPromise(store.put(nextRecord));
+      return { updated: true, record: nextRecord };
+    });
+  } catch (err) {
+    return {
+      updated: false,
+      record: null,
+      errorMessage: err instanceof Error ? err.message : "寫入 ImportedStem Checksum 失敗。",
+    };
+  }
 }
 
 export async function saveImportedStemsAtomically(params: {

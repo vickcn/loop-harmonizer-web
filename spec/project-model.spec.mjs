@@ -9,6 +9,7 @@ import {
   computeProjectBackupSummary,
   createEmptyProject,
   isArtifactRefStrictlyCompatible,
+  normalizeArtifactChecksum,
   projectEntryToBandSong,
   validateProjectDocument,
 } from "../lib/projects/projectModel.ts";
@@ -101,6 +102,12 @@ test("Project mix settings are isolated per project and per duplicate entry with
 });
 
 test("isArtifactRefStrictlyCompatible validates all 8 dimensions, revision, checksums, and 2-stem lineage", () => {
+  const fullFourChecksums = {
+    vocals: "sha256:" + "1".repeat(64),
+    drums: "sha256:" + "2".repeat(64),
+    bass: "sha256:" + "3".repeat(64),
+    other: "sha256:" + "4".repeat(64),
+  };
   const expected = {
     manifestFileId: "man-1",
     revisionId: "rev-001",
@@ -111,7 +118,7 @@ test("isArtifactRefStrictlyCompatible validates all 8 dimensions, revision, chec
     sampleRate: 44100,
     channelCount: 2,
     totalSamples: 882000,
-    artifactChecksums: { vocals: "sum-v-1" },
+    artifactChecksums: fullFourChecksums,
   };
 
   assert.equal(
@@ -124,9 +131,9 @@ test("isArtifactRefStrictlyCompatible validates all 8 dimensions, revision, chec
       channelCount: 2,
       totalSamples: 882000,
       revisionId: "rev-001",
-      checksumsByRole: { vocals: "sum-v-1" },
-    }).compatible,
-    true,
+      checksumsByRole: fullFourChecksums,
+    }).status,
+    "verified",
   );
 
   // 任一版本／規格／Checksum／Revision 欄位不符皆拒絕重用
@@ -140,8 +147,9 @@ test("isArtifactRefStrictlyCompatible validates all 8 dimensions, revision, chec
       channelCount: 2,
       totalSamples: 882000,
       revisionId: "rev-001",
-    }).compatible,
-    false,
+      checksumsByRole: fullFourChecksums,
+    }).status,
+    "incompatible",
   );
 
   assert.equal(
@@ -154,8 +162,9 @@ test("isArtifactRefStrictlyCompatible validates all 8 dimensions, revision, chec
       channelCount: 2,
       totalSamples: 882000,
       revisionId: "rev-001",
-    }).compatible,
-    false,
+      checksumsByRole: fullFourChecksums,
+    }).status,
+    "incompatible",
   );
 
   assert.equal(
@@ -168,8 +177,9 @@ test("isArtifactRefStrictlyCompatible validates all 8 dimensions, revision, chec
       channelCount: 2,
       totalSamples: 882000,
       revisionId: "rev-001",
-    }).compatible,
-    false,
+      checksumsByRole: fullFourChecksums,
+    }).status,
+    "incompatible",
   );
 
   assert.equal(
@@ -182,8 +192,9 @@ test("isArtifactRefStrictlyCompatible validates all 8 dimensions, revision, chec
       channelCount: 2,
       totalSamples: 882000,
       revisionId: "rev-002",
-    }).compatible,
-    false,
+      checksumsByRole: fullFourChecksums,
+    }).status,
+    "incompatible",
   );
 
   assert.equal(
@@ -196,16 +207,21 @@ test("isArtifactRefStrictlyCompatible validates all 8 dimensions, revision, chec
       channelCount: 2,
       totalSamples: 882000,
       revisionId: "rev-001",
-      checksumsByRole: { vocals: "sum-corrupt" },
-    }).compatible,
-    false,
+      checksumsByRole: { ...fullFourChecksums, vocals: "sha256:" + "9".repeat(64) },
+    }).status,
+    "incompatible",
   );
 
-  // 2 Stem 從 4 Stem 派生時必須驗證 derivedFrom 來源版本，不得混用不同版本人聲與伴奏
+  // 2 Stem 從 4 Stem 派生時必須驗證 derivedFrom 來源版本與完整 Checksum，不得混用不同版本音軌
+  const twoStemChecksums = {
+    vocals: "sha256:" + "1".repeat(64),
+    instrumental: "sha256:" + "5".repeat(64),
+  };
   const twoStemDerivedExpected = {
     ...expected,
     separationMode: "two_stem",
     revisionId: "rev-2stem-1",
+    artifactChecksums: twoStemChecksums,
     derivedFrom: {
       sourceMode: "four_stem",
       sourceRevisionId: "rev-4stem-A",
@@ -223,8 +239,9 @@ test("isArtifactRefStrictlyCompatible validates all 8 dimensions, revision, chec
       channelCount: 2,
       totalSamples: 882000,
       revisionId: "rev-4stem-A",
-    }).compatible,
-    true,
+      checksumsByRole: twoStemChecksums,
+    }).status,
+    "verified",
   );
   assert.equal(
     isArtifactRefStrictlyCompatible(twoStemDerivedExpected, {
@@ -242,9 +259,159 @@ test("isArtifactRefStrictlyCompatible validates all 8 dimensions, revision, chec
         modelVersion: "browser-demucs-v1",
         processingVersion: "loop-harmonizer-stems-v2",
       },
-    }).compatible,
-    false,
+      checksumsByRole: twoStemChecksums,
+    }).status,
+    "incompatible",
   );
+});
+
+test("isArtifactRefStrictlyCompatible distinguishes verified, insufficient_evidence, incompatible and preserves local-* legacy path", () => {
+  const rawHex = "A".repeat(64);
+  assert.equal(normalizeArtifactChecksum(rawHex), "sha256:" + "a".repeat(64));
+
+  const fullFour = {
+    vocals: "sha256:" + "a".repeat(64),
+    drums: "sha256:" + "b".repeat(64),
+    bass: "sha256:" + "c".repeat(64),
+    other: "sha256:" + "d".repeat(64),
+  };
+  const officialExpected = {
+    manifestFileId: "man-strict",
+    revisionId: "rev-official-1",
+    sourceAudioHash: "s".repeat(64),
+    separationMode: "four_stem",
+    modelVersion: "browser-demucs-v1",
+    processingVersion: "loop-harmonizer-stems-v2",
+    sampleRate: 44100,
+    channelCount: 2,
+    totalSamples: 441000,
+    artifactChecksums: fullFour,
+  };
+
+  // 1) expected.artifactChecksums 存在，candidate 缺少 checksumsByRole -> insufficient_evidence
+  const missingObj = isArtifactRefStrictlyCompatible(officialExpected, {
+    sourceAudioHash: officialExpected.sourceAudioHash,
+    separationMode: "four_stem",
+    modelVersion: officialExpected.modelVersion,
+    processingVersion: officialExpected.processingVersion,
+    sampleRate: 44100,
+    channelCount: 2,
+    totalSamples: 441000,
+    revisionId: "rev-official-1",
+  });
+  assert.equal(missingObj.compatible, false);
+  assert.equal(missingObj.status, "insufficient_evidence");
+  assert.equal(missingObj.canAttemptRecomputeVerification, true);
+
+  // 2) candidate 缺少任一必要角色 (bass/other) -> 不得回傳 compatible=true
+  const missingRole = isArtifactRefStrictlyCompatible(officialExpected, {
+    sourceAudioHash: officialExpected.sourceAudioHash,
+    separationMode: "four_stem",
+    modelVersion: officialExpected.modelVersion,
+    processingVersion: officialExpected.processingVersion,
+    sampleRate: 44100,
+    channelCount: 2,
+    totalSamples: 441000,
+    revisionId: "rev-official-1",
+    checksumsByRole: { vocals: fullFour.vocals, drums: fullFour.drums },
+  });
+  assert.equal(missingRole.compatible, false);
+  assert.equal(missingRole.status, "insufficient_evidence");
+  assert.ok(missingRole.missingChecksumRoles?.includes("bass"));
+
+  // 3) 缺少某些角色同時另一個角色 checksum 不一致 -> 優先回報 incompatible
+  const corruptAndMissing = isArtifactRefStrictlyCompatible(officialExpected, {
+    sourceAudioHash: officialExpected.sourceAudioHash,
+    separationMode: "four_stem",
+    modelVersion: officialExpected.modelVersion,
+    processingVersion: officialExpected.processingVersion,
+    sampleRate: 44100,
+    channelCount: 2,
+    totalSamples: 441000,
+    revisionId: "rev-official-1",
+    checksumsByRole: { vocals: "sha256:" + "f".repeat(64) },
+  });
+  assert.equal(corruptAndMissing.compatible, false);
+  assert.equal(corruptAndMissing.status, "incompatible");
+
+  // 4) 純 hex 大小寫正規化比對通過 -> verified
+  const normalizedPass = isArtifactRefStrictlyCompatible(officialExpected, {
+    sourceAudioHash: officialExpected.sourceAudioHash,
+    separationMode: "four_stem",
+    modelVersion: officialExpected.modelVersion,
+    processingVersion: officialExpected.processingVersion,
+    sampleRate: 44100,
+    channelCount: 2,
+    totalSamples: 441000,
+    revisionId: "rev-official-1",
+    checksumsByRole: {
+      vocals: rawHex,
+      drums: "b".repeat(64),
+      bass: "c".repeat(64),
+      other: "d".repeat(64),
+    },
+  });
+  assert.equal(normalizedPass.compatible, true);
+  assert.equal(normalizedPass.status, "verified");
+
+  // 5) 2-stem 同為 two_stem 但官方來源缺少 derivedFrom.sourceRevisionId（且無完整 checksum）-> insufficient_evidence
+  const twoStemNoDerivedEvidence = isArtifactRefStrictlyCompatible(
+    {
+      ...officialExpected,
+      separationMode: "two_stem",
+      revisionId: "rev-2stem-official",
+      artifactChecksums: undefined,
+      derivedFrom: {
+        sourceMode: "four_stem",
+        sourceRevisionId: "rev-4stem-A",
+        modelVersion: "browser-demucs-v1",
+        processingVersion: "loop-harmonizer-stems-v2",
+      },
+    },
+    {
+      sourceAudioHash: officialExpected.sourceAudioHash,
+      separationMode: "two_stem",
+      modelVersion: officialExpected.modelVersion,
+      processingVersion: officialExpected.processingVersion,
+      sampleRate: 44100,
+      channelCount: 2,
+      totalSamples: 441000,
+      revisionId: "rev-2stem-official",
+      checksumsByRole: {
+        vocals: "sha256:" + "1".repeat(64),
+        instrumental: "sha256:" + "2".repeat(64),
+      },
+      derivedFrom: null,
+    },
+  );
+  assert.equal(twoStemNoDerivedEvidence.compatible, false);
+  assert.equal(twoStemNoDerivedEvidence.status, "insufficient_evidence");
+
+  // 6) 舊版 local-*本機版本保留無 checksums 的相容路徑 -> verified
+  const legacyLocal = isArtifactRefStrictlyCompatible(
+    {
+      revisionId: "local-task_123",
+      sourceAudioHash: officialExpected.sourceAudioHash,
+      separationMode: "four_stem",
+      modelVersion: officialExpected.modelVersion,
+      processingVersion: officialExpected.processingVersion,
+      sampleRate: 44100,
+      channelCount: 2,
+      totalSamples: 441000,
+    },
+    {
+      sourceAudioHash: officialExpected.sourceAudioHash,
+      separationMode: "four_stem",
+      modelVersion: officialExpected.modelVersion,
+      processingVersion: officialExpected.processingVersion,
+      sampleRate: 44100,
+      channelCount: 2,
+      totalSamples: 441000,
+      revisionId: "local-task_123",
+    },
+  );
+  assert.equal(legacyLocal.compatible, true);
+  assert.equal(legacyLocal.status, "verified");
 });
 
 test("Backup status accurately distinguishes partial backup vs cross-device ready and validates ownerAccountId", () => {

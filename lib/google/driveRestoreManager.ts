@@ -1,12 +1,16 @@
 import {
+  type WavExportFormat,
   computeSha256HexSync,
+  computeWavSourceSha256,
+  createChunkedStemWavSource,
   decodeWavSampleRange,
   parseWavHeader,
+  validateChunksForExport,
 } from "../audio/chunkedWavExporter.ts";
 import type { BandSong } from "../band/bandTypes.ts";
 import type { DeviceCapabilitiesSnapshot } from "../band/resourceGuard.ts";
 import { clampBpmValue, createBandSong, sanitizeSongSavedRates } from "../band/songModel.ts";
-import type { FourStemPcm } from "../separation/stemTypes.ts";
+import type { FourStemPcm, StemSeparationMode } from "../separation/stemTypes.ts";
 import { validateAndPrepareResume } from "../separation/separationResumeController.ts";
 import { isValidationCompleted } from "../separation/separationStateRecovery.ts";
 import { DEMUCS_MODEL_VERSION, SEPARATION_PROCESSING_VERSION, createSeparationCacheKey } from "../storage/cacheKeys.ts";
@@ -14,16 +18,26 @@ import {
   type ImportedStemRecord,
   addImportedStemReference,
   createImportedStemId,
-  findImportedStemStrict,
+  findImportedStemCandidatesBySpec,
   saveImportedStemsAtomically,
+  updateImportedStemChecksums,
   validateImportedStemIntegrity,
 } from "../storage/importedStemStore.ts";
-import { isArtifactRefStrictlyCompatible } from "../projects/projectModel.ts";
-import type { ProjectSongArtifactRef, ProjectSongSettings } from "../projects/projectTypes.ts";
+import {
+  isArtifactRefStrictlyCompatible,
+  normalizeArtifactChecksum,
+} from "../projects/projectModel.ts";
+import type {
+  ArtifactCompatibilityStatus,
+  ProjectSongArtifactRef,
+  ProjectSongDerivedFromRef,
+  ProjectSongSettings,
+} from "../projects/projectTypes.ts";
 import { hashSourceAudio } from "../storage/separationCache.ts";
 import {
   addCheckpointReference,
   findCompletedCheckpointBySourceAudioHash,
+  saveCheckpointRevisionChecksums,
 } from "../storage/separationCheckpointStore.ts";
 import {
   DEMUCS_STRIDE_SAMPLES,
@@ -171,6 +185,12 @@ export async function listDriveLibraryEntries(params: {
         continue;
       }
 
+      const checksums: Record<string, string> = {};
+      for (const role of requiredStemRolesForMode(manifest.separation.mode)) {
+        const cs = manifest.artifacts[role]?.checksum;
+        if (cs) checksums[role] = cs;
+      }
+
       const localCp = await findCompletedCheckpointBySourceAudioHash(
         manifest.source.sourceAudioHash,
         {
@@ -193,6 +213,8 @@ export async function listDriveLibraryEntries(params: {
           sampleRate: manifest.separation.sampleRate,
           channelCount: manifest.separation.channelCount,
           totalSamples: manifest.separation.totalSamples,
+          pcmFormat: manifest.separation.format,
+          artifactChecksums: Object.keys(checksums).length > 0 ? checksums : undefined,
           derivedFrom: manifest.separation.derivedFrom ?? null,
         };
         const compat = isArtifactRefStrictlyCompatible(
@@ -206,10 +228,11 @@ export async function listDriveLibraryEntries(params: {
             channelCount: 2,
             totalSamples: localCp.totalSamples,
             exportedRevisionIds: localCp.exportedRevisionIds,
+            checksumsByRole: localCp.exportedChecksumsByRevision?.[manifest.revisionId],
           },
           { requireExactRevision: true },
         );
-        if (compat.compatible) {
+        if (compat.status === "verified") {
           const cpCheck = await validateAndPrepareResume(localCp.taskId, {
             sourceAudioAvailable: true,
             sourceAudioHash: manifest.source.sourceAudioHash,
@@ -224,12 +247,7 @@ export async function listDriveLibraryEntries(params: {
       }
 
       if (!localAlreadyAvailable) {
-        const checksums: Record<string, string> = {};
-        for (const role of requiredStemRolesForMode(manifest.separation.mode)) {
-          const cs = manifest.artifacts[role]?.checksum;
-          if (cs) checksums[role] = cs;
-        }
-        const localImp = await findImportedStemStrict({
+        const candidates = await findImportedStemCandidatesBySpec({
           sourceAudioHash: manifest.source.sourceAudioHash,
           mode: manifest.separation.mode,
           modelVersion: manifest.separation.modelVersion,
@@ -240,9 +258,10 @@ export async function listDriveLibraryEntries(params: {
           expectedRevisionId: manifest.revisionId,
           expectedChecksums: checksums,
           expectedDerivedFrom: manifest.separation.derivedFrom ?? null,
-        }).catch(() => null);
-        if (localImp) {
-          const impCheck = await validateImportedStemIntegrity(localImp.importId).catch(() => ({
+        }).catch(() => []);
+        const verifiedCand = candidates.find((c) => c.compatibility.status === "verified");
+        if (verifiedCand) {
+          const impCheck = await validateImportedStemIntegrity(verifiedCand.record.importId).catch(() => ({
             valid: false,
           }));
           if (impCheck.valid) {
@@ -449,6 +468,132 @@ export async function fetchDriveManifestByFileId(params: {
 }
 
 /**
+ * 針對缺少 Checksum 證明的舊版本地 Chunked 資料（Checkpoint / ImportedStem），
+ * 以串流方式逐軌重算 WAV SHA-256（不載入整首音訊至記憶體）並做嚴格驗證：
+ * - 驗證通過才回寫並允許重用；
+ * - 不一致或片段缺失則拒絕重用，交由呼叫端自雲端重新下載權威版本。
+ */
+export async function recomputeAndVerifyLocalStemChecksums(params: {
+  taskId: string;
+  sourceType: "demucs_checkpoint" | "imported_stem";
+  stemLayout: "four_stem" | "two_stem_direct";
+  pcmFormat: WavExportFormat;
+  totalChunks?: number;
+  strideSamples: number;
+  expectedRef: ProjectSongArtifactRef;
+  candidateMetadata: {
+    sourceAudioHash: string;
+    separationMode: StemSeparationMode;
+    modelVersion: string;
+    processingVersion: string;
+    sampleRate: number;
+    channelCount: number;
+    totalSamples: number;
+    revisionId?: string;
+    exportedRevisionIds?: readonly string[];
+    derivedFrom?: ProjectSongDerivedFromRef | null;
+  };
+  existingChecksums?: Record<string, string>;
+  requireExactRevision?: boolean;
+  signal?: AbortSignal;
+}): Promise<{
+  verified: boolean;
+  status: ArtifactCompatibilityStatus;
+  checksumsByRole: Record<string, string>;
+  reason?: string;
+}> {
+  try {
+    if (params.sourceType === "imported_stem") {
+      const intact = await validateImportedStemIntegrity(params.taskId);
+      if (!intact.valid) {
+        return {
+          verified: false,
+          status: "incompatible",
+          checksumsByRole: {},
+          reason: intact.reason ?? "本機匯入分軌片段不完整。",
+        };
+      }
+    } else if (params.totalChunks && params.totalChunks > 0) {
+      await validateChunksForExport({
+        taskId: params.taskId,
+        totalSamples: params.candidateMetadata.totalSamples,
+        totalChunks: params.totalChunks,
+        strideSamples: params.strideSamples,
+      });
+    }
+
+    const roles = requiredStemRolesForMode(params.expectedRef.separationMode);
+    const recomputed: Record<string, string> = {};
+    for (const role of roles) {
+      if (params.signal?.aborted) {
+        throw new DOMException("已取消分軌 Checksum 重新驗證。", "AbortError");
+      }
+      const wavSource = createChunkedStemWavSource({
+        taskId: params.taskId,
+        role,
+        totalSamples: params.candidateMetadata.totalSamples,
+        sampleRate: params.candidateMetadata.sampleRate,
+        strideSamples: params.strideSamples,
+        format: params.pcmFormat,
+        stemLayout: params.stemLayout,
+      });
+      const hex = await computeWavSourceSha256(wavSource, params.signal);
+      recomputed[role] = `sha256:${hex.toLowerCase()}`;
+    }
+
+    const compat = isArtifactRefStrictlyCompatible(
+      params.expectedRef,
+      {
+        ...params.candidateMetadata,
+        checksumsByRole: recomputed,
+      },
+      { requireExactRevision: params.requireExactRevision },
+    );
+
+    if (compat.status !== "verified") {
+      return {
+        verified: false,
+        status: compat.status,
+        checksumsByRole: recomputed,
+        reason: compat.reason,
+      };
+    }
+
+    if (params.sourceType === "imported_stem") {
+      await updateImportedStemChecksums(params.taskId, {
+        ...(params.existingChecksums ?? {}),
+        ...recomputed,
+      });
+    } else if (
+      params.expectedRef.revisionId &&
+      !params.expectedRef.revisionId.startsWith("local-")
+    ) {
+      await saveCheckpointRevisionChecksums(
+        params.taskId,
+        params.expectedRef.revisionId,
+        recomputed,
+      );
+    }
+
+    return {
+      verified: true,
+      status: "verified",
+      checksumsByRole: recomputed,
+    };
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw err;
+    }
+    return {
+      verified: false,
+      status: "incompatible",
+      checksumsByRole: {},
+      reason: err instanceof Error ? err.message : "重新驗證本機分軌 Checksum 失敗。",
+    };
+  }
+}
+
+/**
  * 跨裝置恢復單首雲端歌曲成果：
  * 1. 驗證帳戶、Manifest Schema 與版本相容性；
  * 2. 若本機已有嚴格符合版本與規格的完成分軌，零重複下載；
@@ -597,10 +742,11 @@ export async function restoreSongFromDrive(params: {
         channelCount: 2,
         totalSamples: existingCp.totalSamples,
         exportedRevisionIds: existingCp.exportedRevisionIds,
+        checksumsByRole: existingCp.exportedChecksumsByRevision?.[manifest.revisionId],
       },
       { requireExactRevision },
     );
-    if (cpCompat.compatible) {
+    if (cpCompat.status === "verified") {
       const cpCheck = await validateAndPrepareResume(existingCp.taskId, {
         sourceAudioAvailable: true,
         sourceAudioHash: manifest.source.sourceAudioHash,
@@ -617,11 +763,54 @@ export async function restoreSongFromDrive(params: {
           source: "driveRestoreManager.reuseLocalCheckpoint",
         }).catch(() => undefined);
       }
+    } else if (
+      cpCompat.status === "insufficient_evidence" &&
+      cpCompat.canAttemptRecomputeVerification
+    ) {
+      const cpCheck = await validateAndPrepareResume(existingCp.taskId, {
+        sourceAudioAvailable: true,
+        sourceAudioHash: manifest.source.sourceAudioHash,
+        totalSamples: existingCp.totalSamples,
+        sampleRate: existingCp.sampleRate,
+      }).catch(() => null);
+      if (isValidationCompleted(cpCheck)) {
+        const recomputeRes = await recomputeAndVerifyLocalStemChecksums({
+          taskId: existingCp.taskId,
+          sourceType: "demucs_checkpoint",
+          stemLayout: "four_stem",
+          pcmFormat: manifest.separation.format,
+          totalChunks: existingCp.totalChunks,
+          strideSamples: existingCp.strideSamples,
+          expectedRef: expectedArtifactRef,
+          candidateMetadata: {
+            sourceAudioHash: existingCp.sourceAudioHash,
+            separationMode: existingCp.requestedMode,
+            modelVersion: existingCp.modelVersion,
+            processingVersion: existingCp.processingVersion,
+            sampleRate: existingCp.sampleRate,
+            channelCount: 2,
+            totalSamples: existingCp.totalSamples,
+            exportedRevisionIds: existingCp.exportedRevisionIds,
+          },
+          requireExactRevision,
+          signal: params.signal,
+        });
+        if (recomputeRes.verified) {
+          reusedCheckpointTaskId = existingCp.taskId;
+          reusedLocalStems = true;
+          await addCheckpointReference({
+            taskId: existingCp.taskId,
+            songId,
+            mode: manifest.separation.mode,
+            source: "driveRestoreManager.recomputeVerifiedCheckpoint",
+          }).catch(() => undefined);
+        }
+      }
     }
   }
 
   if (!reusedLocalStems) {
-    const existingImp = await findImportedStemStrict({
+    const candidates = await findImportedStemCandidatesBySpec({
       sourceAudioHash: manifest.source.sourceAudioHash,
       mode: manifest.separation.mode,
       modelVersion: manifest.separation.modelVersion,
@@ -632,18 +821,57 @@ export async function restoreSongFromDrive(params: {
       expectedRevisionId: requireExactRevision ? manifest.revisionId : undefined,
       expectedChecksums,
       expectedDerivedFrom: manifest.separation.derivedFrom ?? null,
-    }).catch(() => null);
+    }).catch(() => []);
 
-    if (existingImp) {
-      const impCheck = await validateImportedStemIntegrity(existingImp.importId).catch(() => ({
+    for (const cand of candidates) {
+      const impCheck = await validateImportedStemIntegrity(cand.record.importId).catch(() => ({
         valid: false,
         record: null,
       }));
-      if (impCheck.valid && impCheck.record) {
+      if (!impCheck.valid || !impCheck.record) continue;
+
+      if (cand.compatibility.status === "verified") {
         importedRecord =
-          (await addImportedStemReference(existingImp.importId, songId).catch(() => null)) ??
+          (await addImportedStemReference(cand.record.importId, songId).catch(() => null)) ??
           impCheck.record;
         reusedLocalStems = true;
+        break;
+      }
+
+      if (
+        cand.compatibility.status === "insufficient_evidence" &&
+        cand.compatibility.canAttemptRecomputeVerification &&
+        cand.record.pcmFormat === manifest.separation.format
+      ) {
+        const recomputeRes = await recomputeAndVerifyLocalStemChecksums({
+          taskId: cand.record.importId,
+          sourceType: "imported_stem",
+          stemLayout: cand.record.stemLayout,
+          pcmFormat: cand.record.pcmFormat,
+          strideSamples: cand.record.strideSamples,
+          expectedRef: expectedArtifactRef,
+          candidateMetadata: {
+            sourceAudioHash: cand.record.sourceAudioHash,
+            separationMode: cand.record.requestedMode,
+            modelVersion: cand.record.modelVersion,
+            processingVersion: cand.record.processingVersion,
+            sampleRate: cand.record.sampleRate,
+            channelCount: cand.record.channelCount,
+            totalSamples: cand.record.totalSamples,
+            revisionId: cand.record.revisionId,
+            derivedFrom: cand.record.derivedFrom ?? null,
+          },
+          existingChecksums: cand.record.checksumsByRole,
+          requireExactRevision,
+          signal: params.signal,
+        });
+        if (recomputeRes.verified) {
+          importedRecord =
+            (await addImportedStemReference(cand.record.importId, songId).catch(() => null)) ??
+            impCheck.record;
+          reusedLocalStems = true;
+          break;
+        }
       }
     }
   }
@@ -769,17 +997,16 @@ export async function restoreSongFromDrive(params: {
         );
       }
 
-      if (artifact.checksum?.startsWith("sha256:")) {
-        const expectedHex = artifact.checksum.slice("sha256:".length).toLowerCase();
-        const actualHex = computeSha256HexSync(new Uint8Array(wavBuffer)).toLowerCase();
-        if (actualHex !== expectedHex) {
-          wavBuffer = null;
-          throw new Error(
-            `分軌「${artifact.fileName}」Checksum 驗證失敗，資料已損壞，拒絕恢復。`,
-          );
-        }
-        checksumsByRole[role] = artifact.checksum;
+      const actualHex = computeSha256HexSync(new Uint8Array(wavBuffer)).toLowerCase();
+      const normalizedActual = `sha256:${actualHex}`;
+      const normalizedExpected = normalizeArtifactChecksum(artifact.checksum);
+      if (normalizedExpected && normalizedActual !== normalizedExpected) {
+        wavBuffer = null;
+        throw new Error(
+          `分軌「${artifact.fileName}」Checksum 驗證失敗，資料已損壞，拒絕恢復。`,
+        );
       }
+      checksumsByRole[role] = normalizedActual;
 
       const header = parseWavHeader(wavBuffer);
       if (

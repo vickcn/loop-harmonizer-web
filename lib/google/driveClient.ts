@@ -550,6 +550,47 @@ export async function downloadDriveFileBlob(
   return { file, loadedBytes: loaded };
 }
 
+export type PaginatedDriveIncompleteReason =
+  | "duplicate_page_token"
+  | "page_limit_exceeded"
+  | "item_limit_exceeded"
+  | "page_fetch_error";
+
+export interface PaginatedDriveFilesResult {
+  files: DriveRawFileResource[];
+  complete: boolean;
+  incompleteReason?: PaginatedDriveIncompleteReason;
+  errorMessage?: string;
+  pagesFetched: number;
+  truncated: boolean;
+}
+
+export const DEFAULT_DRIVE_LIST_PAGE_SIZE = 100;
+export const DEFAULT_DRIVE_LIST_MAX_PAGES = 50;
+export const DEFAULT_DRIVE_LIST_MAX_ITEMS = 5000;
+
+async function waitWithAbortSignal(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    throw new DOMException("已取消 Google Drive 清單查詢。", "AbortError");
+  }
+  if (ms <= 0) return;
+  await new Promise<void>((resolve, reject) => {
+    const timer = globalThis.setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      globalThis.clearTimeout(timer);
+      cleanup();
+      reject(new DOMException("已取消 Google Drive 清單查詢。", "AbortError"));
+    };
+    const cleanup = () => {
+      signal?.removeEventListener("abort", onAbort);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 export async function listDriveFiles(params: {
   accessToken: string;
   q: string;
@@ -560,6 +601,9 @@ export async function listDriveFiles(params: {
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
 }): Promise<{ files: DriveRawFileResource[]; nextPageToken?: string }> {
+  if (params.signal?.aborted) {
+    throw new DOMException("已取消 Google Drive 清單查詢。", "AbortError");
+  }
   const fetchFn = params.fetchImpl ?? globalThis.fetch;
   const search = new URLSearchParams({
     q: params.q,
@@ -595,6 +639,147 @@ export async function listDriveFiles(params: {
     files: Array.isArray(data.files) ? data.files : [],
     nextPageToken: data.nextPageToken,
   };
+}
+
+/**
+ * 完整追蹤 Google Drive nextPageToken 的分頁查詢：
+ * - 直到 nextPageToken 為空才標記 complete=true；
+ * - 內建重複 pageToken 防護、頁數與總筆數上限、有限重試（僅限 retryable）與 AbortSignal 即時中止；
+ * - 超過限制或遭遇重複 token 時標示 complete=false 並明確記錄原因，絕不誤判為完整清單。
+ */
+export async function listDriveFilesPaginated(params: {
+  accessToken: string;
+  q: string;
+  fields?: string;
+  pageSize?: number;
+  orderBy?: string;
+  maxPages?: number;
+  maxItems?: number;
+  maxRetriesPerPage?: number;
+  retryDelayMs?: readonly number[];
+  throwOnError?: boolean;
+  signal?: AbortSignal;
+  fetchImpl?: typeof fetch;
+}): Promise<PaginatedDriveFilesResult> {
+  const pageSize = Math.max(1, Math.min(1000, params.pageSize ?? DEFAULT_DRIVE_LIST_PAGE_SIZE));
+  const maxPages = Math.max(1, params.maxPages ?? DEFAULT_DRIVE_LIST_MAX_PAGES);
+  const maxItems = Math.max(1, params.maxItems ?? DEFAULT_DRIVE_LIST_MAX_ITEMS);
+  const maxRetriesPerPage = Math.max(0, params.maxRetriesPerPage ?? 2);
+  const retryDelayMs = params.retryDelayMs ?? [150, 400];
+  const throwOnError = params.throwOnError ?? true;
+
+  const filesById = new Map<string, DriveRawFileResource>();
+  const extraFiles: DriveRawFileResource[] = [];
+  const seenTokens = new Set<string>();
+
+  let pageToken: string | undefined;
+  let pagesFetched = 0;
+
+  while (true) {
+    if (params.signal?.aborted) {
+      throw new DOMException("已取消 Google Drive 清單查詢。", "AbortError");
+    }
+
+    let pageRes: { files: DriveRawFileResource[]; nextPageToken?: string } | null = null;
+    let attempt = 0;
+
+    while (true) {
+      if (params.signal?.aborted) {
+        throw new DOMException("已取消 Google Drive 清單查詢。", "AbortError");
+      }
+      try {
+        pageRes = await listDriveFiles({
+          accessToken: params.accessToken,
+          q: params.q,
+          fields: params.fields,
+          pageSize,
+          pageToken,
+          orderBy: params.orderBy,
+          signal: params.signal,
+          fetchImpl: params.fetchImpl,
+        });
+        break;
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") {
+          throw err;
+        }
+        const retryable = err instanceof DriveApiError && err.retryable;
+        if (retryable && attempt < maxRetriesPerPage) {
+          const delay = retryDelayMs[Math.min(attempt, retryDelayMs.length - 1)] ?? 200;
+          attempt += 1;
+          await waitWithAbortSignal(delay, params.signal);
+          continue;
+        }
+        if (throwOnError) {
+          throw err;
+        }
+        return {
+          files: [...Array.from(filesById.values()), ...extraFiles],
+          complete: false,
+          incompleteReason: "page_fetch_error",
+          errorMessage: err instanceof Error ? err.message : "Google Drive 分頁讀取失敗。",
+          pagesFetched,
+          truncated: true,
+        };
+      }
+    }
+
+    pagesFetched += 1;
+    for (const f of pageRes.files) {
+      if (filesById.size + extraFiles.length >= maxItems) {
+        return {
+          files: [...Array.from(filesById.values()), ...extraFiles],
+          complete: false,
+          incompleteReason: "item_limit_exceeded",
+          errorMessage: `Google Drive 項目超過單次查詢上限（${maxItems} 筆），清單不完整。`,
+          pagesFetched,
+          truncated: true,
+        };
+      }
+      if (f.id) {
+        if (!filesById.has(f.id)) {
+          filesById.set(f.id, f);
+        }
+      } else {
+        extraFiles.push(f);
+      }
+    }
+
+    const nextToken = pageRes.nextPageToken?.trim();
+    if (!nextToken) {
+      return {
+        files: [...Array.from(filesById.values()), ...extraFiles],
+        complete: true,
+        pagesFetched,
+        truncated: false,
+      };
+    }
+
+    if (nextToken === pageToken || seenTokens.has(nextToken)) {
+      return {
+        files: [...Array.from(filesById.values()), ...extraFiles],
+        complete: false,
+        incompleteReason: "duplicate_page_token",
+        errorMessage: "Google Drive 回傳重複的分頁 Token（nextPageToken 迴圈），清單不完整。",
+        pagesFetched,
+        truncated: true,
+      };
+    }
+
+    if (pagesFetched >= maxPages) {
+      return {
+        files: [...Array.from(filesById.values()), ...extraFiles],
+        complete: false,
+        incompleteReason: "page_limit_exceeded",
+        errorMessage: `Google Drive 分頁數超過上限（${maxPages} 頁），清單尚未讀取完畢。`,
+        pagesFetched,
+        truncated: true,
+      };
+    }
+
+    seenTokens.add(nextToken);
+    pageToken = nextToken;
+  }
 }
 
 export async function createDriveFolder(params: {

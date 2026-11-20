@@ -11,6 +11,7 @@ import {
   type DriveLibraryEntry,
   type DriveRestoreProgress,
   fetchDriveManifestByFileId,
+  recomputeAndVerifyLocalStemChecksums,
   restoreSongFromDrive,
 } from "../google/driveRestoreManager.ts";
 import { validateAndPrepareResume } from "../separation/separationResumeController.ts";
@@ -18,7 +19,7 @@ import { isValidationCompleted } from "../separation/separationStateRecovery.ts"
 import type { ImportedStemRecord } from "../storage/importedStemStore.ts";
 import {
   addImportedStemReference,
-  findImportedStemStrict,
+  findImportedStemCandidatesBySpec,
   validateImportedStemIntegrity,
 } from "../storage/importedStemStore.ts";
 import { idbPut } from "../storage/indexedDb.ts";
@@ -26,11 +27,13 @@ import { hashSourceAudio } from "../storage/separationCache.ts";
 import {
   addCheckpointReference,
   findCompletedCheckpointBySourceAudioHash,
+  type SeparationCheckpoint,
 } from "../storage/separationCheckpointStore.ts";
 import { DEMUCS_STRIDE_SAMPLES } from "../storage/separationChunkStore.ts";
 import { getPersistedAudioBlobByKey } from "../storage/songSessionStore.ts";
 import { isArtifactRefStrictlyCompatible, projectEntryToBandSong } from "./projectModel.ts";
 import type {
+  ArtifactCompatibilityStatus,
   BandProject,
   ProjectSongAvailabilityState,
   ProjectSongEntry,
@@ -41,6 +44,9 @@ export interface EvaluatedProjectSongAvailability {
   availabilityState: ProjectSongAvailabilityState;
   localOriginalAvailable: boolean;
   localStemsAvailable: boolean;
+  verificationStatus?: ArtifactCompatibilityStatus;
+  recomputeCandidateCheckpoint?: SeparationCheckpoint | null;
+  recomputeCandidateImportedStem?: ImportedStemRecord | null;
   localTaskId: string | null;
   localSourceType: "demucs_checkpoint" | "imported_stem" | null;
   importedStemRecord: ImportedStemRecord | null;
@@ -51,6 +57,7 @@ export interface EvaluatedProjectSongAvailability {
 
 /**
  * 僅檢視本機 IndexedDB Metadata 評估專案每首歌的可用性（不解碼 AudioBuffer、不下載 WAV、不執行 Demucs）。
+ * 若正式雲端版本僅找到缺乏 Checksum 證明的本機舊資料（insufficient_evidence），絕不偽報 localStemsAvailable=true。
  */
 export async function evaluateProjectSongsAvailability(
   project: BandProject,
@@ -68,6 +75,10 @@ export async function evaluateProjectSongsAvailability(
     );
 
     let localStemsAvailable = false;
+    let verificationStatus: ArtifactCompatibilityStatus | undefined;
+    let recomputeCandidateCheckpoint: SeparationCheckpoint | null = null;
+    let recomputeCandidateImportedStem: ImportedStemRecord | null = null;
+    let missingReason: string | undefined;
     let localTaskId: string | null = null;
     let localSourceType: "demucs_checkpoint" | "imported_stem" | null = null;
     let importedStemRecord: ImportedStemRecord | null = null;
@@ -76,12 +87,18 @@ export async function evaluateProjectSongsAvailability(
 
     if (entry.artifactRef) {
       const ref = entry.artifactRef;
+      const requireExact = !ref.revisionId.startsWith("local-");
       const cp = await findCompletedCheckpointBySourceAudioHash(ref.sourceAudioHash, {
         modelVersion: ref.modelVersion,
         processingVersion: ref.processingVersion,
       }).catch(() => null);
 
       if (cp) {
+        const cpChecksums =
+          cp.exportedChecksumsByRevision?.[ref.revisionId] ??
+          (ref.derivedFrom?.sourceRevisionId
+            ? cp.exportedChecksumsByRevision?.[ref.derivedFrom.sourceRevisionId]
+            : undefined);
         const compat = isArtifactRefStrictlyCompatible(
           ref,
           {
@@ -93,10 +110,12 @@ export async function evaluateProjectSongsAvailability(
             channelCount: 2,
             totalSamples: cp.totalSamples,
             exportedRevisionIds: cp.exportedRevisionIds,
+            checksumsByRole: cpChecksums,
           },
-          { requireExactRevision: !ref.revisionId.startsWith("local-") },
+          { requireExactRevision: requireExact },
         );
-        if (compat.compatible) {
+        verificationStatus = compat.status;
+        if (compat.status === "verified") {
           const check = await validateAndPrepareResume(cp.taskId, {
             sourceAudioAvailable: true,
             sourceAudioHash: cp.sourceAudioHash,
@@ -110,11 +129,24 @@ export async function evaluateProjectSongsAvailability(
             totalChunks = cp.totalChunks;
             committedBytes = cp.committedBytes;
           }
+        } else if (compat.status === "insufficient_evidence") {
+          const check = await validateAndPrepareResume(cp.taskId, {
+            sourceAudioAvailable: true,
+            sourceAudioHash: cp.sourceAudioHash,
+            totalSamples: cp.totalSamples,
+            sampleRate: cp.sampleRate,
+          }).catch(() => null);
+          if (isValidationCompleted(check)) {
+            recomputeCandidateCheckpoint = cp;
+            missingReason = compat.reason;
+          }
+        } else {
+          missingReason = compat.reason;
         }
       }
 
       if (!localStemsAvailable) {
-        const imp = await findImportedStemStrict({
+        const candidates = await findImportedStemCandidatesBySpec({
           sourceAudioHash: ref.sourceAudioHash,
           mode: ref.separationMode,
           modelVersion: ref.modelVersion,
@@ -125,19 +157,33 @@ export async function evaluateProjectSongsAvailability(
           expectedRevisionId: ref.revisionId,
           expectedChecksums: ref.artifactChecksums,
           expectedDerivedFrom: ref.derivedFrom ?? null,
-        }).catch(() => null);
-        if (imp) {
-          const impValid = await validateImportedStemIntegrity(imp.importId).catch(() => ({
+        }).catch(() => []);
+
+        for (const cand of candidates) {
+          const impValid = await validateImportedStemIntegrity(cand.record.importId).catch(() => ({
             valid: false,
             record: null,
           }));
-          if (impValid.valid && impValid.record) {
+          if (!impValid.valid || !impValid.record) continue;
+
+          if (cand.compatibility.status === "verified") {
             localStemsAvailable = true;
+            verificationStatus = "verified";
             localTaskId = impValid.record.importId;
             localSourceType = "imported_stem";
             importedStemRecord = impValid.record;
             totalChunks = impValid.record.totalChunks;
             committedBytes = impValid.record.committedBytes;
+            missingReason = undefined;
+            break;
+          }
+          if (
+            cand.compatibility.status === "insufficient_evidence" &&
+            !recomputeCandidateImportedStem
+          ) {
+            recomputeCandidateImportedStem = impValid.record;
+            verificationStatus = "insufficient_evidence";
+            missingReason = cand.compatibility.reason;
           }
         }
       }
@@ -159,7 +205,7 @@ export async function evaluateProjectSongsAvailability(
       availabilityState = "stems_loaded";
     } else if (hasLocalOriginal && !entry.artifactRef) {
       availabilityState = "local_playable";
-    } else if (hasLocalOriginal && entry.artifactRef && !canDownloadStemsFromDrive) {
+    } else if (hasLocalOriginal && entry.artifactRef && !canDownloadStemsFromDrive && verificationStatus !== "insufficient_evidence") {
       availabilityState = "local_playable";
     } else if (canDownloadStemsFromDrive || (!hasLocalOriginal && canDownloadOriginalFromDrive)) {
       availabilityState = hasAuthForCloud ? "cloud_not_downloaded" : "needs_reauth";
@@ -174,11 +220,15 @@ export async function evaluateProjectSongsAvailability(
       availabilityState,
       localOriginalAvailable: hasLocalOriginal,
       localStemsAvailable,
+      verificationStatus,
+      recomputeCandidateCheckpoint,
+      recomputeCandidateImportedStem,
       localTaskId,
       localSourceType,
       importedStemRecord,
       totalChunks,
       committedBytes,
+      missingReason,
     });
   }
 
@@ -427,8 +477,90 @@ export async function restoreSingleProjectSongOnDemand(params: {
   let reusedLocal = true;
   let originalAudioWarning: string | undefined;
 
+  // 若本地僅有缺乏 checksum 證明的舊版分軌且專案已記錄完整 artifactChecksums + pcmFormat，先串流重算驗證
+  if (
+    !restoredStems &&
+    entry.artifactRef &&
+    entry.artifactRef.artifactChecksums &&
+    Object.keys(entry.artifactRef.artifactChecksums).length > 0 &&
+    entry.artifactRef.pcmFormat
+  ) {
+    const ref = entry.artifactRef;
+    const targetPcmFormat = entry.artifactRef.pcmFormat;
+    const requireExact = !ref.revisionId.startsWith("local-");
+    if (avail.recomputeCandidateImportedStem) {
+      const impCand = avail.recomputeCandidateImportedStem;
+      if (impCand.pcmFormat === targetPcmFormat) {
+        params.onProgress?.({
+          stage: "validating",
+          message: `正在重新驗證「${entry.displayName}」本機分軌 Checksum…`,
+        });
+        const recomputeRes = await recomputeAndVerifyLocalStemChecksums({
+          taskId: impCand.importId,
+          sourceType: "imported_stem",
+          stemLayout: impCand.stemLayout,
+          pcmFormat: impCand.pcmFormat,
+          strideSamples: impCand.strideSamples,
+          expectedRef: ref,
+          candidateMetadata: {
+            sourceAudioHash: impCand.sourceAudioHash,
+            separationMode: impCand.requestedMode,
+            modelVersion: impCand.modelVersion,
+            processingVersion: impCand.processingVersion,
+            sampleRate: impCand.sampleRate,
+            channelCount: impCand.channelCount,
+            totalSamples: impCand.totalSamples,
+            revisionId: impCand.revisionId,
+            derivedFrom: impCand.derivedFrom ?? null,
+          },
+          existingChecksums: impCand.checksumsByRole,
+          requireExactRevision: requireExact,
+          signal: params.signal,
+        });
+        if (recomputeRes.verified) {
+          importedStemRecord = {
+            ...impCand,
+            checksumsByRole: { ...impCand.checksumsByRole, ...recomputeRes.checksumsByRole },
+          };
+          restoredStems = true;
+        }
+      }
+    } else if (avail.recomputeCandidateCheckpoint) {
+      const cpCand = avail.recomputeCandidateCheckpoint;
+      params.onProgress?.({
+        stage: "validating",
+        message: `正在重新驗證「${entry.displayName}」本機分段 Checksum…`,
+      });
+      const recomputeRes = await recomputeAndVerifyLocalStemChecksums({
+        taskId: cpCand.taskId,
+        sourceType: "demucs_checkpoint",
+        stemLayout: "four_stem",
+        pcmFormat: targetPcmFormat,
+        totalChunks: cpCand.totalChunks,
+        strideSamples: cpCand.strideSamples,
+        expectedRef: ref,
+        candidateMetadata: {
+          sourceAudioHash: cpCand.sourceAudioHash,
+          separationMode: cpCand.requestedMode,
+          modelVersion: cpCand.modelVersion,
+          processingVersion: cpCand.processingVersion,
+          sampleRate: cpCand.sampleRate,
+          channelCount: 2,
+          totalSamples: cpCand.totalSamples,
+          exportedRevisionIds: cpCand.exportedRevisionIds,
+        },
+        requireExactRevision: requireExact,
+        signal: params.signal,
+      });
+      if (recomputeRes.verified) {
+        checkpointTaskId = cpCand.taskId;
+        restoredStems = true;
+      }
+    }
+  }
+
   const needStemsFromCloud = Boolean(
-    entry.artifactRef?.manifestFileId && !avail.localStemsAvailable,
+    entry.artifactRef?.manifestFileId && !restoredStems,
   );
   const originalDriveFileId =
     entry.originalBackup?.driveFileId ||
@@ -440,6 +572,17 @@ export async function restoreSingleProjectSongOnDemand(params: {
         entry.settings.playbackSource === "original" ||
         !entry.artifactRef),
   );
+
+  if (
+    !needStemsFromCloud &&
+    !restoredStems &&
+    entry.artifactRef &&
+    avail.verificationStatus === "insufficient_evidence"
+  ) {
+    throw new Error(
+      `無法驗證「${entry.displayName}」本機分軌完整性（${avail.missingReason ?? "缺少 Checksum 證明"}），且目前無可用的雲端 Manifest 可供重新下載。`,
+    );
+  }
 
   if (needStemsFromCloud || needOriginalFromCloud) {
     if (!params.accountId || !params.accessToken) {
@@ -478,6 +621,32 @@ export async function restoreSingleProjectSongOnDemand(params: {
       fetchImpl: params.fetchImpl,
       onProgress: params.onProgress,
     });
+
+    if (
+      entry.artifactRef.artifactChecksums &&
+      restored.importedStemRecord &&
+      entry.artifactRef.revisionId === manifestEntry.manifest.revisionId
+    ) {
+      const postCheck = isArtifactRefStrictlyCompatible(
+        entry.artifactRef,
+        {
+          sourceAudioHash: restored.importedStemRecord.sourceAudioHash,
+          separationMode: restored.importedStemRecord.requestedMode,
+          modelVersion: restored.importedStemRecord.modelVersion,
+          processingVersion: restored.importedStemRecord.processingVersion,
+          sampleRate: restored.importedStemRecord.sampleRate,
+          channelCount: restored.importedStemRecord.channelCount,
+          totalSamples: restored.importedStemRecord.totalSamples,
+          revisionId: restored.importedStemRecord.revisionId,
+          checksumsByRole: restored.importedStemRecord.checksumsByRole,
+          derivedFrom: restored.importedStemRecord.derivedFrom ?? null,
+        },
+        { requireExactRevision: !entry.artifactRef.revisionId.startsWith("local-") },
+      );
+      if (!postCheck.compatible) {
+        throw new Error(`雲端恢復後的分軌未能通過專案 Checksum 驗證：${postCheck.reason}`);
+      }
+    }
 
     importedStemRecord = restored.importedStemRecord;
     checkpointTaskId = restored.checkpointTaskId;

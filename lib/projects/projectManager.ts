@@ -9,6 +9,7 @@ import {
   getProjectRecord,
   listProjectRecords,
   saveLegacyMigrationEntry,
+  saveLocalProjectEditAtomically,
   saveProjectRecord,
   setActiveProjectId,
 } from "../storage/projectStore.ts";
@@ -22,7 +23,7 @@ import {
   backupLocalOriginalAudioToDrive,
   buildProjectListSummary,
   deleteCloudProject,
-  listCloudProjects,
+  listCloudProjectsDetailed,
   saveProjectToDrive,
 } from "./projectDriveSync.ts";
 import {
@@ -146,8 +147,17 @@ export async function saveLocalProjectSnapshot(params: {
     lastSavedAt: Date.now(),
   };
 
-  const saved = await saveProjectRecord(nextRecord);
-  return saved.saved ? saved.record : null;
+  const saved = await saveLocalProjectEditAtomically(nextRecord);
+  if (!saved.saved) {
+    if (saved.reason === "stale_revision" && saved.currentRecord) {
+      return saved.currentRecord;
+    }
+    if (saved.reason === "idb_error") {
+      throw new Error(saved.errorMessage || "儲存本機專案至 IndexedDB 失敗。");
+    }
+    return null;
+  }
+  return saved.record;
 }
 
 export async function saveProjectAs(params: {
@@ -247,9 +257,15 @@ export async function renameProject(params: {
     lastSavedAt: Date.now(),
   };
 
-  const saved = await saveProjectRecord(updated);
+  const saved = await saveLocalProjectEditAtomically(updated);
   if (!saved.saved) {
-    throw new Error("此專案已被刪除，無法重新命名。");
+    if (saved.reason === "project_deleted") {
+      throw new Error("此專案已被刪除，無法重新命名。");
+    }
+    if (saved.reason === "stale_revision") {
+      throw new Error("本機專案剛有較新變更，請重新開啟後再重新命名。");
+    }
+    throw new Error(saved.errorMessage || "寫入專案新名稱至本機資料庫失敗。");
   }
 
   if (
@@ -418,7 +434,10 @@ export async function promoteLocalProjectToDrive(params: {
     lastSavedAt: Date.now(),
   };
 
-  await saveProjectRecord(nextRecord);
+  const promotedSave = await saveLocalProjectEditAtomically(nextRecord);
+  if (!promotedSave.saved) {
+    throw new Error(promotedSave.errorMessage || "無法寫入專案雲端轉換狀態至本機資料庫。");
+  }
 
   params.onProgress?.({
     stage: "uploading_project",
@@ -426,7 +445,7 @@ export async function promoteLocalProjectToDrive(params: {
   });
 
   const syncOutcome = await saveProjectToDrive({
-    record: nextRecord,
+    record: promotedSave.record,
     accountId,
     accessToken,
     generation: params.auth.generation,
@@ -446,7 +465,7 @@ export async function promoteLocalProjectToDrive(params: {
     record:
       syncOutcome.status === "synced"
         ? syncOutcome.record
-        : (await getProjectRecord(params.projectId)) ?? nextRecord,
+        : (await getProjectRecord(params.projectId)) ?? promotedSave.record,
     syncOutcome,
     originalBackupFailures,
   };
@@ -495,7 +514,10 @@ export async function openProjectMetadataAndEntries(params: {
       syncGeneration: 1,
     };
     const saveRes = await saveProjectRecord(createdRec, { allowCreateIfDeleted: true });
-    localRec = saveRes.saved ? saveRes.record : createdRec;
+    if (!saveRes.saved) {
+      throw new Error(saveRes.errorMessage || "無法將雲端專案 Metadata 寫入本機快取。");
+    }
+    localRec = saveRes.record;
   }
 
   if (!localRec) {
@@ -536,8 +558,11 @@ export async function openProjectMetadataAndEntries(params: {
         lastSyncedAt: Date.now(),
         conflictInfo: null,
       };
-      await saveProjectRecord(refreshed);
-      localRec = refreshed;
+      const refreshSave = await saveProjectRecord(refreshed);
+      if (!refreshSave.saved) {
+        throw new Error(refreshSave.errorMessage || "更新最新雲端專案 Metadata 至本機失敗。");
+      }
+      localRec = refreshSave.record;
     } else if (
       params.cloudEntryHint.project.revision > (localRec.lastSyncedRemoteRevision ?? localRec.localBaseRevision)
     ) {
@@ -577,7 +602,9 @@ export async function deleteProjectSafely(params: {
   deletedCloud: boolean;
   cloudError?: string;
 }> {
-  params.autoSyncController?.invalidateProject(params.projectId);
+  await params.autoSyncController?.invalidateProject(params.projectId, {
+    discardPendingLocal: true,
+  });
   const existing = await getProjectRecord(params.projectId);
 
   let deletedCloud = false;
@@ -655,13 +682,18 @@ export async function resolveProjectConflict(params: {
       lastSyncedRemoteRevisionToken: remoteProj.revisionToken,
       dirty: false,
       syncStatus: "synced",
+      syncGeneration: existing.syncGeneration + 1,
+      pendingRevisionPublish: null,
       lastSavedAt: Date.now(),
       lastSyncedAt: Date.now(),
       conflictInfo: null,
       lastError: null,
     };
-    await saveProjectRecord(loadedRec);
-    return { activeRecord: loadedRec };
+    const saveLoaded = await saveProjectRecord(loadedRec);
+    if (!saveLoaded.saved) {
+      throw new Error(saveLoaded.errorMessage || "載入雲端版本並寫入本機失敗。");
+    }
+    return { activeRecord: saveLoaded.record };
   }
 
   if (params.strategy === "save_local_as_new") {
@@ -682,14 +714,19 @@ export async function resolveProjectConflict(params: {
         localRevision: remoteProj.revision,
         lastSyncedRemoteRevision: remoteProj.revision,
         lastSyncedRemoteRevisionToken: remoteProj.revisionToken,
+        pendingRevisionPublish: null,
         dirty: false,
         syncStatus: "synced",
+        syncGeneration: existing.syncGeneration + 1,
         lastSavedAt: Date.now(),
         lastSyncedAt: Date.now(),
         conflictInfo: null,
         lastError: null,
       };
-      await saveProjectRecord(syncedRemoteRec);
+      const saveSyncedRemote = await saveProjectRecord(syncedRemoteRec);
+      if (!saveSyncedRemote.saved) {
+        throw new Error(saveSyncedRemote.errorMessage || "重設原雲端專案狀態至遠端版本失敗。");
+      }
       return {
         activeRecord: backupCopy.record,
         createdLocalCopyRecord: backupCopy.record,
@@ -862,12 +899,17 @@ export async function listAllProjectsForUi(params?: {
   currentAccountId?: string | null;
   accessToken?: string | null;
   includeCloud?: boolean;
+  pageSize?: number;
+  maxPages?: number;
+  maxItems?: number;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
 }): Promise<{
   projects: ProjectListEntrySummary[];
   cloudProjectsMap: Map<string, { project: BandProject; driveVersion?: string | null }>;
   cloudError?: string;
+  cloudListIncomplete: boolean;
+  cloudIncompleteReason?: string;
 }> {
   const localRecords = await listProjectRecords({
     includeLocal: true,
@@ -887,16 +929,31 @@ export async function listAllProjectsForUi(params?: {
 
   const cloudProjectsMap = new Map<string, { project: BandProject; driveVersion?: string | null }>();
   let cloudError: string | undefined;
+  let cloudListIncomplete = false;
+  let cloudIncompleteReason: string | undefined;
 
   if (params?.includeCloud !== false && params?.currentAccountId && params?.accessToken) {
     try {
-      const cloudList = await listCloudProjects({
+      const cloudRes = await listCloudProjectsDetailed({
         accountId: params.currentAccountId,
         accessToken: params.accessToken,
+        strict: false,
+        pageSize: params.pageSize,
+        maxPages: params.maxPages,
+        maxItems: params.maxItems,
         signal: params.signal,
         fetchImpl: params.fetchImpl,
       });
-      for (const item of cloudList) {
+
+      if (!cloudRes.complete || cloudRes.truncated) {
+        cloudListIncomplete = true;
+        cloudIncompleteReason =
+          cloudRes.errorMessage ||
+          `雲端專案清單未完整讀取（已讀取 ${cloudRes.projects.length} 項，尚未列出全部）。`;
+        cloudError = cloudIncompleteReason;
+      }
+
+      for (const item of cloudRes.projects) {
         if (item.project.ownerAccountId !== params.currentAccountId) continue;
         cloudProjectsMap.set(item.project.projectId, item);
         const existingLocal = localRecords.find((r) => r.projectId === item.project.projectId);
@@ -946,6 +1003,8 @@ export async function listAllProjectsForUi(params?: {
       }
     } catch (err) {
       cloudError = err instanceof Error ? err.message : "無法載入 Google Drive 專案清單";
+      cloudListIncomplete = true;
+      cloudIncompleteReason = cloudError;
     }
   }
 
@@ -957,6 +1016,8 @@ export async function listAllProjectsForUi(params?: {
     projects,
     cloudProjectsMap,
     cloudError,
+    cloudListIncomplete,
+    cloudIncompleteReason,
   };
 }
 

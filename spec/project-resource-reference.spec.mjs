@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createBandSong } from "../lib/band/songModel.ts";
+import { listManagedProjectsPaginated } from "../lib/google/driveFolderManager.ts";
 import { checkCloudArtifactReferencesAcrossProjects, collectLocalProjectResourceReferences, isAudioHashReferencedAcrossWorkspace } from "../lib/projects/projectResourceReferences.ts";
 import { buildProjectFromBandSongs } from "../lib/projects/projectModel.ts";
-import { createNewProject, deleteProjectSafely, saveProjectAs } from "../lib/projects/projectManager.ts";
+import { createNewProject, deleteProjectSafely, listAllProjectsForUi, saveProjectAs } from "../lib/projects/projectManager.ts";
 import { pinTaskForDriveTransfer, unpinTaskForDriveTransfer } from "../lib/storage/driveTransferStore.ts";
 import { configureInMemoryIdbForTests, idbGet, idbPut, resetInMemoryIdbForTests } from "../lib/storage/indexedDb.ts";
 import { saveImportedStemsAtomically, releaseImportedStemReferenceAndMaybeGc } from "../lib/storage/importedStemStore.ts";
@@ -378,6 +379,351 @@ test("checkCloudArtifactReferencesAcrossProjects blocks cloud deletion when refe
     });
     assert.equal(refCheck.safeToDelete, false);
     assert.ok(refCheck.referencingProjectNames.includes("Active Concert Project"));
+  } finally {
+    resetInMemoryIdbForTests();
+  }
+});
+
+test("P1-3: paginated listing handles >100 projects, detects page-2 references & 2-stem derivedFrom, and fails closed on duplicate tokens, limits, errors, permissions, or Abort", async () => {
+  configureInMemoryIdbForTests();
+  try {
+    const targetManifestId = "man-target-103";
+    const targetRevisionId = "rev-target-103";
+    const sharedHash = "p".repeat(64);
+    const totalCount = 105;
+
+    const projectDocs = new Map();
+    const folderMetas = [];
+    const jsonMetas = [];
+
+    for (let i = 1; i <= totalCount; i += 1) {
+      const pid = `proj-${String(i).padStart(3, "0")}`;
+      const folderId = `fld-${pid}`;
+      const fileId = `pjson-${pid}`;
+      folderMetas.push({
+        id: folderId,
+        name: `project_${pid}`,
+        mimeType: "application/vnd.google-apps.folder",
+        appProperties: {
+          lhApp: "loop-harmonizer",
+          lhRole: "project",
+          lhAccountId: "google:acc1",
+          lhProjectId: pid,
+        },
+        trashed: false,
+        capabilities: { canAddChildren: true },
+      });
+      jsonMetas.push({
+        id: fileId,
+        name: "project.json",
+        mimeType: "application/json",
+        parents: [folderId],
+        appProperties: {
+          lhApp: "loop-harmonizer",
+          lhRole: "project_json",
+          lhAccountId: "google:acc1",
+          lhProjectId: pid,
+        },
+        trashed: false,
+      });
+
+      const songs = [];
+      if (i === 1) {
+        // 第 1 個專案引用相同 sourceAudioHash，但為不同 Revision（rev-unrelated）
+        songs.push({
+          entryId: "e-other-rev",
+          sourceAudioHash: sharedHash,
+          source: { provider: "local" },
+          displayName: "Same Hash Other Rev",
+          fileName: "shared.mp3",
+          durationSec: 60,
+          order: 0,
+          artifactRef: {
+            manifestFileId: "man-other-rev",
+            revisionId: "rev-other-999",
+            sourceAudioHash: sharedHash,
+            separationMode: "four_stem",
+            modelVersion: "m1",
+            processingVersion: "p1",
+            sampleRate: 44100,
+            channelCount: 2,
+            totalSamples: 44100,
+          },
+          settings: {
+            displayName: "Same Hash Other Rev",
+            fileName: "shared.mp3",
+            originalBpm: 120,
+            targetBpm: 120,
+            tempoMode: "target-bpm",
+            manualRate: 1,
+            fineRateOffset: 0,
+            savedRates: [1],
+            keyShiftSemitones: 0,
+            masterVolume: 1,
+            muted: false,
+            loop: false,
+            playbackSource: "stems",
+            separationMode: "four_stem",
+            stemChannels: [],
+          },
+        });
+      }
+      if (i === 103) {
+        // 第 103 個專案位於第 2 頁之後，直接引用或透過 2-stem derivedFrom 引用目標 Revision
+        songs.push({
+          entryId: "e-103",
+          sourceAudioHash: sharedHash,
+          source: { provider: "local" },
+          displayName: "Page 2 Referencing Song",
+          fileName: "shared.mp3",
+          durationSec: 60,
+          order: 0,
+          artifactRef: {
+            manifestFileId: targetManifestId,
+            revisionId: targetRevisionId,
+            sourceAudioHash: sharedHash,
+            separationMode: "four_stem",
+            modelVersion: "m1",
+            processingVersion: "p1",
+            sampleRate: 44100,
+            channelCount: 2,
+            totalSamples: 44100,
+          },
+          settings: {
+            displayName: "Page 2 Referencing Song",
+            fileName: "shared.mp3",
+            originalBpm: 120,
+            targetBpm: 120,
+            tempoMode: "target-bpm",
+            manualRate: 1,
+            fineRateOffset: 0,
+            savedRates: [1],
+            keyShiftSemitones: 0,
+            masterVolume: 1,
+            muted: false,
+            loop: false,
+            playbackSource: "stems",
+            separationMode: "four_stem",
+            stemChannels: [],
+          },
+        });
+      }
+      projectDocs.set(fileId, {
+        schemaVersion: 1,
+        application: "loop-harmonizer",
+        projectId: pid,
+        name: `Tour Project ${i}`,
+        storageProvider: "google_drive",
+        ownerAccountId: "google:acc1",
+        revision: 1,
+        revisionToken: `r1-${i}`,
+        createdAt: "2026-01-01T00:00:00Z",
+        updatedAt: "2026-01-01T00:00:00Z",
+        masterSettings: {},
+        songs,
+      });
+    }
+
+    let mode = "normal";
+    let fetchAttemptPage2 = 0;
+
+    const paginatedFetch = async (url, init) => {
+      if (init?.signal?.aborted) {
+        throw new DOMException("Aborted", "AbortError");
+      }
+      const u = new URL(String(url));
+      if (u.pathname === "/drive/v3/files") {
+        const q = u.searchParams.get("q") ?? "";
+        const pageSize = Number(u.searchParams.get("pageSize") ?? "100");
+        const token = u.searchParams.get("pageToken");
+        const offset = token ? Number(token.replace("p_", "")) : 0;
+
+        if (mode === "duplicate_token" && token) {
+          return new Response(
+            JSON.stringify({ files: [], nextPageToken: token }),
+            { status: 200 },
+          );
+        }
+        if (mode === "page2_503" && offset > 0) {
+          fetchAttemptPage2 += 1;
+          return new Response("Unavailable", { status: 503 });
+        }
+        if (mode === "page2_403" && offset > 0) {
+          return new Response("Forbidden", { status: 403 });
+        }
+
+        const isFolder = q.includes("lhRole' and value='project'");
+        const source = isFolder ? folderMetas : jsonMetas;
+        const slice = source.slice(offset, offset + pageSize);
+        const nextPageToken =
+          offset + pageSize < source.length
+            ? `p_${offset + pageSize}`
+            : mode === "duplicate_token"
+              ? "dup-tok-1"
+              : undefined;
+        return new Response(JSON.stringify({ files: slice, nextPageToken }), { status: 200 });
+      }
+
+      if (u.pathname.startsWith("/drive/v3/files/")) {
+        const id = decodeURIComponent(u.pathname.split("/").pop());
+        if (u.searchParams.get("alt") === "media") {
+          const doc = projectDocs.get(id);
+          return doc ? new Response(JSON.stringify(doc), { status: 200 }) : new Response("Not Found", { status: 404 });
+        }
+        const meta = jsonMetas.find((m) => m.id === id);
+        return meta ? new Response(JSON.stringify(meta), { status: 200 }) : new Response("Not Found", { status: 404 });
+      }
+      return new Response("Not Found", { status: 404 });
+    };
+
+    // 1) >100 專案完整分頁（105 個專案，pageSize=50 -> 3 頁），成功找出位於第 2+ 頁的 Project #103
+    const managedAll = await listManagedProjectsPaginated({
+      accountId: "google:acc1",
+      accessToken: "token-1",
+      pageSize: 50,
+      fetchImpl: paginatedFetch,
+    });
+    assert.equal(managedAll.complete, true);
+    assert.equal(managedAll.entries.length, 105);
+    assert.equal(managedAll.folderPagesFetched, 3);
+
+    const gcBlockedPage2 = await checkCloudArtifactReferencesAcrossProjects({
+      manifestFileId: targetManifestId,
+      revisionId: targetRevisionId,
+      sourceAudioHash: sharedHash,
+      accountId: "google:acc1",
+      accessToken: "token-1",
+      pageSize: 50,
+      fetchImpl: paginatedFetch,
+    });
+    assert.equal(gcBlockedPage2.safeToDelete, false);
+    assert.equal(gcBlockedPage2.unknownCloudCoverage, false);
+    assert.ok(gcBlockedPage2.referencingProjectIds.includes("proj-103"));
+
+    // 2) 只依 sourceAudioHash：查詢完全未被任何專案引用的第三個 Revision (rev-unreferenced)，應允許刪除而不被 proj-001 的同 Hash 其他 Revision 誤卡
+    const gcUnreferencedRev = await checkCloudArtifactReferencesAcrossProjects({
+      manifestFileId: "man-unreferenced",
+      revisionId: "rev-unreferenced",
+      sourceAudioHash: sharedHash,
+      accountId: "google:acc1",
+      accessToken: "token-1",
+      pageSize: 50,
+      fetchImpl: paginatedFetch,
+    });
+    assert.equal(gcUnreferencedRev.safeToDelete, true);
+
+    // 3) 若 UI / 專案只帶了 2-stem derivedFrom.sourceRevisionId 指向 rev-unreferenced-parent，必須保護該父版本
+    projectDocs.get("pjson-proj-001").songs[0].artifactRef.derivedFrom = {
+      sourceMode: "four_stem",
+      sourceRevisionId: "rev-parent-protected",
+      modelVersion: "m1",
+      processingVersion: "p1",
+    };
+    const gcDerivedParent = await checkCloudArtifactReferencesAcrossProjects({
+      manifestFileId: "man-parent-protected",
+      revisionId: "rev-parent-protected",
+      sourceAudioHash: sharedHash,
+      accountId: "google:acc1",
+      accessToken: "token-1",
+      pageSize: 50,
+      fetchImpl: paginatedFetch,
+    });
+    assert.equal(gcDerivedParent.safeToDelete, false);
+
+    // 4) 重複 pageToken -> UI 可取得已讀部分但標記 cloudListIncomplete=true，GC fail closed
+    mode = "duplicate_token";
+    const uiDup = await listAllProjectsForUi({
+      currentAccountId: "google:acc1",
+      accessToken: "token-1",
+      pageSize: 50,
+      fetchImpl: paginatedFetch,
+    });
+    assert.equal(uiDup.cloudListIncomplete, true);
+    assert.ok(uiDup.projects.length > 0);
+    const gcDup = await checkCloudArtifactReferencesAcrossProjects({
+      manifestFileId: "man-any",
+      revisionId: "rev-any",
+      sourceAudioHash: sharedHash,
+      accountId: "google:acc1",
+      accessToken: "token-1",
+      pageSize: 50,
+      fetchImpl: paginatedFetch,
+    });
+    assert.equal(gcDup.safeToDelete, false);
+    assert.equal(gcDup.unknownCloudCoverage, true);
+
+    // 5) 超過 maxPages 上限 -> UI 明確標記 incomplete 且 GC fail closed
+    mode = "normal";
+    const uiLimited = await listAllProjectsForUi({
+      currentAccountId: "google:acc1",
+      accessToken: "token-1",
+      pageSize: 40,
+      maxPages: 1,
+      fetchImpl: paginatedFetch,
+    });
+    assert.equal(uiLimited.cloudListIncomplete, true);
+    assert.ok(uiLimited.cloudIncompleteReason);
+    const gcLimited = await checkCloudArtifactReferencesAcrossProjects({
+      manifestFileId: "man-any",
+      revisionId: "rev-any",
+      sourceAudioHash: sharedHash,
+      accountId: "google:acc1",
+      accessToken: "token-1",
+      pageSize: 40,
+      maxPages: 1,
+      fetchImpl: paginatedFetch,
+    });
+    assert.equal(gcLimited.safeToDelete, false);
+    assert.equal(gcLimited.unknownCloudCoverage, true);
+
+    // 6) 第 2 頁 503 中斷（有限重試耗盡） -> fail closed
+    mode = "page2_503";
+    fetchAttemptPage2 = 0;
+    const gc503 = await checkCloudArtifactReferencesAcrossProjects({
+      manifestFileId: "man-any",
+      revisionId: "rev-any",
+      sourceAudioHash: sharedHash,
+      accountId: "google:acc1",
+      accessToken: "token-1",
+      pageSize: 50,
+      maxRetriesPerPage: 1,
+      retryDelayMs: [5],
+      fetchImpl: paginatedFetch,
+    });
+    assert.equal(gc503.safeToDelete, false);
+    assert.equal(gc503.unknownCloudCoverage, true);
+    assert.ok(fetchAttemptPage2 >= 2);
+
+    // 7) 權限錯誤 (403) -> fail closed
+    mode = "page2_403";
+    const gc403 = await checkCloudArtifactReferencesAcrossProjects({
+      manifestFileId: "man-any",
+      revisionId: "rev-any",
+      sourceAudioHash: sharedHash,
+      accountId: "google:acc1",
+      accessToken: "token-1",
+      pageSize: 50,
+      fetchImpl: paginatedFetch,
+    });
+    assert.equal(gc403.safeToDelete, false);
+    assert.equal(gc403.unknownCloudCoverage, true);
+
+    // 8) AbortSignal 中止 -> fail closed（絕不把半套清單當成可安全刪除）
+    mode = "normal";
+    const abortCtrl = new AbortController();
+    abortCtrl.abort();
+    const gcAborted = await checkCloudArtifactReferencesAcrossProjects({
+      manifestFileId: "man-any",
+      revisionId: "rev-any",
+      sourceAudioHash: sharedHash,
+      accountId: "google:acc1",
+      accessToken: "token-1",
+      pageSize: 50,
+      signal: abortCtrl.signal,
+      fetchImpl: paginatedFetch,
+    });
+    assert.equal(gcAborted.safeToDelete, false);
+    assert.equal(gcAborted.unknownCloudCoverage, true);
   } finally {
     resetInMemoryIdbForTests();
   }

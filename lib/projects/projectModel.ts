@@ -10,6 +10,7 @@ import {
 import { DEMUCS_SAMPLE_RATE } from "../storage/separationChunkStore.ts";
 import {
   PROJECT_SCHEMA_VERSION,
+  type ArtifactCompatibilityResult,
   type BandProject,
   type PersistedProjectRecord,
   type ProjectBackupSummary,
@@ -599,11 +600,24 @@ export function validateProjectDocument(
   };
 }
 
+export function normalizeArtifactChecksum(value?: string | null): string | null {
+  if (!value || typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (/^sha256:[0-9a-f]{64}$/i.test(trimmed)) {
+    return trimmed.toLowerCase();
+  }
+  if (/^[0-9a-f]{64}$/i.test(trimmed)) {
+    return `sha256:${trimmed.toLowerCase()}`;
+  }
+  return trimmed;
+}
+
 /**
  * 嚴格檢驗本地既有或待重用分軌成果是否完全相容於專案指定的 ProjectSongArtifactRef。
- * 不僅檢查 sourceAudioHash + separationMode，必須比對：
- * sourceAudioHash, separationMode, modelVersion, processingVersion,
- * sampleRate, channelCount, totalSamples, revisionId / derivedFrom 與 artifactChecksums。
+ * 區分 verified / insufficient_evidence / incompatible 三態：
+ * - 不得將缺少 checksum 或缺少必要角色的候選直接視為 verified。
+ * - 舊版 local-* Revision 保留必要本機相容路徑，正式雲端版本不得降低驗證要求。
  */
 export function isArtifactRefStrictlyCompatible(
   expected: ProjectSongArtifactRef,
@@ -621,37 +635,42 @@ export function isArtifactRefStrictlyCompatible(
     derivedFrom?: ProjectSongDerivedFromRef | null;
   },
   options?: { requireExactRevision?: boolean },
-): { compatible: boolean; reason?: string } {
+): ArtifactCompatibilityResult {
   if (expected.sourceAudioHash !== candidate.sourceAudioHash) {
-    return { compatible: false, reason: "sourceAudioHash 不符" };
+    return { compatible: false, status: "incompatible", reason: "sourceAudioHash 不符" };
   }
   if (expected.modelVersion !== candidate.modelVersion) {
     return {
       compatible: false,
+      status: "incompatible",
       reason: `模型版本不符（專案指定 ${expected.modelVersion}，候選為 ${candidate.modelVersion}）`,
     };
   }
   if (expected.processingVersion !== candidate.processingVersion) {
     return {
       compatible: false,
+      status: "incompatible",
       reason: `處理管線版本不符（專案指定 ${expected.processingVersion}，候選為 ${candidate.processingVersion}）`,
     };
   }
   if (expected.sampleRate !== candidate.sampleRate) {
     return {
       compatible: false,
+      status: "incompatible",
       reason: `取樣率不符（專案 ${expected.sampleRate}Hz，候選 ${candidate.sampleRate}Hz）`,
     };
   }
   if (expected.channelCount !== candidate.channelCount) {
     return {
       compatible: false,
+      status: "incompatible",
       reason: `聲道數不符（專案 ${expected.channelCount}，候選 ${candidate.channelCount}）`,
     };
   }
   if (expected.totalSamples !== candidate.totalSamples) {
     return {
       compatible: false,
+      status: "incompatible",
       reason: `總樣本數不符（專案 ${expected.totalSamples}，候選 ${candidate.totalSamples}）`,
     };
   }
@@ -663,30 +682,18 @@ export function isArtifactRefStrictlyCompatible(
   if (!modeDirectMatch && !twoStemDerivedFromFour) {
     return {
       compatible: false,
+      status: "incompatible",
       reason: `分軌模式不相容（專案需要 ${expected.separationMode}，候選為 ${candidate.separationMode}）`,
     };
   }
 
-  if (expected.derivedFrom && candidate.derivedFrom) {
-    if (
-      expected.derivedFrom.modelVersion !== candidate.derivedFrom.modelVersion ||
-      expected.derivedFrom.processingVersion !== candidate.derivedFrom.processingVersion ||
-      (expected.derivedFrom.sourceRevisionId &&
-        candidate.derivedFrom.sourceRevisionId &&
-        expected.derivedFrom.sourceRevisionId !== candidate.derivedFrom.sourceRevisionId)
-    ) {
-      return {
-        compatible: false,
-        reason: "2 Stem 派生來源版本與專案指定版本不一致，禁止混用不同版本音軌",
-      };
-    }
-  }
-
+  const isLegacyLocalRevision =
+    !expected.revisionId || expected.revisionId.startsWith("local-");
   const requireExact = options?.requireExactRevision ?? true;
+
   if (
     requireExact &&
-    expected.revisionId &&
-    !expected.revisionId.startsWith("local-")
+    !isLegacyLocalRevision
   ) {
     const revMatches =
       candidate.revisionId === expected.revisionId ||
@@ -694,27 +701,184 @@ export function isArtifactRefStrictlyCompatible(
       Boolean(
         twoStemDerivedFromFour &&
           expected.derivedFrom?.sourceRevisionId &&
+          !expected.derivedFrom.sourceRevisionId.startsWith("local-") &&
           (candidate.revisionId === expected.derivedFrom.sourceRevisionId ||
             candidate.exportedRevisionIds?.includes(expected.derivedFrom.sourceRevisionId)),
       );
     if (!revMatches) {
       return {
         compatible: false,
+        status: "incompatible",
         reason: `分軌版本不符（專案指定 ${expected.revisionId}，本機為 ${candidate.revisionId ?? "未知"}）`,
       };
     }
   }
 
-  if (expected.artifactChecksums && candidate.checksumsByRole) {
-    for (const [role, expSum] of Object.entries(expected.artifactChecksums)) {
-      const gotSum = candidate.checksumsByRole[role];
-      if (expSum && gotSum && expSum !== gotSum) {
-        return { compatible: false, reason: `分軌 ${role} Checksum 不一致` };
+  let derivedFromNeedsEvidenceReason: string | undefined;
+  if (expected.derivedFrom) {
+    if (
+      expected.derivedFrom.modelVersion !== candidate.modelVersion ||
+      expected.derivedFrom.processingVersion !== candidate.processingVersion
+    ) {
+      return {
+        compatible: false,
+        status: "incompatible",
+        reason: "2 Stem 派生來源模型或處理版本與專案指定版本不一致，禁止混用不同來源音軌",
+      };
+    }
+    if (twoStemDerivedFromFour) {
+      const expSrcRev = expected.derivedFrom.sourceRevisionId;
+      if (expSrcRev && !expSrcRev.startsWith("local-")) {
+        const matchesSourceRev =
+          candidate.revisionId === expSrcRev ||
+          Boolean(candidate.exportedRevisionIds?.includes(expSrcRev));
+        if (!matchesSourceRev) {
+          return {
+            compatible: false,
+            status: "incompatible",
+            reason: "2 Stem 派生來源 4 Stem Revision 與專案指定版本不一致，禁止混用不同來源音軌",
+          };
+        }
       }
+      if (candidate.derivedFrom) {
+        if (
+          expected.derivedFrom.modelVersion !== candidate.derivedFrom.modelVersion ||
+          expected.derivedFrom.processingVersion !== candidate.derivedFrom.processingVersion ||
+          (expected.derivedFrom.sourceRevisionId &&
+            candidate.derivedFrom.sourceRevisionId &&
+            expected.derivedFrom.sourceRevisionId !== candidate.derivedFrom.sourceRevisionId)
+        ) {
+          return {
+            compatible: false,
+            status: "incompatible",
+            reason: "2 Stem 派生來源版本與專案指定版本不一致，禁止混用不同版本音軌",
+          };
+        }
+      }
+    } else if (candidate.derivedFrom) {
+      if (
+        expected.derivedFrom.modelVersion !== candidate.derivedFrom.modelVersion ||
+        expected.derivedFrom.processingVersion !== candidate.derivedFrom.processingVersion ||
+        (expected.derivedFrom.sourceRevisionId &&
+          candidate.derivedFrom.sourceRevisionId &&
+          expected.derivedFrom.sourceRevisionId !== candidate.derivedFrom.sourceRevisionId)
+      ) {
+        return {
+          compatible: false,
+          status: "incompatible",
+          reason: "2 Stem 派生來源版本與專案指定版本不一致，禁止混用不同版本音軌",
+        };
+      }
+      if (expected.derivedFrom.sourceRevisionId && !candidate.derivedFrom.sourceRevisionId) {
+        derivedFromNeedsEvidenceReason = "2 Stem 候選缺少派生來源 Revision 紀錄";
+      }
+    } else if (expected.derivedFrom.sourceRevisionId && !isLegacyLocalRevision) {
+      derivedFromNeedsEvidenceReason = "2 Stem 候選缺少 derivedFrom 譜系紀錄";
     }
   }
 
-  return { compatible: true };
+  const requiredRoles =
+    expected.separationMode === "two_stem"
+      ? (["vocals", "instrumental"] as const)
+      : (["vocals", "drums", "bass", "other"] as const);
+
+  const normalizedExpected: Record<string, string> = {};
+  if (expected.artifactChecksums) {
+    for (const [role, sum] of Object.entries(expected.artifactChecksums)) {
+      const norm = normalizeArtifactChecksum(sum);
+      if (norm) normalizedExpected[role] = norm;
+    }
+  }
+  const normalizedCandidate: Record<string, string> = {};
+  if (candidate.checksumsByRole) {
+    for (const [role, sum] of Object.entries(candidate.checksumsByRole)) {
+      const norm = normalizeArtifactChecksum(sum);
+      if (norm) normalizedCandidate[role] = norm;
+    }
+  }
+
+  // 優先檢查已存在欄位之間是否明確不符（checksum 不一致屬於 incompatible）
+  for (const [role, expSum] of Object.entries(normalizedExpected)) {
+    const gotSum = normalizedCandidate[role];
+    if (gotSum && gotSum !== expSum) {
+      return {
+        compatible: false,
+        status: "incompatible",
+        reason: `分軌 ${role} Checksum 不一致`,
+      };
+    }
+  }
+
+  const expectedKeys = Object.keys(normalizedExpected);
+  const hasExplicitExpectedChecksums =
+    expected.artifactChecksums !== undefined && expectedKeys.length > 0;
+
+  if (hasExplicitExpectedChecksums) {
+    if (!candidate.checksumsByRole) {
+      const missingRoles = Array.from(
+        new Set(isLegacyLocalRevision ? expectedKeys : [...requiredRoles, ...expectedKeys]),
+      );
+      return {
+        compatible: false,
+        status: "insufficient_evidence",
+        missingChecksumRoles: missingRoles,
+        canAttemptRecomputeVerification: true,
+        reason: `候選分軌缺少 checksumsByRole 完整性證明（缺少：${missingRoles.join("、")}）`,
+      };
+    }
+    const rolesToCheck = isLegacyLocalRevision
+      ? expectedKeys
+      : Array.from(new Set([...requiredRoles, ...expectedKeys]));
+    const missingRoles = rolesToCheck.filter(
+      (role) => !normalizedCandidate[role] || (!isLegacyLocalRevision && (requiredRoles as readonly string[]).includes(role) && !normalizedExpected[role]),
+    );
+    if (missingRoles.length > 0) {
+      return {
+        compatible: false,
+        status: "insufficient_evidence",
+        missingChecksumRoles: missingRoles,
+        canAttemptRecomputeVerification: !rolesToCheck.some(
+          (role) => !isLegacyLocalRevision && (requiredRoles as readonly string[]).includes(role) && !normalizedExpected[role],
+        ),
+        reason: `缺少必要角色的 Checksum 完整性證明（${missingRoles.join("、")}），不可直接視為已驗證`,
+      };
+    }
+  } else if (!isLegacyLocalRevision) {
+    // 正式雲端版本不得因未傳 expected.artifactChecksums 而免除完整性檢查
+    const rolesToCheck = [...requiredRoles];
+    const missingCandidateRoles = rolesToCheck.filter((role) => !normalizedCandidate[role]);
+    const missingExpectedRoles = expected.artifactChecksums !== undefined
+      ? rolesToCheck.filter((role) => !normalizedExpected[role])
+      : [];
+    const missingRoles = Array.from(new Set([...missingCandidateRoles, ...missingExpectedRoles]));
+    if (missingRoles.length > 0) {
+      return {
+        compatible: false,
+        status: "insufficient_evidence",
+        missingChecksumRoles: missingRoles,
+        canAttemptRecomputeVerification: missingExpectedRoles.length === 0 && Object.keys(normalizedExpected).length > 0,
+        reason: `正式雲端版本缺少完整 Checksum 證明（缺少：${missingRoles.join("、")}）`,
+      };
+    }
+  }
+
+  if (derivedFromNeedsEvidenceReason) {
+    const canAcceptExactWithAllChecksums =
+      hasExplicitExpectedChecksums &&
+      candidate.revisionId === expected.revisionId &&
+      requiredRoles.every(
+        (role) => normalizedExpected[role] && normalizedCandidate[role] === normalizedExpected[role],
+      );
+    if (!canAcceptExactWithAllChecksums) {
+      return {
+        compatible: false,
+        status: "insufficient_evidence",
+        reason: derivedFromNeedsEvidenceReason,
+      };
+    }
+  }
+
+  return { compatible: true, status: "verified" };
 }
 
 export function computeLegacySessionFingerprint(

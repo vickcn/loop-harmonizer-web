@@ -142,6 +142,7 @@ import { ResourceGuardModal, type ResourceGuardConfirmSelection } from "./Resour
 import { ConfirmDeleteDialog } from "./ConfirmDeleteDialog";
 import { idbPut } from "@/lib/storage/indexedDb";
 import {
+  commitProjectSyncResultAtomically,
   getProjectRecord,
   setActiveProjectId,
   subscribeProjectSyncBroadcast,
@@ -433,6 +434,7 @@ export function BandMixer() {
   const [projectListEntries, setProjectListEntries] = useState<ProjectListEntrySummary[]>([]);
   const [projectListLoading, setProjectListLoading] = useState(false);
   const [projectListError, setProjectListError] = useState<string | null>(null);
+  const [projectListIncompleteReason, setProjectListIncompleteReason] = useState<string | null>(null);
   const cloudProjectsMapRef = useRef(new Map<string, { project: BandProject; driveVersion?: string | null }>());
   const [promoteProgress, setPromoteProgress] = useState<PromoteLocalToDriveProgress | null>(null);
   const [promoteBackupFailures, setPromoteBackupFailures] = useState<Array<{ entryId: string; displayName: string; reason: string }>>([]);
@@ -466,6 +468,36 @@ export function BandMixer() {
         job.stage === "pausing" ||
         job.stage === "cancelling"),
   );
+
+  function shouldApplyIncomingProjectRecord(
+    current: PersistedProjectRecord | null,
+    incoming: PersistedProjectRecord,
+    currentGoogleAccountId: string | null,
+  ): boolean {
+    if (
+      incoming.storageProvider === "google_drive" &&
+      incoming.ownerAccountId &&
+      currentGoogleAccountId &&
+      incoming.ownerAccountId !== currentGoogleAccountId
+    ) {
+      return false;
+    }
+    if (!current) return true;
+    if (current.projectId !== incoming.projectId) return false;
+    if (incoming.localRevision < current.localRevision) {
+      return false;
+    }
+    if (
+      incoming.localRevision === current.localRevision &&
+      current.dirty &&
+      !incoming.dirty &&
+      current.project.revisionToken !== incoming.project.revisionToken &&
+      incoming.lastSyncedRemoteRevisionToken !== incoming.project.revisionToken
+    ) {
+      return false;
+    }
+    return true;
+  }
 
   const getEngine = useCallback(() => {
     if (!engineRef.current) {
@@ -775,19 +807,36 @@ export function BandMixer() {
     };
   }, []);
 
+  const applyActiveProjectRecordMonotonically = useCallback((incoming: PersistedProjectRecord) => {
+    const current = activeProjectRecordRef.current;
+    const currentAcc = sharedGoogleAccountManager.getSnapshot().account?.accountId ?? null;
+    if (!shouldApplyIncomingProjectRecord(current, incoming, currentAcc)) {
+      return false;
+    }
+    activeProjectRecordRef.current = incoming;
+    activeProjectIdRef.current = incoming.projectId;
+    setActiveProjectRecord(incoming);
+    return true;
+  }, []);
+
   if (!autoSyncControllerRef.current) {
     autoSyncControllerRef.current = new ProjectAutoSyncController({
       getAuthContext: getProjectAuthContext,
       onStatusChanged: (projectId, outcome) => {
         if (!mountedRef.current || activeProjectIdRef.current !== projectId) return;
+        if (outcome.status === "local_save_error") {
+          showShortcutHint(outcome.errorMessage || "寫入本機專案資料庫失敗。");
+          return;
+        }
         if ("record" in outcome && outcome.record) {
-          activeProjectRecordRef.current = outcome.record;
-          setActiveProjectRecord(outcome.record);
+          applyActiveProjectRecordMonotonically(outcome.record);
+          if (outcome.status === "synced" && outcome.superseded) {
+            showShortcutHint("同步期間偵測到新的本機變更，已保留最新設定並排程下一次同步。");
+          }
         } else if (outcome.status === "conflict") {
           void getProjectRecord(projectId).then((fresh) => {
             if (fresh && mountedRef.current && activeProjectIdRef.current === projectId) {
-              activeProjectRecordRef.current = fresh;
-              setActiveProjectRecord(fresh);
+              applyActiveProjectRecordMonotonically(fresh);
             }
           });
         }
@@ -2194,6 +2243,7 @@ export function BandMixer() {
           setDriveLibraryEntries([]);
           setDriveLibraryInvalidEntries([]);
           setDriveLibraryError(null);
+          setProjectListIncompleteReason(null);
           cloudProjectsMapRef.current.clear();
           setProjectListEntries((prev) => prev.filter((item) => item.storageProvider === "local"));
           if (reason !== "switched") {
@@ -2224,7 +2274,7 @@ export function BandMixer() {
                 setRestoreAttempt((n) => n + 1);
               }
             });
-            showShortcutHint("已切換 Google 帳號，已卸載前帳號的雲端專案畫面（本機快取安全保留）。");
+            showShortcutHint("已切換 Google 帳號，已卸載前帳號的雲端專案畫面（未儲存修改與本機快取安全保留）。");
           }
         }
         if (reason === "expired") {
@@ -2232,13 +2282,26 @@ export function BandMixer() {
           setDriveExportError("Google 授權已過期，請重新授權後接續上傳。");
           const activeProj = activeProjectRecordRef.current;
           if (activeProj && activeProj.storageProvider === "google_drive" && activeProj.dirty) {
-            const waitingProj: PersistedProjectRecord = {
-              ...activeProj,
-              syncStatus: "waiting_auth",
-              lastError: "Google 授權已過期，請重新授權後同步變更（本機已安全保存）。",
-            };
-            activeProjectRecordRef.current = waitingProj;
-            setActiveProjectRecord(waitingProj);
+            const waitMsg = "Google 授權已過期，請重新授權後同步變更（本機已安全保存）。";
+            void commitProjectSyncResultAtomically({
+              projectId: activeProj.projectId,
+              expectedBase: {
+                ownerAccountId: activeProj.ownerAccountId,
+                syncGeneration: activeProj.syncGeneration,
+                localRevision: activeProj.localRevision,
+                revisionToken: activeProj.project.revisionToken,
+              },
+              kind: "waiting_auth",
+              remoteMetadata: { lastError: waitMsg },
+            }).then((commitRes) => {
+              if (
+                commitRes.committed &&
+                mountedRef.current &&
+                activeProjectIdRef.current === activeProj.projectId
+              ) {
+                applyActiveProjectRecordMonotonically(commitRes.record);
+              }
+            });
           }
         }
       },
@@ -2257,6 +2320,7 @@ export function BandMixer() {
       }
       feedbackTimers.forEach((timer) => window.clearTimeout(timer));
       feedbackTimers.clear();
+      void autoSyncControllerRef.current?.dispose();
       sharedPerfTelemetry.stopObserving();
       engineRef.current?.dispose();
       engineRef.current = null;
@@ -6344,9 +6408,14 @@ export function BandMixer() {
   }, []);
 
   const clearWorkspaceForProjectSwitch = useCallback(async () => {
+    const prevProjectId = activeProjectIdRef.current;
     await Promise.all([
       flushPendingSongPersists().catch(() => undefined),
-      autoSyncControllerRef.current?.flushLocalSaves().catch(() => undefined),
+      prevProjectId
+        ? autoSyncControllerRef.current
+            ?.invalidateProject(prevProjectId, { discardPendingLocal: false })
+            .catch(() => undefined)
+        : autoSyncControllerRef.current?.flushLocalSaves({ suppressStatusCallback: true }).catch(() => undefined),
     ]);
     const engine = getEngine();
     for (const s of sessionRef.current.songs) {
@@ -6379,6 +6448,7 @@ export function BandMixer() {
     const auth = getProjectAuthContext();
     setProjectListLoading(true);
     setProjectListError(null);
+    setProjectListIncompleteReason(null);
     try {
       const res = await listAllProjectsForUi({
         currentAccountId: auth.accountId,
@@ -6389,6 +6459,11 @@ export function BandMixer() {
       cloudProjectsMapRef.current = res.cloudProjectsMap;
       setProjectListEntries(res.projects);
       setProjectListError(res.cloudError ?? null);
+      setProjectListIncompleteReason(
+        res.cloudListIncomplete
+          ? res.cloudIncompleteReason || "雲端專案清單未完整讀取（僅顯示已讀取部分）"
+          : null,
+      );
     } catch (err) {
       if (mountedRef.current) {
         setProjectListError(err instanceof Error ? err.message : "無法載入專案清單。");
@@ -6600,15 +6675,17 @@ export function BandMixer() {
         incrementRevision: true,
       });
       if (!updated || gen !== projectOpGenerationRef.current || !mountedRef.current) return;
-      activeProjectRecordRef.current = updated;
-      setActiveProjectRecord(updated);
+      applyActiveProjectRecordMonotonically(updated);
       if (updated.storageProvider === "google_drive") {
         const outcome: ProjectDriveSyncOutcome | null =
           (await autoSyncControllerRef.current?.triggerDriveSync(updated.projectId)) ?? null;
         if (outcome?.status === "synced") {
-          activeProjectRecordRef.current = outcome.record;
-          setActiveProjectRecord(outcome.record);
-          showShortcutHint(`已同步「${outcome.record.project.name}」（v${outcome.record.localRevision}）至 Google Drive。`);
+          applyActiveProjectRecordMonotonically(outcome.record);
+          showShortcutHint(
+            outcome.superseded
+              ? "同步期間偵測到新的本機變更，已保留最新設定並排程下一次同步。"
+              : `已同步「${outcome.record.project.name}」（v${outcome.record.localRevision}）至 Google Drive。`,
+          );
         } else if (outcome?.status === "conflict") {
           showShortcutHint("偵測到跨裝置版本衝突，請選擇衝突處理方式。");
           openProjectModal("conflict");
@@ -7727,6 +7804,7 @@ export function BandMixer() {
         projects={projectListEntries}
         projectsLoading={projectListLoading}
         cloudError={projectListError}
+        cloudIncompleteReason={projectListIncompleteReason}
         account={googleAuth.account}
         isGoogleConfigured={isGoogleDrivePickerConfigured()}
         hasLegacyWorkspaceSongs={hasLegacyWorkspaceSongs}

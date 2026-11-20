@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type { GoogleAccount } from "@/lib/google/googleAuthTypes";
 import { computeEntryBackupStatus } from "@/lib/projects/projectModel";
+import { DRIVE_CAS_LIMITATION_NOTE } from "@/lib/projects/projectDriveSync";
 import type { PromoteLocalToDriveProgress } from "@/lib/projects/projectManager";
 import type {
   ProjectOfflineAssessment,
@@ -36,6 +37,7 @@ type Props = {
   projects: ProjectListEntrySummary[];
   projectsLoading: boolean;
   cloudError: string | null;
+  cloudIncompleteReason?: string | null;
   account: GoogleAccount | null;
   isGoogleConfigured: boolean;
   hasLegacyWorkspaceSongs: boolean;
@@ -305,7 +307,16 @@ export function ProjectManagerDialog(props: Props) {
               </div>
             )}
 
-            {props.cloudError && (
+            {props.cloudIncompleteReason && (
+              <div role="status" className="card-warning-banner grid" style={{ gap: 2 }}>
+                <strong style={{ fontSize: 12 }}>Google Drive 雲端專案清單可能不完整</strong>
+                <span className="small">
+                  僅顯示已讀取的部分專案（尚未列出全部，或部分項目讀取異常）：{props.cloudIncompleteReason}
+                </span>
+              </div>
+            )}
+
+            {props.cloudError && props.cloudError !== props.cloudIncompleteReason && (
               <div role="status" className="card-warning-banner">
                 <span>Google Drive 雲端清單讀取異常（仍可正常開啟本機專案與快取）：{props.cloudError}</span>
               </div>
@@ -705,8 +716,17 @@ export function ProjectManagerDialog(props: Props) {
 
         {mode === "conflict" && activeProject?.conflictInfo && (
           <div className="grid" style={{ gap: 12 }}>
-            <div className="card-warning-banner">
+            <div className="card-warning-banner grid" style={{ gap: 4 }}>
               <span>{activeProject.conflictInfo.reason}</span>
+              {activeProject.conflictInfo.conflictSubType === "sibling_branch" &&
+                activeProject.conflictInfo.siblingRevisions && (
+                  <span className="small">
+                    分支詳情：同父版本共發現 {activeProject.conflictInfo.siblingRevisions.length} 個保留中的不可變 Revision 快照，系統未進行任何自動合併或刪除。
+                  </span>
+                )}
+              <span className="small" style={{ opacity: 0.8 }}>
+                {DRIVE_CAS_LIMITATION_NOTE}
+              </span>
             </div>
             <div className="project-conflict-grid">
               <div className="mixer-modal-section grid" style={{ gap: 4 }}>

@@ -1,7 +1,7 @@
 import { getAllProjectRecords, listCloudCachedProjectRecordsByAccount } from "../storage/projectStore.ts";
 import { loadPersistedBandSession } from "../storage/songSessionStore.ts";
-import { listCloudProjects } from "./projectDriveSync.ts";
-import type { PersistedProjectRecord } from "./projectTypes.ts";
+import { listCloudProjectsDetailed } from "./projectDriveSync.ts";
+import type { PersistedProjectRecord, ProjectSongArtifactRef } from "./projectTypes.ts";
 
 export interface LocalProjectResourceReferenceSummary {
   referencedSourceAudioHashes: Set<string>;
@@ -83,9 +83,33 @@ export interface CloudArtifactReferenceCheckResult {
   reason?: string;
 }
 
+function matchesTargetCloudArtifactRevision(
+  ref: ProjectSongArtifactRef,
+  params: { manifestFileId: string; revisionId: string; sourceAudioHash: string },
+): "matched" | "ambiguous_missing_revision" | "not_matched" {
+  if (params.manifestFileId && ref.manifestFileId === params.manifestFileId) {
+    return "matched";
+  }
+  if (params.revisionId && ref.revisionId === params.revisionId) {
+    return "matched";
+  }
+  if (params.revisionId && ref.derivedFrom?.sourceRevisionId === params.revisionId) {
+    return "matched";
+  }
+  if (
+    ref.sourceAudioHash === params.sourceAudioHash &&
+    !ref.revisionId &&
+    !ref.manifestFileId
+  ) {
+    return "ambiguous_missing_revision";
+  }
+  return "not_matched";
+}
+
 /**
  * 刪除 Google Drive `songs/.../revisions/...` 成果前，檢查是否仍有同帳戶雲端專案引用該成果。
- * 若無法取得完整雲端專案清單（離線/權限不足/API 錯誤），禁止自動刪除，以防誤刪仍被其他專案引用的成果。
+ * - 完整分頁讀取全部受管理雲端專案；不可只依 sourceAudioHash 判定指定 Revision 可刪除。
+ * - 若清單讀取失敗、Abort、分頁重複/超限、或部分專案缺檔/驗證失敗（incomplete），一律 fail closed 禁止刪除。
  */
 export async function checkCloudArtifactReferencesAcrossProjects(params: {
   manifestFileId: string;
@@ -93,54 +117,55 @@ export async function checkCloudArtifactReferencesAcrossProjects(params: {
   sourceAudioHash: string;
   accountId: string;
   accessToken: string;
+  pageSize?: number;
+  maxPages?: number;
+  maxItems?: number;
+  maxRetriesPerPage?: number;
+  retryDelayMs?: readonly number[];
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
 }): Promise<CloudArtifactReferenceCheckResult> {
   const referencingProjectIds = new Set<string>();
   const referencingProjectNames = new Set<string>();
+  let ambiguousReferenceFound = false;
+
+  const inspectProject = (projectId: string, projectName: string, songs: ReadonlyArray<{ artifactRef?: ProjectSongArtifactRef | null }>) => {
+    for (const entry of songs) {
+      const ref = entry.artifactRef;
+      if (!ref) continue;
+      const match = matchesTargetCloudArtifactRevision(ref, params);
+      if (match === "matched") {
+        referencingProjectIds.add(projectId);
+        referencingProjectNames.add(projectName);
+      } else if (match === "ambiguous_missing_revision") {
+        ambiguousReferenceFound = true;
+        referencingProjectIds.add(projectId);
+        referencingProjectNames.add(projectName);
+      }
+    }
+  };
 
   const cachedCloudProjects = await listCloudCachedProjectRecordsByAccount(
     params.accountId,
   ).catch(() => []);
   for (const rec of cachedCloudProjects) {
-    for (const entry of rec.project.songs) {
-      const ref = entry.artifactRef;
-      if (!ref) continue;
-      if (
-        ref.manifestFileId === params.manifestFileId ||
-        (ref.sourceAudioHash === params.sourceAudioHash &&
-          ref.revisionId === params.revisionId)
-      ) {
-        referencingProjectIds.add(rec.projectId);
-        referencingProjectNames.add(rec.project.name);
-      }
-    }
+    inspectProject(rec.projectId, rec.project.name, rec.project.songs);
   }
 
-  let remoteCheckedOk = false;
+  let listRes;
   try {
-    const remoteProjects = await listCloudProjects({
+    listRes = await listCloudProjectsDetailed({
       accountId: params.accountId,
       accessToken: params.accessToken,
       strict: true,
+      pageSize: params.pageSize,
+      maxPages: params.maxPages,
+      maxItems: params.maxItems,
+      maxRetriesPerPage: params.maxRetriesPerPage,
+      retryDelayMs: params.retryDelayMs,
       signal: params.signal,
       fetchImpl: params.fetchImpl,
     });
-    remoteCheckedOk = true;
-    for (const { project } of remoteProjects) {
-      for (const entry of project.songs) {
-        const ref = entry.artifactRef;
-        if (!ref) continue;
-        if (
-          ref.manifestFileId === params.manifestFileId ||
-          (ref.sourceAudioHash === params.sourceAudioHash &&
-            ref.revisionId === params.revisionId)
-        ) {
-          referencingProjectIds.add(project.projectId);
-          referencingProjectNames.add(project.name);
-        }
-      }
-    }
   } catch (err) {
     return {
       safeToDelete: false,
@@ -151,24 +176,37 @@ export async function checkCloudArtifactReferencesAcrossProjects(params: {
     };
   }
 
-  if (!remoteCheckedOk) {
+  if (
+    !listRes.complete ||
+    listRes.truncated ||
+    listRes.failedProjectIds.length > 0 ||
+    listRes.missingFileProjectIds.length > 0
+  ) {
     return {
       safeToDelete: false,
       unknownCloudCoverage: true,
       referencingProjectIds: Array.from(referencingProjectIds),
       referencingProjectNames: Array.from(referencingProjectNames),
-      reason: "無法確認雲端所有專案是否仍在引用此分軌。",
+      reason:
+        listRes.errorMessage ||
+        "雲端專案清單未完整讀取完畢（分頁受限或部分專案無法讀取），為避免誤刪已拒絕自動刪除。",
     };
+  }
+
+  for (const { project } of listRes.projects) {
+    inspectProject(project.projectId, project.name, project.songs);
   }
 
   if (referencingProjectIds.size > 0) {
     const names = Array.from(referencingProjectNames);
     return {
       safeToDelete: false,
-      unknownCloudCoverage: false,
+      unknownCloudCoverage: ambiguousReferenceFound,
       referencingProjectIds: Array.from(referencingProjectIds),
       referencingProjectNames: names,
-      reason: `此分軌成果仍被 ${names.length} 個雲端專案引用：${names.join("、")}。請先從該專案移除或改版後再刪除。`,
+      reason: ambiguousReferenceFound
+        ? `偵測到 ${names.length} 個專案引用同來源音訊且缺少明確 Revision 資訊，保守拒絕自動刪除：${names.join("、")}。`
+        : `此分軌成果仍被 ${names.length} 個雲端專案引用：${names.join("、")}。請先從該專案移除或改版後再刪除。`,
     };
   }
 

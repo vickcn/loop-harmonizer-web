@@ -115,6 +115,8 @@ export interface SeparationCheckpoint {
   entryId?: string | null;
   /** 本機 Checkpoint 已匯出發布至 Google Drive 的確定 Revision ID 紀錄 */
   exportedRevisionIds?: string[];
+  /** 對應各 exportedRevisionId 的分軌 WAV SHA-256 Checksum 證明 */
+  exportedChecksumsByRevision?: Record<string, Record<string, string>>;
   createdAt: number;
   updatedAt: number;
 }
@@ -229,23 +231,82 @@ export function buildInitialCheckpoint(params: {
 export async function recordCheckpointExportedRevision(
   taskId: string,
   revisionId: string,
-): Promise<void> {
-  if (!taskId || !revisionId) return;
-  await withIdbTransaction("separationCheckpoints", "readwrite", async (tx) => {
-    const store = tx.objectStore("separationCheckpoints");
-    const existing = (await idbRequestPromise(store.get(taskId))) as
-      | SeparationCheckpoint
-      | undefined;
-    if (!existing) return;
-    const next = Array.from(new Set([...(existing.exportedRevisionIds ?? []), revisionId]));
-    await idbRequestPromise(
-      store.put({
-        ...existing,
-        exportedRevisionIds: next,
-        updatedAt: Date.now(),
-      } satisfies SeparationCheckpoint),
-    );
-  }).catch(() => undefined);
+  checksumsByRole?: Record<string, string>,
+): Promise<{ saved: boolean; errorMessage?: string }> {
+  if (!taskId || !revisionId) return { saved: false, errorMessage: "缺少 taskId 或 revisionId。" };
+  try {
+    return await withIdbTransaction("separationCheckpoints", "readwrite", async (tx) => {
+      const store = tx.objectStore("separationCheckpoints");
+      const existing = (await idbRequestPromise(store.get(taskId))) as
+        | SeparationCheckpoint
+        | undefined;
+      if (!existing) return { saved: false, errorMessage: "找不到目標 Checkpoint。" };
+      const next = Array.from(new Set([...(existing.exportedRevisionIds ?? []), revisionId]));
+      const nextChecksumsByRev =
+        checksumsByRole && Object.keys(checksumsByRole).length > 0
+          ? {
+              ...(existing.exportedChecksumsByRevision ?? {}),
+              [revisionId]: {
+                ...(existing.exportedChecksumsByRevision?.[revisionId] ?? {}),
+                ...checksumsByRole,
+              },
+            }
+          : existing.exportedChecksumsByRevision;
+      await idbRequestPromise(
+        store.put({
+          ...existing,
+          exportedRevisionIds: next,
+          ...(nextChecksumsByRev ? { exportedChecksumsByRevision: nextChecksumsByRev } : {}),
+          updatedAt: Date.now(),
+        } satisfies SeparationCheckpoint),
+      );
+      return { saved: true };
+    });
+  } catch (err) {
+    return {
+      saved: false,
+      errorMessage: err instanceof Error ? err.message : "寫入 Checkpoint 匯出版本失敗。",
+    };
+  }
+}
+
+export async function saveCheckpointRevisionChecksums(
+  taskId: string,
+  revisionId: string,
+  checksumsByRole: Record<string, string>,
+): Promise<{ saved: boolean; errorMessage?: string }> {
+  if (!taskId || !revisionId || Object.keys(checksumsByRole).length === 0) {
+    return { saved: false, errorMessage: "缺少寫入 Checkpoint Checksum 所需資訊。" };
+  }
+  try {
+    return await withIdbTransaction("separationCheckpoints", "readwrite", async (tx) => {
+      const store = tx.objectStore("separationCheckpoints");
+      const existing = (await idbRequestPromise(store.get(taskId))) as
+        | SeparationCheckpoint
+        | undefined;
+      if (!existing) return { saved: false, errorMessage: "找不到目標 Checkpoint。" };
+      const nextChecksumsByRev = {
+        ...(existing.exportedChecksumsByRevision ?? {}),
+        [revisionId]: {
+          ...(existing.exportedChecksumsByRevision?.[revisionId] ?? {}),
+          ...checksumsByRole,
+        },
+      };
+      await idbRequestPromise(
+        store.put({
+          ...existing,
+          exportedChecksumsByRevision: nextChecksumsByRev,
+          updatedAt: Date.now(),
+        } satisfies SeparationCheckpoint),
+      );
+      return { saved: true };
+    });
+  } catch (err) {
+    return {
+      saved: false,
+      errorMessage: err instanceof Error ? err.message : "儲存 Checkpoint Checksum 失敗。",
+    };
+  }
 }
 
 export async function getCheckpoint(taskId: string): Promise<SeparationCheckpoint | null> {

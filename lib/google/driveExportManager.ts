@@ -549,7 +549,12 @@ export async function exportSongArtifactsToDrive(params: {
     });
 
     if (pinnedTaskId) {
-      await recordCheckpointExportedRevision(pinnedTaskId, revisionId).catch(() => undefined);
+      const exportedChecksums: Record<string, string> = {};
+      for (const role of requiredRoles) {
+        const cs = artifacts[role]?.checksum;
+        if (cs) exportedChecksums[role] = cs;
+      }
+      await recordCheckpointExportedRevision(pinnedTaskId, revisionId, exportedChecksums);
     }
 
     params.onProgress?.({

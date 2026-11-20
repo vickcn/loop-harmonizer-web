@@ -19,12 +19,13 @@ import {
   saveProjectToDrive,
 } from "../lib/projects/projectDriveSync.ts";
 import { buildProjectFromBandSongs, createEmptyProject, createInitialPersistedProjectRecord } from "../lib/projects/projectModel.ts";
-import { createNewProject, listAllProjectsForUi } from "../lib/projects/projectManager.ts";
+import { createNewProject, deleteProjectSafely, listAllProjectsForUi } from "../lib/projects/projectManager.ts";
 import {
   configureInMemoryIdbForTests,
   resetInMemoryIdbForTests,
+  setInMemoryIdbHooksForTests,
 } from "../lib/storage/indexedDb.ts";
-import { getProjectRecord } from "../lib/storage/projectStore.ts";
+import { getProjectRecord, saveProjectRecord } from "../lib/storage/projectStore.ts";
 
 function createProjectDriveMockServer() {
   let nextId = 1;
@@ -503,6 +504,484 @@ test("Resumable upload distinguishes fresh upload, in-memory byte resume, and co
     assert.equal(reusedRes.resumeMode, "reused_completed_artifact");
   } finally {
     clearResumableSessionUrisForAccount();
+    resetInMemoryIdbForTests();
+  }
+});
+
+function createDeferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+test("P0 race: concurrent edits during v10 Drive upload (both flushed and within debounce) are never overwritten by stale sync snapshot, including retry/401/tombstone/IDB errors", async () => {
+  configureInMemoryIdbForTests();
+  clearCachedFolderLayoutForAccount();
+  try {
+    const server = createProjectDriveMockServer();
+    let holdV10Patch = null;
+    let holdV10Entered = null;
+    const observedSyncedBpmHistory = [];
+
+    const wrappedFetch = async (url, init) => {
+      const u = new URL(String(url));
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (
+        (method === "POST" || method === "PATCH") &&
+        u.pathname.startsWith("/upload/drive/v3/files") &&
+        String(init?.body ?? "").includes('"lhRole":"project_json"') &&
+        holdV10Patch
+      ) {
+        const d = holdV10Patch;
+        holdV10Patch = null;
+        holdV10Entered?.resolve();
+        await d.promise;
+      }
+      return server.fetchImpl(url, init);
+    };
+
+    const auth = {
+      accountId: "google:user-a",
+      accessToken: "token-a",
+      generation: 1,
+      isGenerationValid: (g, a) => g === auth.generation && a === auth.accountId,
+    };
+
+    // 建立並預先把專案推進到 localRevision=10
+    const baseSong10 = {
+      ...createBandSong({
+        id: "e1",
+        projectEntryId: "e1",
+        name: "Race Track",
+        fileName: "race.mp3",
+        sourceAudioId: "e1_original",
+        settingsKey: "k-race",
+        originalBpm: 120,
+        sourceAudioHash: "r".repeat(64),
+        durationSec: 120,
+      }),
+      targetBpm: 100,
+      keyShiftSemitones: 0,
+      masterVolume: 0.5,
+    };
+    let rec = createInitialPersistedProjectRecord(
+      buildProjectFromBandSongs({
+        existingProject: createEmptyProject({
+          name: "Race Project v10",
+          storageProvider: "google_drive",
+          ownerAccountId: "google:user-a",
+        }),
+        songs: [baseSong10],
+        incrementRevision: false,
+      }),
+      { dirty: true, syncStatus: "dirty" },
+    );
+    rec = {
+      ...rec,
+      project: { ...rec.project, revision: 10, revisionToken: "r10-tok" },
+      localBaseRevision: 10,
+      localBaseRevisionToken: "r10-tok",
+      localRevision: 10,
+    };
+    await saveProjectRecord(rec);
+
+    const statusEvents = [];
+    const controller = new ProjectAutoSyncController({
+      localDebounceMs: 60,
+      driveDebounceMs: 200,
+      retryBackoffMs: [20, 40],
+      getAuthContext: () => auth,
+      syncDriveFn: (syncParams) => saveProjectToDrive({ ...syncParams, fetchImpl: wrappedFetch }),
+      onStatusChanged: (_id, outcome) => {
+        statusEvents.push(outcome);
+        if ("record" in outcome && outcome.record?.project?.songs?.[0]) {
+          observedSyncedBpmHistory.push({
+            status: outcome.status,
+            rev: outcome.record.localRevision,
+            bpm: outcome.record.project.songs[0].settings.targetBpm,
+            dirty: outcome.record.dirty,
+          });
+        }
+      },
+    });
+
+    holdV10Entered = createDeferred();
+    const patchDeferred = createDeferred();
+    holdV10Patch = patchDeferred;
+
+    // 1. 開始同步 v10（會停在 PATCH project.json 的 Deferred Promise）
+    const v10SyncPromise = controller.triggerDriveSync(rec.projectId);
+    await holdV10Entered.promise;
+
+    // 2. 同步卡在半途期間：先編輯形成 localRevision=11 且讓它寫進 IDB，再編輯形成 localRevision=12 停在 Debounce 記憶體內
+    const rec11 = {
+      ...rec,
+      project: buildProjectFromBandSongs({
+        existingProject: rec.project,
+        songs: [{ ...baseSong10, targetBpm: 111, keyShiftSemitones: 1, masterVolume: 0.61 }],
+        incrementRevision: true,
+      }),
+    };
+    rec11.localRevision = 11;
+    rec11.project.revision = 11;
+    rec11.project.revisionToken = "r11-tok";
+    controller.scheduleProjectEdit(rec11, { immediateLocal: true });
+    await controller.flushLocalSaves({ projectId: rec.projectId });
+
+    const rec12 = {
+      ...rec11,
+      project: buildProjectFromBandSongs({
+        existingProject: rec11.project,
+        songs: [{ ...baseSong10, targetBpm: 142, keyShiftSemitones: 3, masterVolume: 0.88 }],
+        incrementRevision: true,
+      }),
+    };
+    rec12.localRevision = 12;
+    rec12.project.revision = 12;
+    rec12.project.revisionToken = "r12-tok";
+    // 特意不 immediateLocal，讓 v12 在 Debounce 內，驗證 v10 commit 前會透過 onBeforeCommit flush v12
+    controller.scheduleProjectEdit(rec12, { immediateLocal: false });
+
+    // 3. 放行 v10 上傳完成！
+    patchDeferred.resolve();
+    const firstOutcome = await v10SyncPromise;
+    assert.equal(firstOutcome?.status, "synced");
+    assert.equal(firstOutcome?.superseded, true);
+    // v10 提交結果絕對不可把本機狀態倒退回 v10 (100 BPM)！
+    assert.equal(firstOutcome?.record.localRevision, 12);
+    assert.equal(firstOutcome?.record.dirty, true);
+    assert.equal(firstOutcome?.record.project.songs[0].settings.targetBpm, 142);
+    assert.equal(firstOutcome?.record.lastSyncedRemoteRevision, 10);
+
+    // 等待 follow-up sync 自動把 v12 同步上 Drive
+    await new Promise((r) => setTimeout(r, 120));
+    const afterFollowUp = await getProjectRecord(rec.projectId);
+    assert.equal(afterFollowUp.localRevision, 12);
+    assert.equal(afterFollowUp.dirty, false);
+    assert.equal(afterFollowUp.syncStatus, "synced");
+    assert.equal(afterFollowUp.project.songs[0].settings.targetBpm, 142);
+    assert.equal(afterFollowUp.project.songs[0].settings.keyShiftSemitones, 3);
+    // 全程 onStatusChanged 從未把 stale 100 BPM 覆寫回流到 UI
+    assert.equal(observedSyncedBpmHistory.some((h) => h.bpm === 100), false);
+
+    // 4. 同步失敗/503 重試/401 及帳號切換時一樣絕不覆蓋較新本機修改
+    const rec13 = {
+      ...afterFollowUp,
+      dirty: true,
+      syncStatus: "dirty",
+      localRevision: 13,
+      project: {
+        ...afterFollowUp.project,
+        revision: 13,
+        revisionToken: "r13-tok",
+        songs: [
+          {
+            ...afterFollowUp.project.songs[0],
+            settings: { ...afterFollowUp.project.songs[0].settings, targetBpm: 155 },
+          },
+        ],
+      },
+    };
+    await saveProjectRecord(rec13);
+
+    // 4a. 503 retryable 失敗後自動重試期間又有新編輯 -> 最終必須保留最新修改並成功同步
+    let transient503Count = 1;
+    let first503Done = false;
+    const retryHold = createDeferred();
+    const retryCtrl = new ProjectAutoSyncController({
+      localDebounceMs: 20,
+      driveDebounceMs: 50,
+      retryBackoffMs: [25],
+      getAuthContext: () => auth,
+      syncDriveFn: async (syncParams) => {
+        if (transient503Count > 0) {
+          transient503Count -= 1;
+          return saveProjectToDrive({
+            ...syncParams,
+            fetchImpl: async () => new Response("Retryable 503", { status: 503 }),
+          });
+        }
+        const out = await saveProjectToDrive({ ...syncParams, fetchImpl: server.fetchImpl });
+        if (out.status === "synced" && first503Done) {
+          retryHold.resolve();
+        }
+        return out;
+      },
+    });
+    const firstRetryTry = await retryCtrl.triggerDriveSync(rec.projectId);
+    assert.equal(firstRetryTry?.status, "error");
+    const rec13b = {
+      ...rec13,
+      localRevision: 14,
+      project: {
+        ...rec13.project,
+        revision: 14,
+        revisionToken: "r14-retry-tok",
+        songs: [{ ...rec13.project.songs[0], settings: { ...rec13.project.songs[0].settings, targetBpm: 158 } }],
+      },
+    };
+    retryCtrl.scheduleProjectEdit(rec13b, { immediateLocal: true });
+    first503Done = true;
+    await retryCtrl.triggerDriveSync(rec.projectId);
+    const dbAfterRetry = await getProjectRecord(rec.projectId);
+    assert.equal(dbAfterRetry.localRevision, 14);
+    assert.equal(dbAfterRetry.project.songs[0].settings.targetBpm, 158);
+    assert.equal(dbAfterRetry.syncStatus, "synced");
+    await retryCtrl.dispose();
+
+    // 4b. 401 waiting_auth 與帳號切換競態
+    const dirtyBefore401 = {
+      ...dbAfterRetry,
+      dirty: true,
+      syncStatus: "dirty",
+      localRevision: 15,
+      project: {
+        ...dbAfterRetry.project,
+        revision: 15,
+        revisionToken: "r15-tok",
+        songs: [{ ...dbAfterRetry.project.songs[0], settings: { ...dbAfterRetry.project.songs[0].settings, targetBpm: 161 } }],
+      },
+    };
+    await saveProjectRecord(dirtyBefore401);
+    const hold401 = createDeferred();
+    const res401Promise = saveProjectToDrive({
+      record: dirtyBefore401,
+      accountId: "google:user-a",
+      accessToken: "expired-token",
+      generation: 1,
+      isGenerationValid: auth.isGenerationValid,
+      onBeforeCommit: async () => {
+        await hold401.promise;
+      },
+      fetchImpl: server.fetchImpl,
+    });
+    const rec16 = {
+      ...dirtyBefore401,
+      localRevision: 16,
+      project: {
+        ...dirtyBefore401.project,
+        revision: 16,
+        revisionToken: "r16-tok",
+        songs: [
+          {
+            ...dirtyBefore401.project.songs[0],
+            settings: { ...dirtyBefore401.project.songs[0].settings, targetBpm: 166 },
+          },
+        ],
+      },
+    };
+    await saveProjectRecord(rec16);
+    hold401.resolve();
+    const outcome401 = await res401Promise;
+    assert.equal(outcome401.status, "waiting_auth");
+    const dbAfter401 = await getProjectRecord(rec.projectId);
+    assert.equal(dbAfter401.localRevision, 16);
+    assert.equal(dbAfter401.project.songs[0].settings.targetBpm, 166);
+    assert.equal(dbAfter401.dirty, true);
+
+    // 4c. 同步進行中發生帳號切換（generation 過期）-> 回傳 cancelled 且不覆蓋較新本機資料
+    const holdSwitchRace = createDeferred();
+    const switchRacePromise = saveProjectToDrive({
+      record: dbAfter401,
+      accountId: "google:user-a",
+      accessToken: "token-a",
+      generation: 1,
+      isGenerationValid: auth.isGenerationValid,
+      onBeforeCommit: async () => {
+        await holdSwitchRace.promise;
+      },
+      fetchImpl: server.fetchImpl,
+    });
+    const rec17 = {
+      ...dbAfter401,
+      localRevision: 17,
+      project: { ...dbAfter401.project, revision: 17, revisionToken: "r17-tok" },
+    };
+    await saveProjectRecord(rec17);
+    auth.generation = 2;
+    auth.accountId = "google:user-b";
+    holdSwitchRace.resolve();
+    const switchRaceOut = await switchRacePromise;
+    assert.equal(switchRaceOut.status, "cancelled");
+    assert.equal((await getProjectRecord(rec.projectId))?.localRevision, 17);
+    auth.generation = 1;
+    auth.accountId = "google:user-a";
+
+    // 5. 同步期間刪除專案 -> 寫入受 tombstone 保護回傳 cancelled，絕不復活
+    const delPromise = saveProjectToDrive({
+      record: dbAfter401,
+      accountId: "google:user-a",
+      accessToken: "token-a",
+      generation: 1,
+      isGenerationValid: auth.isGenerationValid,
+      onBeforeCommit: async () => {
+        await deleteProjectSafely({
+          projectId: rec.projectId,
+          scope: "local_only",
+          autoSyncController: controller,
+        });
+      },
+      fetchImpl: server.fetchImpl,
+    });
+    const delOutcome = await delPromise;
+    assert.equal(delOutcome.status, "cancelled");
+    assert.equal(await getProjectRecord(rec.projectId), null);
+
+    // 6. IndexedDB 寫入失敗時，絕不把 catch 後失敗誤當 synced / local_saved
+    const errProj = createInitialPersistedProjectRecord(
+      createEmptyProject({
+        name: "IDB Failure Probe",
+        storageProvider: "google_drive",
+        ownerAccountId: "google:user-a",
+      }),
+      { dirty: true, syncStatus: "dirty" },
+    );
+    await saveProjectRecord(errProj);
+    setInMemoryIdbHooksForTests({
+      beforeWrite(storeName) {
+        if (storeName === "projects") {
+          throw new Error("Simulated IDB write error");
+        }
+      },
+    });
+    const failedSync = await saveProjectToDrive({
+      record: errProj,
+      accountId: "google:user-a",
+      accessToken: "token-a",
+      generation: 1,
+      isGenerationValid: auth.isGenerationValid,
+      fetchImpl: server.fetchImpl,
+    });
+    assert.equal(failedSync.status, "error");
+    assert.notEqual(failedSync.status, "synced");
+
+    const localErrEvents = [];
+    const errCtrl = new ProjectAutoSyncController({
+      localDebounceMs: 20,
+      getAuthContext: () => auth,
+      onStatusChanged: (_id, out) => localErrEvents.push(out.status),
+    });
+    errCtrl.scheduleProjectEdit({ ...errProj, localRevision: 2 }, { immediateLocal: false });
+    await errCtrl.flushLocalSaves();
+    assert.equal(localErrEvents.includes("local_saved"), false);
+    assert.equal(localErrEvents.includes("local_save_error"), true);
+    await errCtrl.dispose();
+    await controller.dispose();
+  } finally {
+    setInMemoryIdbHooksForTests({});
+    clearCachedFolderLayoutForAccount();
+    resetInMemoryIdbForTests();
+  }
+});
+
+test("P1-2: account switch, sign out, token expiry, project switch, and dispose flush pending 500ms edits without polluting new account UI; tombstone blocks delayed recreate", async () => {
+  configureInMemoryIdbForTests();
+  clearCachedFolderLayoutForAccount();
+  try {
+    const server = createProjectDriveMockServer();
+    let currentAuth = {
+      accountId: "google:acc-a",
+      accessToken: "token-a",
+      generation: 1,
+      isGenerationValid: (g, a) => g === currentAuth.generation && a === currentAuth.accountId,
+    };
+
+    const makeProj = (name, accountId = "google:acc-a") =>
+      createInitialPersistedProjectRecord(
+        createEmptyProject({
+          name,
+          storageProvider: "google_drive",
+          ownerAccountId: accountId,
+        }),
+        { dirty: true, syncStatus: "dirty" },
+      );
+
+    const pSwitchAcc = makeProj("Pending Account Switch");
+    const pSwitchProj = makeProj("Pending Project Switch");
+    const pDispose = makeProj("Pending Unmount Dispose");
+    const pDeleted = makeProj("Deleted Before Flush");
+    await saveProjectRecord(pSwitchAcc);
+    await saveProjectRecord(pSwitchProj);
+    await saveProjectRecord(pDispose);
+    await saveProjectRecord(pDeleted);
+
+    const uiCallbacksAfterSwitch = [];
+    let activeUiAccount = "google:acc-a";
+    const ctrl = new ProjectAutoSyncController({
+      localDebounceMs: 500,
+      driveDebounceMs: 4000,
+      getAuthContext: () => currentAuth,
+      syncDriveFn: (p) => saveProjectToDrive({ ...p, fetchImpl: server.fetchImpl }),
+      onStatusChanged: (pid, outcome) => {
+        if (activeUiAccount !== "google:acc-a") {
+          uiCallbacksAfterSwitch.push({ pid, status: outcome.status });
+        }
+      },
+    });
+
+    // 1. 在 500ms Debounce 內編輯後立即切換帳號（模擬 Account A -> Account B）
+    const editedAcc = {
+      ...pSwitchAcc,
+      localRevision: 2,
+      project: { ...pSwitchAcc.project, revision: 2, revisionToken: "r2-acc-a", name: "Unsaved Before Switch" },
+    };
+    ctrl.scheduleProjectEdit(editedAcc); // 500ms local debounce 尚未到期
+    activeUiAccount = "google:acc-b";
+    currentAuth = {
+      accountId: "google:acc-b",
+      accessToken: "token-b",
+      generation: 2,
+      isGenerationValid: (g, a) => g === 2 && a === "google:acc-b",
+    };
+    await ctrl.invalidateAccount("google:acc-a");
+    assert.equal((await getProjectRecord(pSwitchAcc.projectId))?.project.name, "Unsaved Before Switch");
+    assert.equal(uiCallbacksAfterSwitch.length, 0); // 舊帳號不觸發 UI 回呼掛回新帳號畫面
+
+    // 2. 切回 Account A 後在 500ms 內切換另一專案 (invalidateProject(..., discardPendingLocal: false))
+    activeUiAccount = "google:acc-a";
+    currentAuth = {
+      accountId: "google:acc-a",
+      accessToken: "token-a",
+      generation: 3,
+      isGenerationValid: (g, a) => g === 3 && a === "google:acc-a",
+    };
+    const editedSwitchProj = {
+      ...pSwitchProj,
+      localRevision: 2,
+      project: { ...pSwitchProj.project, revision: 2, revisionToken: "r2-sw", name: "Saved On Project Switch" },
+    };
+    ctrl.scheduleProjectEdit(editedSwitchProj);
+    await ctrl.invalidateProject(pSwitchProj.projectId, { discardPendingLocal: false });
+    assert.equal((await getProjectRecord(pSwitchProj.projectId))?.project.name, "Saved On Project Switch");
+
+    // 3. 在 500ms Debounce 內主動刪除專案 -> 遵守 tombstone，絕不重建
+    ctrl.scheduleProjectEdit({
+      ...pDeleted,
+      localRevision: 2,
+      project: { ...pDeleted.project, revision: 2, revisionToken: "r2-del", name: "Should Stay Deleted" },
+    });
+    await deleteProjectSafely({
+      projectId: pDeleted.projectId,
+      scope: "local_only",
+      autoSyncController: ctrl,
+    });
+    await ctrl.flushLocalSaves();
+    assert.equal(await getProjectRecord(pDeleted.projectId), null);
+
+    // 4. 在 500ms Debounce 內元件 unmount 呼叫 dispose() -> 本機未提交資料必須安全落盤
+    ctrl.scheduleProjectEdit({
+      ...pDispose,
+      localRevision: 2,
+      project: { ...pDispose.project, revision: 2, revisionToken: "r2-disp", name: "Saved On Dispose" },
+    });
+    await ctrl.dispose();
+    assert.equal((await getProjectRecord(pDispose.projectId))?.project.name, "Saved On Dispose");
+  } finally {
+    clearCachedFolderLayoutForAccount();
     resetInMemoryIdbForTests();
   }
 });
