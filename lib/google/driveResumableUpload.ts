@@ -199,9 +199,15 @@ async function findAlreadyUploadedArtifactInFolder(params: {
   return null;
 }
 
+export type ResumableUploadResumeMode =
+  | "reused_completed_artifact"
+  | "in_memory_byte_resume"
+  | "fresh_upload";
+
 export interface ResumableUploadResult {
   status: "completed" | "paused" | "waiting_auth" | "cancelled" | "failed";
   job: DriveTransferJob;
+  resumeMode?: ResumableUploadResumeMode;
   remoteFileId?: string;
   sizeBytes?: number;
   md5Checksum?: string;
@@ -287,6 +293,8 @@ export async function uploadChunkedResumable(params: {
     params.onProgress?.(job);
   };
 
+  let usedInMemoryByteResume = false;
+
   try {
     // 1) 防重複建立：先檢查遠端是否已存在同 Revision 與 Artifact Role 之完整檔案
     const existingRemote = await findAlreadyUploadedArtifactInFolder({
@@ -308,6 +316,7 @@ export async function uploadChunkedResumable(params: {
       return {
         status: "completed",
         job,
+        resumeMode: "reused_completed_artifact",
         remoteFileId: existingRemote.id,
         sizeBytes: existingRemote.sizeBytes,
         md5Checksum: existingRemote.md5Checksum,
@@ -344,6 +353,7 @@ export async function uploadChunkedResumable(params: {
         return {
           status: "completed",
           job,
+          resumeMode: "in_memory_byte_resume",
           remoteFileId: probe.remoteFileId,
           sizeBytes: probe.sizeBytes,
           md5Checksum: probe.md5Checksum,
@@ -364,6 +374,9 @@ export async function uploadChunkedResumable(params: {
         offset = 0;
       } else {
         offset = Math.max(0, Math.min(totalBytes, probe.confirmedBytes));
+        if (offset > 0) {
+          usedInMemoryByteResume = true;
+        }
       }
     }
 
@@ -380,6 +393,7 @@ export async function uploadChunkedResumable(params: {
           lhAccountId: params.ownerAccountId,
           lhRevisionId: params.revisionId,
           lhArtifactRole: params.artifactRole,
+          lhSourceAudioHash: params.sourceAudioHash.slice(0, 64),
         },
         signal: params.signal,
         fetchImpl: fetchFn,
@@ -596,6 +610,7 @@ export async function uploadChunkedResumable(params: {
         return {
           status: "completed",
           job,
+          resumeMode: usedInMemoryByteResume ? "in_memory_byte_resume" : "fresh_upload",
           remoteFileId,
           sizeBytes: remoteSize,
           md5Checksum: body.md5Checksum,

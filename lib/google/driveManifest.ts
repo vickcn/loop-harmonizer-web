@@ -49,6 +49,12 @@ export interface DriveSongManifest {
     channelCount: 2;
     totalSamples: number;
     format: WavExportFormat;
+    derivedFrom?: {
+      sourceMode: "four_stem";
+      sourceRevisionId?: string;
+      modelVersion: string;
+      processingVersion: string;
+    } | null;
   };
   artifacts: {
     vocals?: DriveArtifactDescriptor;
@@ -176,6 +182,7 @@ export function buildDriveSongManifest(params: {
   sampleRate: number;
   totalSamples: number;
   format: WavExportFormat;
+  derivedFrom?: DriveSongManifest["separation"]["derivedFrom"];
   artifacts: DriveSongManifest["artifacts"];
   sessionFileId?: string;
   createdAt?: string;
@@ -199,6 +206,7 @@ export function buildDriveSongManifest(params: {
       channelCount: 2,
       totalSamples: params.totalSamples,
       format: params.format,
+      ...(params.derivedFrom ? { derivedFrom: params.derivedFrom } : {}),
     },
     artifacts: { ...params.artifacts },
     sessionFileId: params.sessionFileId,

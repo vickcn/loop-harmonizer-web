@@ -13,6 +13,12 @@ import type {
   SongTempoMode,
   StemChannel,
 } from "./bandTypes";
+import type {
+  ProjectSongArtifactRef,
+  ProjectSongAvailabilityState,
+  ProjectSongBackupStatus,
+  ProjectSongOriginalBackupRef,
+} from "../projects/projectTypes";
 
 export type PersistedStemChannelState = {
   stemType: string;
@@ -97,6 +103,11 @@ type CreateBandSongInput = {
   driveExport?: DriveExportStatusSummary | null;
   importedStemOrigin?: ImportedStemOrigin | null;
   sourceAudioMissing?: boolean;
+  projectEntryId?: string;
+  availabilityState?: ProjectSongAvailabilityState;
+  backupStatus?: ProjectSongBackupStatus;
+  artifactRef?: ProjectSongArtifactRef | null;
+  originalBackup?: ProjectSongOriginalBackupRef | null;
 };
 
 export function createBandSong(input: CreateBandSongInput): BandSong {
@@ -142,6 +153,11 @@ export function createBandSong(input: CreateBandSongInput): BandSong {
     driveExport: input.driveExport ?? null,
     importedStemOrigin: input.importedStemOrigin ?? null,
     sourceAudioMissing: input.sourceAudioMissing ?? false,
+    projectEntryId: input.projectEntryId,
+    availabilityState: input.availabilityState,
+    backupStatus: input.backupStatus,
+    artifactRef: input.artifactRef ?? null,
+    originalBackup: input.originalBackup ?? null,
   };
 }
 

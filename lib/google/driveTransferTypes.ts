@@ -99,6 +99,7 @@ export type DriveArtifactRole =
   | "other"
   | "instrumental"
   | "custom_mix"
+  | "original_audio"
   | "session"
   | "manifest";
 

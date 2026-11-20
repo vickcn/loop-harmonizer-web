@@ -1,5 +1,5 @@
 const DB_NAME = "loop-harmonizer-audio-cache";
-const DB_VERSION = 5;
+const DB_VERSION = 6;
 
 export const INDEXEDDB_VERSION = DB_VERSION;
 export const SEPARATION_CHECKPOINT_HASH_INDEX = "by_sourceAudioHash";
@@ -7,6 +7,9 @@ export const SEPARATION_CHUNK_TASK_INDEX = "by_taskId";
 export const DRIVE_TRANSFER_ACCOUNT_INDEX = "by_ownerAccountId";
 export const DRIVE_TRANSFER_SONG_INDEX = "by_songId";
 export const IMPORTED_STEM_HASH_INDEX = "by_sourceAudioHash";
+export const PROJECT_OWNER_ACCOUNT_INDEX = "by_ownerAccountId";
+export const PROJECT_PROVIDER_INDEX = "by_storageProvider";
+export const PROJECT_SYNC_ACCOUNT_INDEX = "by_ownerAccountId";
 
 export type AudioCacheStore =
   | "separations"
@@ -19,7 +22,10 @@ export type AudioCacheStore =
   | "separationChunks"
   | "driveAccounts"
   | "driveTransfers"
-  | "importedStems";
+  | "importedStems"
+  | "projects"
+  | "projectPreferences"
+  | "projectSyncJobs";
 
 const ALL_STORES: readonly AudioCacheStore[] = [
   "separations",
@@ -33,6 +39,9 @@ const ALL_STORES: readonly AudioCacheStore[] = [
   "driveAccounts",
   "driveTransfers",
   "importedStems",
+  "projects",
+  "projectPreferences",
+  "projectSyncJobs",
 ];
 
 export interface InMemoryIdbHooks {
@@ -211,6 +220,30 @@ export function applyIndexedDbSchemaUpgrade(
         unique: false,
       });
     }
+    if (
+      storeName === "projects" &&
+      !store.indexNames.contains(PROJECT_OWNER_ACCOUNT_INDEX)
+    ) {
+      store.createIndex(PROJECT_OWNER_ACCOUNT_INDEX, "ownerAccountId", {
+        unique: false,
+      });
+    }
+    if (
+      storeName === "projects" &&
+      !store.indexNames.contains(PROJECT_PROVIDER_INDEX)
+    ) {
+      store.createIndex(PROJECT_PROVIDER_INDEX, "storageProvider", {
+        unique: false,
+      });
+    }
+    if (
+      storeName === "projectSyncJobs" &&
+      !store.indexNames.contains(PROJECT_SYNC_ACCOUNT_INDEX)
+    ) {
+      store.createIndex(PROJECT_SYNC_ACCOUNT_INDEX, "ownerAccountId", {
+        unique: false,
+      });
+    }
   }
 }
 
@@ -360,6 +393,24 @@ async function runInMemoryTransaction<T>(
                 indexName === IMPORTED_STEM_HASH_INDEX
               ) {
                 return obj.sourceAudioHash;
+              }
+              if (
+                storeName === "projects" &&
+                indexName === PROJECT_OWNER_ACCOUNT_INDEX
+              ) {
+                return obj.ownerAccountId;
+              }
+              if (
+                storeName === "projects" &&
+                indexName === PROJECT_PROVIDER_INDEX
+              ) {
+                return obj.storageProvider;
+              }
+              if (
+                storeName === "projectSyncJobs" &&
+                indexName === PROJECT_SYNC_ACCOUNT_INDEX
+              ) {
+                return obj.ownerAccountId;
               }
               throw new Error(`資料表 ${storeName} 尚未建立索引：${indexName}`);
             };

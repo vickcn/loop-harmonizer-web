@@ -1,5 +1,6 @@
 import type { WavExportFormat } from "../audio/chunkedWavExporter.ts";
 import type { StemSeparationMode } from "../separation/stemTypes.ts";
+import type { PersistedProjectRecord, ProjectSongDerivedFromRef } from "../projects/projectTypes.ts";
 import { isTaskPinnedByDriveTransfer } from "./driveTransferStore.ts";
 import {
   IMPORTED_STEM_HASH_INDEX,
@@ -36,6 +37,7 @@ export interface ImportedStemRecord {
   totalChunks: number;
   committedBytes: number;
   checksumsByRole: Record<string, string>;
+  derivedFrom?: ProjectSongDerivedFromRef | null;
   referencedBySongIds: string[];
   createdAt: number;
   updatedAt: number;
@@ -86,6 +88,77 @@ export async function findImportedStemByHash(params: {
       if (params.modelVersion && item.modelVersion !== params.modelVersion) return false;
       if (params.processingVersion && item.processingVersion !== params.processingVersion) {
         return false;
+      }
+      return true;
+    })
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+
+  return matched[0] ?? null;
+}
+
+export async function findImportedStemStrict(params: {
+  sourceAudioHash: string;
+  mode: StemSeparationMode;
+  modelVersion: string;
+  processingVersion: string;
+  sampleRate?: number;
+  channelCount?: number;
+  totalSamples?: number;
+  expectedRevisionId?: string;
+  expectedChecksums?: Record<string, string>;
+  expectedDerivedFrom?: ProjectSongDerivedFromRef | null;
+}): Promise<ImportedStemRecord | null> {
+  if (!params.sourceAudioHash) return null;
+  const rows = await withIdbTransaction("importedStems", "readonly", async (tx) => {
+    const store = tx.objectStore("importedStems");
+    if (
+      typeof store.index === "function" &&
+      (!store.indexNames || store.indexNames.contains(IMPORTED_STEM_HASH_INDEX))
+    ) {
+      return (await idbRequestPromise(
+        store.index(IMPORTED_STEM_HASH_INDEX).getAll(params.sourceAudioHash),
+      )) as ImportedStemRecord[];
+    }
+    const all = (await idbRequestPromise(store.getAll())) as ImportedStemRecord[];
+    return all.filter((item) => item.sourceAudioHash === params.sourceAudioHash);
+  });
+
+  const matched = rows
+    .filter((item) => {
+      if (item.sourceAudioHash !== params.sourceAudioHash) return false;
+      if (item.requestedMode !== params.mode) return false;
+      if (item.modelVersion !== params.modelVersion) return false;
+      if (item.processingVersion !== params.processingVersion) return false;
+      if (params.sampleRate !== undefined && item.sampleRate !== params.sampleRate) return false;
+      if (params.channelCount !== undefined && item.channelCount !== params.channelCount) {
+        return false;
+      }
+      if (params.totalSamples !== undefined && item.totalSamples !== params.totalSamples) {
+        return false;
+      }
+      if (
+        params.expectedRevisionId &&
+        !params.expectedRevisionId.startsWith("local-") &&
+        item.revisionId !== params.expectedRevisionId
+      ) {
+        return false;
+      }
+      if (params.expectedDerivedFrom && item.derivedFrom) {
+        if (
+          params.expectedDerivedFrom.modelVersion !== item.derivedFrom.modelVersion ||
+          params.expectedDerivedFrom.processingVersion !== item.derivedFrom.processingVersion ||
+          (params.expectedDerivedFrom.sourceRevisionId &&
+            item.derivedFrom.sourceRevisionId &&
+            params.expectedDerivedFrom.sourceRevisionId !== item.derivedFrom.sourceRevisionId)
+        ) {
+          return false;
+        }
+      }
+      if (params.expectedChecksums) {
+        for (const [role, expSum] of Object.entries(params.expectedChecksums)) {
+          const gotSum = item.checksumsByRole?.[role];
+          if (expSum && gotSum && expSum !== gotSum) return false;
+        }
       }
       return true;
     })
@@ -205,10 +278,11 @@ export async function releaseImportedStemReferenceAndMaybeGc(params: {
     return { deleted: false, remainingReferences: 0, blockedByTransferPin: false };
   }
   return withIdbTransaction(
-    ["songs", "importedStems", "separationChunks"],
+    ["songs", "projects", "importedStems", "separationChunks"],
     "readwrite",
     async (tx) => {
       const songsStore = tx.objectStore("songs");
+      const projectsStore = tx.objectStore("projects");
       const impStore = tx.objectStore("importedStems");
       const chunkStore = tx.objectStore("separationChunks");
 
@@ -219,14 +293,36 @@ export async function releaseImportedStemReferenceAndMaybeGc(params: {
         return { deleted: false, remainingReferences: 0, blockedByTransferPin: false };
       }
 
-      const persistedSongs = (await idbRequestPromise(songsStore.getAll())) as Array<{
-        songId?: string;
-        importedStemOrigin?: { importId?: string } | null;
-      }>;
+      const [persistedSongs, persistedProjects] = await Promise.all([
+        idbRequestPromise(songsStore.getAll()) as Promise<
+          Array<{
+            songId?: string;
+            importedStemOrigin?: { importId?: string } | null;
+          }>
+        >,
+        idbRequestPromise(projectsStore.getAll()) as Promise<PersistedProjectRecord[]>,
+      ]);
       const activeIds = new Set<string>();
       for (const s of persistedSongs) {
         if (s.songId && s.songId !== params.songId && s.importedStemOrigin?.importId === params.importId) {
           activeIds.add(s.songId);
+        }
+      }
+      for (const p of persistedProjects) {
+        for (const entry of p.project?.songs ?? []) {
+          if (entry.entryId === params.songId) continue;
+          const ref = entry.artifactRef;
+          if (!ref) continue;
+          const exactTaskMatch = ref.localTaskId === params.importId;
+          const exactArtifactMatch =
+            ref.sourceAudioHash === rec.sourceAudioHash &&
+            ref.revisionId === rec.revisionId &&
+            ref.separationMode === rec.requestedMode &&
+            ref.modelVersion === rec.modelVersion &&
+            ref.processingVersion === rec.processingVersion;
+          if (exactTaskMatch || exactArtifactMatch) {
+            activeIds.add(`project:${p.projectId}:${entry.entryId}`);
+          }
         }
       }
       for (const s of params.knownInMemorySongs ?? []) {

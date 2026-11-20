@@ -21,6 +21,28 @@ export interface AppFolderLayout {
   rootFolderId: string;
   songsFolderId: string;
   sessionsFolderId: string;
+  projectsFolderId?: string;
+}
+
+export interface ProjectFolderLayout {
+  accountId: string;
+  projectId: string;
+  rootFolderId: string;
+  projectsFolderId: string;
+  projectFolderId: string;
+  projectRevisionsFolderId?: string;
+  duplicateFolderIds: string[];
+}
+
+export interface ManagedDriveProjectEntry {
+  projectId: string;
+  projectFolderId: string;
+  projectFolderName: string;
+  projectFileId?: string;
+  projectFileModifiedTime?: string;
+  projectFileVersion?: string;
+  projectFileRevisionToken?: string;
+  revisionsFolderId?: string;
 }
 
 export interface SongRevisionFolders {
@@ -32,6 +54,14 @@ export interface SongRevisionFolders {
   revisionFolderId: string;
   stemsFolderId: string;
   exportsFolderId?: string;
+}
+
+export interface SongOriginalsFolders {
+  accountId: string;
+  rootFolderId: string;
+  songsFolderId: string;
+  songFolderId: string;
+  originalsFolderId: string;
 }
 
 export class MultipleManagedAppFoldersError extends Error {
@@ -353,6 +383,7 @@ export async function ensureAppFolder(params: {
         rootFolderId,
         songsFolderId,
         sessionsFolderId,
+        projectsFolderId: cachedDb?.projectsFolderId,
       };
       inMemoryLayoutByAccount.set(params.accountId, layout);
       await savePersistedDriveAccountFolders({
@@ -371,6 +402,427 @@ export async function ensureAppFolder(params: {
   });
   ensureFolderInFlightByAccount.set(params.accountId, tracked);
   return tracked;
+}
+
+function selectCanonicalFolder(
+  candidates: readonly DriveRawFileResource[],
+): { canonical: DriveRawFileResource; duplicateIds: string[] } {
+  const sorted = [...candidates].sort((a, b) => {
+    const ta = a.createdTime ? Date.parse(a.createdTime) : Number.MAX_SAFE_INTEGER;
+    const tb = b.createdTime ? Date.parse(b.createdTime) : Number.MAX_SAFE_INTEGER;
+    if (Number.isFinite(ta) && Number.isFinite(tb) && ta !== tb) return ta - tb;
+    return a.id.localeCompare(b.id);
+  });
+  const canonical = sorted[0];
+  return {
+    canonical,
+    duplicateIds: sorted.slice(1).map((item) => item.id),
+  };
+}
+
+export function buildStableProjectFolderName(projectId: string): string {
+  const clean = projectId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64);
+  return clean ? `project_${clean}` : "project_unknown";
+}
+
+export async function ensureProjectsFolder(params: {
+  accountId: string;
+  accessToken: string;
+  preferredRootFolderId?: string;
+  onMultipleCandidates?: (candidates: DriveRawFileResource[]) => Promise<string | null>;
+  signal?: AbortSignal;
+  lockAdapter?: WebLockAdapter | null;
+  fetchImpl?: typeof fetch;
+}): Promise<{ rootFolderId: string; projectsFolderId: string }> {
+  const layout = await ensureAppFolder({
+    accountId: params.accountId,
+    accessToken: params.accessToken,
+    preferredRootFolderId: params.preferredRootFolderId,
+    onMultipleCandidates: params.onMultipleCandidates,
+    signal: params.signal,
+    lockAdapter: params.lockAdapter,
+    fetchImpl: params.fetchImpl,
+  });
+
+  if (layout.projectsFolderId) {
+    const verified = await verifyFolderSafe(layout.projectsFolderId, "projects", {
+      accessToken: params.accessToken,
+      signal: params.signal,
+      fetchImpl: params.fetchImpl,
+    });
+    if (verified) {
+      return { rootFolderId: layout.rootFolderId, projectsFolderId: verified.id };
+    }
+  }
+
+  return withAccountFolderLock(
+    `${params.accountId}:projects`,
+    async () => {
+      const existing = await findManagedSubfolder({
+        parentId: layout.rootFolderId,
+        role: "projects",
+        extraAppProps: { lhAccountId: params.accountId },
+        accessToken: params.accessToken,
+        signal: params.signal,
+        fetchImpl: params.fetchImpl,
+      });
+
+      let projectsFolderId: string;
+      if (existing.length > 0) {
+        projectsFolderId = selectCanonicalFolder(existing).canonical.id;
+      } else {
+        const created = await createDriveFolder({
+          accessToken: params.accessToken,
+          name: "projects",
+          parentId: layout.rootFolderId,
+          appProperties: {
+            lhApp: LOOP_HARMONIZER_APP_TAG,
+            lhRole: "projects",
+            lhAccountId: params.accountId,
+          },
+          signal: params.signal,
+          fetchImpl: params.fetchImpl,
+        });
+        // 無 Web Locks 跨裝置並發防護：建立後再檢查一次並確定性收斂
+        const afterCheck = await findManagedSubfolder({
+          parentId: layout.rootFolderId,
+          role: "projects",
+          extraAppProps: { lhAccountId: params.accountId },
+          accessToken: params.accessToken,
+          signal: params.signal,
+          fetchImpl: params.fetchImpl,
+        });
+        projectsFolderId =
+          afterCheck.length > 0
+            ? selectCanonicalFolder(afterCheck).canonical.id
+            : created.id;
+      }
+
+      const nextLayout: AppFolderLayout = {
+        ...layout,
+        projectsFolderId,
+      };
+      inMemoryLayoutByAccount.set(params.accountId, nextLayout);
+      await savePersistedDriveAccountFolders({
+        ...nextLayout,
+        updatedAt: Date.now(),
+      }).catch(() => undefined);
+
+      return { rootFolderId: layout.rootFolderId, projectsFolderId };
+    },
+    params.lockAdapter,
+  );
+}
+
+export async function findProjectFolder(params: {
+  accountId: string;
+  accessToken: string;
+  projectId: string;
+  driveFolderId?: string;
+  projectsFolderId?: string;
+  signal?: AbortSignal;
+  fetchImpl?: typeof fetch;
+}): Promise<{ folder: DriveRawFileResource | null; duplicateFolderIds: string[] }> {
+  if (params.driveFolderId) {
+    const direct = await verifyFolderSafe(params.driveFolderId, "project", {
+      accessToken: params.accessToken,
+      signal: params.signal,
+      fetchImpl: params.fetchImpl,
+    });
+    if (
+      direct &&
+      direct.appProperties?.lhProjectId === params.projectId &&
+      direct.appProperties?.lhAccountId === params.accountId
+    ) {
+      return { folder: direct, duplicateFolderIds: [] };
+    }
+  }
+
+  let projectsFolderId = params.projectsFolderId;
+  if (!projectsFolderId) {
+    const { projectsFolderId: resolvedProjectsId } = await ensureProjectsFolder({
+      accountId: params.accountId,
+      accessToken: params.accessToken,
+      signal: params.signal,
+      fetchImpl: params.fetchImpl,
+    });
+    projectsFolderId = resolvedProjectsId;
+  }
+
+  const matched = await findManagedSubfolder({
+    parentId: projectsFolderId,
+    role: "project",
+    extraAppProps: {
+      lhAccountId: params.accountId,
+      lhProjectId: params.projectId,
+    },
+    accessToken: params.accessToken,
+    signal: params.signal,
+    fetchImpl: params.fetchImpl,
+  });
+
+  if (matched.length === 0) {
+    return { folder: null, duplicateFolderIds: [] };
+  }
+  const { canonical, duplicateIds } = selectCanonicalFolder(matched);
+  return { folder: canonical, duplicateFolderIds: duplicateIds };
+}
+
+export async function ensureProjectFolder(params: {
+  accountId: string;
+  accessToken: string;
+  projectId: string;
+  driveFolderId?: string;
+  includeRevisionsFolder?: boolean;
+  preferredRootFolderId?: string;
+  onMultipleCandidates?: (candidates: DriveRawFileResource[]) => Promise<string | null>;
+  signal?: AbortSignal;
+  lockAdapter?: WebLockAdapter | null;
+  fetchImpl?: typeof fetch;
+}): Promise<ProjectFolderLayout> {
+  const { rootFolderId, projectsFolderId } = await ensureProjectsFolder({
+    accountId: params.accountId,
+    accessToken: params.accessToken,
+    preferredRootFolderId: params.preferredRootFolderId,
+    onMultipleCandidates: params.onMultipleCandidates,
+    signal: params.signal,
+    lockAdapter: params.lockAdapter,
+    fetchImpl: params.fetchImpl,
+  });
+
+  return withAccountFolderLock(
+    `${params.accountId}:project:${params.projectId}`,
+    async () => {
+      const found = await findProjectFolder({
+        accountId: params.accountId,
+        accessToken: params.accessToken,
+        projectId: params.projectId,
+        driveFolderId: params.driveFolderId,
+        projectsFolderId,
+        signal: params.signal,
+        fetchImpl: params.fetchImpl,
+      });
+
+      let projectFolderId: string;
+      let duplicateFolderIds = [...found.duplicateFolderIds];
+
+      if (found.folder) {
+        projectFolderId = found.folder.id;
+      } else {
+        const created = await createDriveFolder({
+          accessToken: params.accessToken,
+          name: buildStableProjectFolderName(params.projectId),
+          parentId: projectsFolderId,
+          appProperties: {
+            lhApp: LOOP_HARMONIZER_APP_TAG,
+            lhRole: "project",
+            lhAccountId: params.accountId,
+            lhProjectId: params.projectId,
+          },
+          signal: params.signal,
+          fetchImpl: params.fetchImpl,
+        });
+        // 跨裝置無 Web Locks 競態防護：建立後重新查詢確定性選用最早 canonical 資料夾
+        const recheck = await findManagedSubfolder({
+          parentId: projectsFolderId,
+          role: "project",
+          extraAppProps: {
+            lhAccountId: params.accountId,
+            lhProjectId: params.projectId,
+          },
+          accessToken: params.accessToken,
+          signal: params.signal,
+          fetchImpl: params.fetchImpl,
+        });
+        if (recheck.length > 0) {
+          const selection = selectCanonicalFolder(recheck);
+          projectFolderId = selection.canonical.id;
+          duplicateFolderIds = selection.duplicateIds;
+        } else {
+          projectFolderId = created.id;
+        }
+      }
+
+      let projectRevisionsFolderId: string | undefined;
+      if (params.includeRevisionsFolder !== false) {
+        projectRevisionsFolderId = await ensureChildManagedFolder({
+          parentId: projectFolderId,
+          name: "revisions",
+          role: "project_revisions",
+          extraAppProps: {
+            lhAccountId: params.accountId,
+            lhProjectId: params.projectId,
+          },
+          accessToken: params.accessToken,
+          signal: params.signal,
+          fetchImpl: params.fetchImpl,
+        });
+      }
+
+      return {
+        accountId: params.accountId,
+        projectId: params.projectId,
+        rootFolderId,
+        projectsFolderId,
+        projectFolderId,
+        projectRevisionsFolderId,
+        duplicateFolderIds,
+      };
+    },
+    params.lockAdapter,
+  );
+}
+
+export async function listManagedProjects(params: {
+  accountId: string;
+  accessToken: string;
+  signal?: AbortSignal;
+  fetchImpl?: typeof fetch;
+}): Promise<ManagedDriveProjectEntry[]> {
+  if (!params.accountId || !params.accessToken) return [];
+  const safeAccount = params.accountId.replace(/'/g, "");
+
+  // 確保只讀取目前登入帳戶、受 Loop Harmonizer 管理之專案資料夾與 project.json
+  const folderQuery = [
+    `mimeType='${DRIVE_FOLDER_MIME_TYPE}'`,
+    "trashed=false",
+    `appProperties has { key='lhApp' and value='${LOOP_HARMONIZER_APP_TAG}' }`,
+    `appProperties has { key='lhRole' and value='project' }`,
+    `appProperties has { key='lhAccountId' and value='${safeAccount}' }`,
+  ].join(" and ");
+
+  const fileQuery = [
+    "trashed=false",
+    `appProperties has { key='lhApp' and value='${LOOP_HARMONIZER_APP_TAG}' }`,
+    `appProperties has { key='lhRole' and value='project_json' }`,
+    `appProperties has { key='lhAccountId' and value='${safeAccount}' }`,
+  ].join(" and ");
+
+  const [folderRes, fileRes] = await Promise.all([
+    listDriveFiles({
+      accessToken: params.accessToken,
+      q: folderQuery,
+      pageSize: 100,
+      orderBy: "modifiedTime desc",
+      signal: params.signal,
+      fetchImpl: params.fetchImpl,
+    }),
+    listDriveFiles({
+      accessToken: params.accessToken,
+      q: fileQuery,
+      pageSize: 100,
+      orderBy: "modifiedTime desc",
+      signal: params.signal,
+      fetchImpl: params.fetchImpl,
+    }),
+  ]);
+
+  const jsonByProjectId = new Map<string, DriveRawFileResource>();
+  for (const file of fileRes.files) {
+    if (file.trashed) continue;
+    if (file.appProperties?.lhAccountId !== params.accountId) continue;
+    const pid = file.appProperties?.lhProjectId;
+    if (!pid) continue;
+    if (!jsonByProjectId.has(pid)) {
+      jsonByProjectId.set(pid, file);
+    }
+  }
+
+  const foldersByProjectId = new Map<string, DriveRawFileResource[]>();
+  for (const folder of folderRes.files) {
+    if (!isManagedAppFolder(folder, "project")) continue;
+    if (folder.appProperties?.lhAccountId !== params.accountId) continue;
+    const pid = folder.appProperties?.lhProjectId;
+    if (!pid) continue;
+    const arr = foldersByProjectId.get(pid) ?? [];
+    arr.push(folder);
+    foldersByProjectId.set(pid, arr);
+  }
+
+  const entries: ManagedDriveProjectEntry[] = [];
+  for (const [projectId, candidates] of foldersByProjectId.entries()) {
+    const canonical = selectCanonicalFolder(candidates).canonical;
+    const projectFile = jsonByProjectId.get(projectId);
+    entries.push({
+      projectId,
+      projectFolderId: canonical.id,
+      projectFolderName: canonical.name || buildStableProjectFolderName(projectId),
+      projectFileId: projectFile?.id,
+      projectFileModifiedTime: projectFile?.modifiedTime ?? canonical.modifiedTime,
+      projectFileVersion:
+        projectFile?.version !== undefined ? String(projectFile.version) : undefined,
+      projectFileRevisionToken: projectFile?.appProperties?.lhRevisionToken,
+    });
+  }
+
+  // 也容錯收錄未附在資料夾清單但有明確 lhProjectId 的 project.json
+  for (const [projectId, projectFile] of jsonByProjectId.entries()) {
+    if (foldersByProjectId.has(projectId)) continue;
+    entries.push({
+      projectId,
+      projectFolderId: projectFile.parents?.[0] ?? "",
+      projectFolderName: buildStableProjectFolderName(projectId),
+      projectFileId: projectFile.id,
+      projectFileModifiedTime: projectFile.modifiedTime,
+      projectFileVersion:
+        projectFile.version !== undefined ? String(projectFile.version) : undefined,
+      projectFileRevisionToken: projectFile.appProperties?.lhRevisionToken,
+    });
+  }
+
+  return entries;
+}
+
+export async function ensureSongOriginalsFolder(params: {
+  accountId: string;
+  accessToken: string;
+  stableSongKey: string;
+  preferredRootFolderId?: string;
+  signal?: AbortSignal;
+  lockAdapter?: WebLockAdapter | null;
+  fetchImpl?: typeof fetch;
+}): Promise<SongOriginalsFolders> {
+  const layout = await ensureAppFolder({
+    accountId: params.accountId,
+    accessToken: params.accessToken,
+    preferredRootFolderId: params.preferredRootFolderId,
+    signal: params.signal,
+    lockAdapter: params.lockAdapter,
+    fetchImpl: params.fetchImpl,
+  });
+
+  const songFolderId = await ensureChildManagedFolder({
+    parentId: layout.songsFolderId,
+    name: params.stableSongKey,
+    role: "song",
+    extraAppProps: {
+      lhStableSongKey: params.stableSongKey,
+    },
+    accessToken: params.accessToken,
+    signal: params.signal,
+    fetchImpl: params.fetchImpl,
+  });
+
+  const originalsFolderId = await ensureChildManagedFolder({
+    parentId: songFolderId,
+    name: "originals",
+    role: "originals",
+    extraAppProps: {
+      lhStableSongKey: params.stableSongKey,
+      lhAccountId: params.accountId,
+    },
+    accessToken: params.accessToken,
+    signal: params.signal,
+    fetchImpl: params.fetchImpl,
+  });
+
+  return {
+    accountId: params.accountId,
+    rootFolderId: layout.rootFolderId,
+    songsFolderId: layout.songsFolderId,
+    songFolderId,
+    originalsFolderId,
+  };
 }
 
 export async function ensureSongRevisionFolders(params: {

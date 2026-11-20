@@ -31,6 +31,7 @@ import {
   isTaskPinnedByDriveTransfer,
 } from "./driveTransferStore.ts";
 import type { ImportedStemRecord } from "./importedStemStore.ts";
+import type { PersistedProjectRecord } from "../projects/projectTypes.ts";
 import { recordSeparationDiagnostic } from "../separation/separationStateRecovery.ts";
 
 export type SeparationCheckpointStatus =
@@ -109,6 +110,11 @@ export interface SeparationCheckpoint {
   referencedBySongIds?: string[];
   /** 各引用歌曲目前使用的分離播放模式（two_stem / four_stem） */
   referencedModesBySongId?: Record<string, "two_stem" | "four_stem">;
+  /** 所屬專案與歌曲項目識別（供多專案切換與跨專案隔離使用） */
+  projectId?: string | null;
+  entryId?: string | null;
+  /** 本機 Checkpoint 已匯出發布至 Google Drive 的確定 Revision ID 紀錄 */
+  exportedRevisionIds?: string[];
   createdAt: number;
   updatedAt: number;
 }
@@ -179,6 +185,8 @@ export function buildInitialCheckpoint(params: {
   userAuthorized?: boolean;
   status?: SeparationCheckpointStatus;
   lease?: SeparationLeaseInfo | null;
+  projectId?: string | null;
+  entryId?: string | null;
   now?: number;
 }): SeparationCheckpoint {
   const modelVersion = params.modelVersion ?? DEMUCS_MODEL_VERSION;
@@ -211,9 +219,33 @@ export function buildInitialCheckpoint(params: {
     lease: params.lease ?? null,
     referencedBySongIds: [params.songId],
     referencedModesBySongId: { [params.songId]: params.requestedMode },
+    projectId: params.projectId ?? null,
+    entryId: params.entryId ?? null,
     createdAt: now,
     updatedAt: now,
   };
+}
+
+export async function recordCheckpointExportedRevision(
+  taskId: string,
+  revisionId: string,
+): Promise<void> {
+  if (!taskId || !revisionId) return;
+  await withIdbTransaction("separationCheckpoints", "readwrite", async (tx) => {
+    const store = tx.objectStore("separationCheckpoints");
+    const existing = (await idbRequestPromise(store.get(taskId))) as
+      | SeparationCheckpoint
+      | undefined;
+    if (!existing) return;
+    const next = Array.from(new Set([...(existing.exportedRevisionIds ?? []), revisionId]));
+    await idbRequestPromise(
+      store.put({
+        ...existing,
+        exportedRevisionIds: next,
+        updatedAt: Date.now(),
+      } satisfies SeparationCheckpoint),
+    );
+  }).catch(() => undefined);
 }
 
 export async function getCheckpoint(taskId: string): Promise<SeparationCheckpoint | null> {
@@ -639,6 +671,36 @@ export async function findCompletedCheckpointBySourceAudioHash(
   });
 }
 
+function projectRecordsToReferenceCandidates(
+  projects: readonly PersistedProjectRecord[],
+): CheckpointSongReferenceCandidate[] {
+  const list: CheckpointSongReferenceCandidate[] = [];
+  for (const p of projects) {
+    for (const entry of p.project?.songs ?? []) {
+      const mode = entry.artifactRef?.separationMode ?? entry.settings.separationMode ?? null;
+      const hasCompletedArtifact = Boolean(entry.artifactRef);
+      list.push({
+        id: entry.entryId,
+        songId: entry.entryId,
+        sourceAudioHash: entry.sourceAudioHash,
+        separationTaskId: entry.artifactRef?.localTaskId ?? null,
+        separationMode: mode,
+        separationStatus: hasCompletedArtifact ? "completed" : "not_started",
+        cacheKey:
+          hasCompletedArtifact && entry.artifactRef && entry.sourceAudioHash
+            ? createSeparationCacheKey({
+                sourceAudioHash: entry.sourceAudioHash,
+                modelVersion: entry.artifactRef.modelVersion,
+                separationMode: entry.artifactRef.separationMode,
+                processingVersion: entry.artifactRef.processingVersion,
+              })
+            : null,
+      });
+    }
+  }
+  return list;
+}
+
 function buildEffectiveSongsMap(params: {
   persistedSongs: CheckpointSongReferenceCandidate[];
   knownInMemorySongs?: CheckpointSongReferenceCandidate[];
@@ -822,12 +884,16 @@ export async function isCheckpointSharedOrLeased(params: {
   otherReferenceSongIds: string[];
 }> {
   const now = params.now ?? Date.now();
-  return withIdbTransaction(["songs", "separationCheckpoints"], "readonly", async (tx) => {
+  return withIdbTransaction(["songs", "projects", "separationCheckpoints"], "readonly", async (tx) => {
     const songStore = tx.objectStore("songs");
+    const projectsStore = tx.objectStore("projects");
     const cpStore = tx.objectStore("separationCheckpoints");
     const persistedSongs = (await idbRequestPromise(
       songStore.getAll(),
     )) as CheckpointSongReferenceCandidate[];
+    const persistedProjects = (await idbRequestPromise(
+      projectsStore.getAll(),
+    )) as PersistedProjectRecord[];
     const allCps = (await idbRequestPromise(
       cpStore.getAll(),
     )) as SeparationCheckpoint[];
@@ -846,7 +912,10 @@ export async function isCheckpointSharedOrLeased(params: {
     );
     const removedIds = new Set(params.knownRemovedSongIds ?? []);
     const effectiveSongsById = buildEffectiveSongsMap({
-      persistedSongs,
+      persistedSongs: [
+        ...persistedSongs,
+        ...projectRecordsToReferenceCandidates(persistedProjects),
+      ],
       knownInMemorySongs: params.knownInMemorySongs,
       detachedSongId: params.actingSongId,
       removedIds,
@@ -900,10 +969,11 @@ export async function releaseCheckpointReferenceAndMaybeGc(
   const pendingDiagnostics: Array<Parameters<typeof recordSeparationDiagnostic>[0]> = [];
 
   const result = await withIdbTransaction(
-    ["songs", "separationCheckpoints", "separationChunks", "separations"],
+    ["songs", "projects", "separationCheckpoints", "separationChunks", "separations"],
     "readwrite",
     async (tx) => {
       const songStore = tx.objectStore("songs");
+      const projectsStore = tx.objectStore("projects");
       const cpStore = tx.objectStore("separationCheckpoints");
       const chunkStore = tx.objectStore("separationChunks");
       const sepStore = tx.objectStore("separations");
@@ -911,6 +981,9 @@ export async function releaseCheckpointReferenceAndMaybeGc(
       const persistedSongs = (await idbRequestPromise(
         songStore.getAll(),
       )) as CheckpointSongReferenceCandidate[];
+      const persistedProjects = (await idbRequestPromise(
+        projectsStore.getAll(),
+      )) as PersistedProjectRecord[];
       const allCps = (await idbRequestPromise(
         cpStore.getAll(),
       )) as SeparationCheckpoint[];
@@ -920,7 +993,10 @@ export async function releaseCheckpointReferenceAndMaybeGc(
       );
       const removedIds = new Set(params.knownRemovedSongIds ?? []);
       const effectiveSongsById = buildEffectiveSongsMap({
-        persistedSongs,
+        persistedSongs: [
+          ...persistedSongs,
+          ...projectRecordsToReferenceCandidates(persistedProjects),
+        ],
         knownInMemorySongs: params.knownInMemorySongs,
         detachedSongId: params.songId,
         removedIds,
@@ -1115,10 +1191,11 @@ export async function runCheckpointGarbageCollection(params?: {
   const pendingDiagnostics: Array<Parameters<typeof recordSeparationDiagnostic>[0]> = [];
 
   const result = await withIdbTransaction(
-    ["songs", "separationCheckpoints", "separationChunks", "importedStems"],
+    ["songs", "projects", "separationCheckpoints", "separationChunks", "importedStems"],
     "readwrite",
     async (tx) => {
       const songStore = tx.objectStore("songs");
+      const projectsStore = tx.objectStore("projects");
       const cpStore = tx.objectStore("separationCheckpoints");
       const chunkStore = tx.objectStore("separationChunks");
       const impStore = tx.objectStore("importedStems");
@@ -1126,6 +1203,9 @@ export async function runCheckpointGarbageCollection(params?: {
       const persistedSongs = (await idbRequestPromise(
         songStore.getAll(),
       )) as CheckpointSongReferenceCandidate[];
+      const persistedProjects = (await idbRequestPromise(
+        projectsStore.getAll(),
+      )) as PersistedProjectRecord[];
       const allCps = (await idbRequestPromise(
         cpStore.getAll(),
       )) as SeparationCheckpoint[];
@@ -1139,7 +1219,10 @@ export async function runCheckpointGarbageCollection(params?: {
       );
       const removedIds = new Set(params?.knownRemovedSongIds ?? []);
       const effectiveSongsById = buildEffectiveSongsMap({
-        persistedSongs,
+        persistedSongs: [
+          ...persistedSongs,
+          ...projectRecordsToReferenceCandidates(persistedProjects),
+        ],
         knownInMemorySongs: params?.knownInMemorySongs,
         removedIds,
       });

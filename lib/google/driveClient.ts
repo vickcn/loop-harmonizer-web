@@ -49,7 +49,10 @@ export interface DriveRawFileResource {
   name?: string;
   mimeType?: string;
   size?: string | number;
+  createdTime?: string;
   modifiedTime?: string;
+  version?: string | number;
+  headRevisionId?: string;
   md5Checksum?: string;
   trashed?: boolean;
   driveId?: string;
@@ -241,7 +244,7 @@ export async function getDriveFileMetadata(
   const fetchFn = options.fetchImpl ?? globalThis.fetch;
   const fields =
     options.fields ??
-    "id,name,mimeType,size,modifiedTime,md5Checksum,trashed,driveId,resourceKey,webViewLink,parents,appProperties,capabilities(canDownload,canCopy,canDelete,canEdit,canAddChildren),shortcutDetails(targetId,targetMimeType,targetResourceKey)";
+    "id,name,mimeType,size,createdTime,modifiedTime,version,headRevisionId,md5Checksum,trashed,driveId,resourceKey,webViewLink,parents,appProperties,capabilities(canDownload,canCopy,canDelete,canEdit,canAddChildren),shortcutDetails(targetId,targetMimeType,targetResourceKey)";
   const url = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?supportsAllDrives=true&fields=${encodeURIComponent(fields)}`;
   const headers: Record<string, string> = {
     Authorization: `Bearer ${options.accessToken}`,
@@ -562,7 +565,7 @@ export async function listDriveFiles(params: {
     q: params.q,
     fields:
       params.fields ??
-      "nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum,trashed,parents,appProperties,capabilities(canDownload,canDelete,canEdit,canAddChildren))",
+      "nextPageToken,files(id,name,mimeType,size,createdTime,modifiedTime,version,headRevisionId,md5Checksum,trashed,parents,appProperties,capabilities(canDownload,canDelete,canEdit,canAddChildren))",
     pageSize: String(params.pageSize ?? 50),
     supportsAllDrives: "true",
     includeItemsFromAllDrives: "true",
@@ -665,8 +668,8 @@ export async function uploadDriveMultipartJson(params: {
     `--${boundary}--`;
 
   const url = params.existingFileId
-    ? `https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(params.existingFileId)}?uploadType=multipart&supportsAllDrives=true&fields=id,name,size,md5Checksum,modifiedTime,appProperties`
-    : "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true&fields=id,name,size,md5Checksum,modifiedTime,appProperties";
+    ? `https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(params.existingFileId)}?uploadType=multipart&supportsAllDrives=true&fields=id,name,size,md5Checksum,modifiedTime,createdTime,version,headRevisionId,appProperties`
+    : "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true&fields=id,name,size,md5Checksum,modifiedTime,createdTime,version,headRevisionId,appProperties";
 
   const response = await fetchFn(url, {
     method: params.existingFileId ? "PATCH" : "POST",
@@ -779,11 +782,14 @@ function optionsProgressSafe(
   }
 }
 
-/** 僅刪除由 Loop Harmonizer 自行建立且具備 lhApp=loop-harmonizer 標記的 Drive 檔案或資料夾。 */
+/** 僅刪除由 Loop Harmonizer 自行建立且具備 lhApp=loop-harmonizer 標記的 Drive 檔案或資料夾；支援嚴格角色/帳戶/專案驗證。 */
 export async function deleteAppManagedDriveFile(params: {
   fileId: string;
   accessToken: string;
   fileName?: string;
+  expectedRole?: string;
+  expectedAccountId?: string;
+  expectedProjectId?: string;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
 }): Promise<void> {
@@ -798,6 +804,40 @@ export async function deleteAppManagedDriveFile(params: {
   if (meta.appProperties?.lhApp !== "loop-harmonizer") {
     throw new DriveApiError(
       `「${meta.name || params.fileName || params.fileId}」並非 Loop Harmonizer 管理的成果檔案，已拒絕刪除。`,
+      {
+        status: 403,
+        code: "forbidden",
+        fileName: meta.name || params.fileName,
+      },
+    );
+  }
+  if (params.expectedRole && meta.appProperties?.lhRole !== params.expectedRole) {
+    throw new DriveApiError(
+      `「${meta.name || params.fileName || params.fileId}」的系統角色（${meta.appProperties?.lhRole ?? "unknown"}）與預期不符，已拒絕刪除。`,
+      {
+        status: 403,
+        code: "forbidden",
+        fileName: meta.name || params.fileName,
+      },
+    );
+  }
+  if (
+    params.expectedAccountId &&
+    meta.appProperties?.lhAccountId &&
+    meta.appProperties.lhAccountId !== params.expectedAccountId
+  ) {
+    throw new DriveApiError(
+      `「${meta.name || params.fileName || params.fileId}」屬於其他 Google 帳戶，已拒絕跨帳戶刪除。`,
+      {
+        status: 403,
+        code: "forbidden",
+        fileName: meta.name || params.fileName,
+      },
+    );
+  }
+  if (params.expectedProjectId && meta.appProperties?.lhProjectId !== params.expectedProjectId) {
+    throw new DriveApiError(
+      `「${meta.name || params.fileName || params.fileId}」與指定 Project ID 不符，已拒絕刪除。`,
       {
         status: 403,
         code: "forbidden",

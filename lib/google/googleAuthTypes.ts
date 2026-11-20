@@ -26,6 +26,9 @@ export type GoogleAccount = {
   email?: string;
   displayName?: string;
   picture?: string;
+  googleSub?: string;
+  drivePermissionId?: string;
+  identitySource?: "oidc_sub" | "drive_permission_id" | "verified_pair";
 };
 
 export interface GoogleAuthSnapshot {

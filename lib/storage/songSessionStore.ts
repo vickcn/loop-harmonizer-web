@@ -1,4 +1,5 @@
 import type { BandSong, SeparationStatus } from "../band/bandTypes.ts";
+import type { PersistedProjectRecord } from "../projects/projectTypes.ts";
 import {
   detectSongRevisionConflict,
   findUnreferencedAudioKeys,
@@ -964,10 +965,11 @@ export async function removePersistedSong(input: {
   const tabId = getTabSyncId();
   return enqueueDbWrite(async () => {
     const res = await withIdbTransaction(
-      ["songs", "sessionMeta", "audioFiles", "separations", "settings"],
+      ["songs", "projects", "sessionMeta", "audioFiles", "separations", "settings"],
       "readwrite",
       async (tx) => {
         const songsStore = tx.objectStore("songs");
+        const projectsStore = tx.objectStore("projects");
         const metaStore = tx.objectStore("sessionMeta");
         const audioStore = tx.objectStore("audioFiles");
         const separationsStore = tx.objectStore("separations");
@@ -998,13 +1000,25 @@ export async function removePersistedSong(input: {
           updatedByTabId: tabId,
         } satisfies PersistedSessionMetaRecord));
 
-        const remainingDbSongs = await idbRequestPromise<PersistedSongRecord[]>(songsStore.getAll());
+        const [remainingDbSongs, allProjects] = await Promise.all([
+          idbRequestPromise<PersistedSongRecord[]>(songsStore.getAll()),
+          idbRequestPromise<PersistedProjectRecord[]>(projectsStore.getAll()),
+        ]);
         const remainingAllRefs = [
           ...remainingDbSongs.map((item) => ({
             audioKey: item.audioKey,
             sourceAudioHash: item.sourceAudioHash,
             settingsKey: item.settingsKey,
           })),
+          ...allProjects.flatMap((proj) =>
+            (proj.project?.songs ?? [])
+              .filter((entry) => entry.entryId !== input.song.id)
+              .map((entry) => ({
+                audioKey: entry.sourceAudioHash,
+                sourceAudioHash: entry.sourceAudioHash,
+                settingsKey: `proj:${entry.entryId}:${entry.sourceAudioHash.slice(0, 12)}`,
+              })),
+          ),
           ...(input.inMemoryRemainingSongs ?? [])
             .filter((item) => item.id !== input.song.id)
             .map((item) => ({
@@ -1095,16 +1109,24 @@ export async function clearUnusedSeparationCaches(
   inMemorySongs: readonly BandSong[] = [],
 ): Promise<{ deletedCount: number; freedBytes: number }> {
   const res = await enqueueDbWrite(() =>
-    withIdbTransaction(["songs", "separations"], "readwrite", async (tx) => {
+    withIdbTransaction(["songs", "projects", "separations"], "readwrite", async (tx) => {
       const songsStore = tx.objectStore("songs");
+      const projectsStore = tx.objectStore("projects");
       const separationsStore = tx.objectStore("separations");
-      const [dbSongs, allSeparations] = await Promise.all([
+      const [dbSongs, allProjects, allSeparations] = await Promise.all([
         idbRequestPromise<PersistedSongRecord[]>(songsStore.getAll()),
+        idbRequestPromise<PersistedProjectRecord[]>(projectsStore.getAll()),
         idbRequestPromise<StemCacheRecord[]>(separationsStore.getAll()),
       ]);
 
       const activeRefs = [
         ...dbSongs.map((item) => ({ sourceAudioHash: item.sourceAudioHash, cacheKey: item.cacheKey })),
+        ...allProjects.flatMap((proj) =>
+          (proj.project?.songs ?? []).map((entry) => ({
+            sourceAudioHash: entry.sourceAudioHash,
+            cacheKey: null,
+          })),
+        ),
         ...inMemorySongs.map((item) => ({
           sourceAudioHash: item.sourceAudioHash ?? null,
           cacheKey: item.cacheKey ?? null,

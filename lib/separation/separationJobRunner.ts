@@ -39,6 +39,13 @@ import {
   patchPersistedSongSeparationFields,
 } from "../storage/songSessionStore.ts";
 import {
+  commitProjectEntrySeparationArtifact,
+  getProjectRecord,
+  isProjectDeleted,
+} from "../storage/projectStore.ts";
+import { idbRequestPromise, withIdbTransaction } from "../storage/indexedDb.ts";
+import { DEMUCS_SAMPLE_RATE, getTaskChunkKeysInStore } from "../storage/separationChunkStore.ts";
+import {
   DEFAULT_JOB_LEASE_TTL_MS,
   type ResumeValidationResult,
   type SeparationJobLeaseManager,
@@ -74,6 +81,8 @@ import {
 export interface SeparationJobDescriptor {
   taskId: string;
   songId: string;
+  projectId?: string | null;
+  entryId?: string | null;
   songName?: string;
   sourceAudioId: string;
   sourceAudioHash: string;
@@ -280,6 +289,8 @@ export async function reconstructJobDescriptor(params: {
   const descriptor: SeparationJobDescriptor = {
     taskId,
     songId: resolvedSongId,
+    projectId: checkpoint?.projectId ?? null,
+    entryId: checkpoint?.entryId ?? resolvedSongId,
     songName: transient?.name || songRecord?.name || resolvedSongId,
     sourceAudioId: `${resolvedSongId}_original`,
     sourceAudioHash,
@@ -326,6 +337,8 @@ async function getLatestCheckpointForSongFallback(
 
 export interface StartSeparationJobRequest {
   songId: string;
+  projectId?: string | null;
+  entryId?: string | null;
   taskId?: string;
   songName?: string;
   mode?: StemSeparationMode;
@@ -441,6 +454,8 @@ export interface SeparationJobSinkPort {
   startJobController: (options: {
     taskId: string;
     songId: string;
+    projectId?: string | null;
+    entryId?: string | null;
     songName?: string;
     throttleMs?: number;
     cooldownMs?: number;
@@ -451,6 +466,8 @@ export interface SeparationJobSinkPort {
     patch: {
       taskId?: string;
       songId?: string;
+      projectId?: string | null;
+      entryId?: string | null;
       songName?: string;
       requestedMode?: StemSeparationMode;
       generation?: number;
@@ -534,6 +551,15 @@ export async function runSeparationJob(
     taskId: request.taskId,
     songId: request.songId,
   });
+
+  const effectiveProjectId =
+    request.projectId !== undefined
+      ? request.projectId
+      : (reconstructed?.descriptor.projectId ?? null);
+  const effectiveEntryId =
+    request.entryId !== undefined
+      ? request.entryId
+      : (reconstructed?.descriptor.entryId ?? request.songId);
 
   const transient = getTransientSongAudio(request.songId);
   const audioBlob = request.file ?? transient?.blob ?? reconstructed?.audioBlob ?? null;
@@ -753,13 +779,29 @@ export async function runSeparationJob(
         }
 
         const freshSongBefore = await getPersistedSongRecord(request.songId).catch(() => null);
-        if (!freshSongBefore) {
+        const freshProjectEntryBefore =
+          !freshSongBefore && effectiveProjectId && effectiveEntryId
+            ? await (async () => {
+                if (await isProjectDeleted(effectiveProjectId)) return null;
+                const projRec = await getProjectRecord(effectiveProjectId).catch(() => null);
+                return (
+                  projRec?.project.songs.find(
+                    (item) =>
+                      item.entryId === effectiveEntryId &&
+                      item.sourceAudioHash === sourceAudioHash,
+                  ) ?? null
+                );
+              })()
+            : null;
+        if (!freshSongBefore && !freshProjectEntryBefore) {
           controller?.settleForFinalizationPending();
           jobSink.updateJob(
             finalTaskId,
             {
               taskId: finalTaskId,
               songId: request.songId,
+              projectId: effectiveProjectId,
+              entryId: effectiveEntryId,
               songName: effectiveSongName,
               requestedMode: mode,
               stage: "failed",
@@ -771,7 +813,7 @@ export async function runSeparationJob(
               completedChunks: totalChunks,
               totalChunks,
               committedBytes,
-              message: "歌曲已被移除，已停止最終保存。",
+              message: "歌曲或所屬專案已被移除，已停止最終保存。",
             },
             {
               allowRepairOrReset: true,
@@ -785,7 +827,7 @@ export async function runSeparationJob(
             generation: params.executionFence?.generation ?? controller?.generation ?? null,
             finalizationOutcome: "song_missing",
             controllerSettled: true,
-            note: "aborted finalization because song no longer exists",
+            note: "aborted finalization because song/project entry no longer exists",
           });
           return {
             status: "failed",
@@ -798,7 +840,7 @@ export async function runSeparationJob(
             completedChunks: totalChunks,
             totalChunks,
             committedBytes,
-            message: "歌曲已被移除，已停止最終保存。",
+            message: "歌曲或所屬專案已被移除，已停止最終保存。",
           };
         }
 
@@ -936,7 +978,7 @@ export async function runSeparationJob(
           if (explicitFence) {
             fence = explicitFence;
           } else {
-            const nextGen = Math.max(1, (freshSongBefore.separationGeneration ?? 0) + 1);
+            const nextGen = Math.max(1, (freshSongBefore?.separationGeneration ?? 0) + 1);
             fence = {
               generation: nextGen,
               ownerJobToken: createJobToken(),
@@ -952,6 +994,8 @@ export async function runSeparationJob(
           {
             taskId: finalTaskId,
             songId: request.songId,
+            projectId: effectiveProjectId,
+            entryId: effectiveEntryId,
             songName: effectiveSongName,
             requestedMode: mode,
             generation: uiGeneration,
@@ -978,6 +1022,9 @@ export async function runSeparationJob(
         );
 
         let commitResult: SeparationCommitResult;
+        let projectFinalizedSampleRate = chunkedSummary?.sampleRate ?? DEMUCS_SAMPLE_RATE;
+        let projectFinalizedTotalSamples = chunkedSummary?.totalSamples ?? 0;
+
         try {
           if (totalChunks > 0) {
             await addCheckpointReference({
@@ -988,23 +1035,101 @@ export async function runSeparationJob(
             }).catch(() => undefined);
           }
 
-          commitResult = await commitPersistedSongSeparationFinalization({
-            songId: request.songId,
-            taskId: finalTaskId,
-            sourceAudioHash,
-            modelVersion: DEMUCS_MODEL_VERSION,
-            processingVersion: SEPARATION_PROCESSING_VERSION,
-            generation: fence.generation,
-            ownerJobToken: fence.ownerJobToken,
-            ownerTabId: fence.ownerTabId,
-            mode,
-            totalChunks,
-            committedBytes,
-            cacheKey,
-            stemRoles: stemRolesForMode(mode),
-            allowReplaceCompleted,
-            expectedPreviousTaskId: effectivePreviousCompletedTaskId,
-          });
+          if (freshSongBefore) {
+            commitResult = await commitPersistedSongSeparationFinalization({
+              songId: request.songId,
+              taskId: finalTaskId,
+              sourceAudioHash,
+              modelVersion: DEMUCS_MODEL_VERSION,
+              processingVersion: SEPARATION_PROCESSING_VERSION,
+              generation: fence.generation,
+              ownerJobToken: fence.ownerJobToken,
+              ownerTabId: fence.ownerTabId,
+              mode,
+              totalChunks,
+              committedBytes,
+              cacheKey,
+              stemRoles: stemRolesForMode(mode),
+              allowReplaceCompleted,
+              expectedPreviousTaskId: effectivePreviousCompletedTaskId,
+            });
+          } else {
+            // 專案歌曲路徑：驗證 Checkpoint 完成狀態並標記 finalized，不寫入舊版 default songs store
+            commitResult = await withIdbTransaction(
+              ["separationCheckpoints", "separationChunks"],
+              "readwrite",
+              async (tx) => {
+                const cpStore = tx.objectStore("separationCheckpoints");
+                const chunkStore = tx.objectStore("separationChunks");
+                if (totalChunks > 0) {
+                  const targetCp = (await idbRequestPromise(
+                    cpStore.get(finalTaskId),
+                  )) as SeparationCheckpoint | undefined;
+                  if (!targetCp || targetCp.status === "cancelled") {
+                    return { status: "transition_rejected" } as SeparationCommitResult;
+                  }
+                  const keys = await getTaskChunkKeysInStore(chunkStore, finalTaskId);
+                  if (targetCp.status !== "completed" || keys.length < targetCp.totalChunks) {
+                    return { status: "transition_rejected" } as SeparationCommitResult;
+                  }
+                  projectFinalizedSampleRate = targetCp.sampleRate;
+                  projectFinalizedTotalSamples = targetCp.totalSamples;
+                  const nowTs = Date.now();
+                  const prevRefs = targetCp.referencedBySongIds ?? [targetCp.songId];
+                  await idbRequestPromise(
+                    cpStore.put({
+                      ...targetCp,
+                      referencedBySongIds: Array.from(
+                        new Set([...prevRefs, effectiveEntryId || request.songId]),
+                      ),
+                      lease: null,
+                      finalizedAt: targetCp.finalizedAt ?? nowTs,
+                      finalizedGeneration: Math.max(
+                        targetCp.finalizedGeneration ?? 0,
+                        fence.generation,
+                      ),
+                      finalizedOwnerJobToken: fence.ownerJobToken,
+                      retryState: null,
+                      updatedAt: nowTs,
+                    } satisfies SeparationCheckpoint),
+                  );
+                }
+                return {
+                  status: "committed",
+                  record: undefined as unknown as PersistedSongRecord,
+                } as SeparationCommitResult;
+              },
+            );
+          }
+
+          if (
+            (commitResult.status === "committed" || commitResult.status === "already_committed") &&
+            effectiveProjectId &&
+            effectiveEntryId
+          ) {
+            const projCommit = await commitProjectEntrySeparationArtifact({
+              projectId: effectiveProjectId,
+              entryId: effectiveEntryId,
+              sourceAudioHash,
+              artifactRef: {
+                revisionId: `local-${finalTaskId}`,
+                sourceAudioHash,
+                separationMode: mode,
+                modelVersion: DEMUCS_MODEL_VERSION,
+                processingVersion: SEPARATION_PROCESSING_VERSION,
+                sampleRate: projectFinalizedSampleRate,
+                channelCount: 2,
+                totalSamples:
+                  projectFinalizedTotalSamples ||
+                  Math.max(1, Math.round(effectiveDurationSec * projectFinalizedSampleRate)),
+                localTaskId: totalChunks > 0 ? finalTaskId : null,
+                localSourceType: totalChunks > 0 ? "demucs_checkpoint" : null,
+              },
+            });
+            if (!projCommit.updated && !freshSongBefore) {
+              commitResult = { status: "song_missing" };
+            }
+          }
         } catch (error) {
           controller?.settleForFinalizationPending();
           const quotaErr = isQuotaExceededError(error);
@@ -1546,6 +1671,8 @@ export async function runSeparationJob(
         controller = jobSink.startJobController({
           taskId: checkpointTaskId,
           songId: request.songId,
+          projectId: effectiveProjectId,
+          entryId: effectiveEntryId,
           songName: effectiveSongName,
           throttleMs: 180,
           cooldownMs: 80,
@@ -1638,6 +1765,8 @@ export async function runSeparationJob(
           mode: effectiveMode,
           controller,
           songId: request.songId,
+          projectId: effectiveProjectId,
+          entryId: effectiveEntryId,
           sourceAudioHash,
           checkpointTaskId,
           userAuthorized: true,

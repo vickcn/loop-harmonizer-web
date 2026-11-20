@@ -1,4 +1,8 @@
 import {
+  lookupCanonicalAccountIdForDrivePermission,
+  saveVerifiedAccountIdentityLink,
+} from "../storage/projectStore.ts";
+import {
   GOOGLE_DRIVE_FILE_SCOPE,
   GOOGLE_REQUESTED_SCOPES,
   type GoogleAccount,
@@ -59,11 +63,42 @@ async function fetchGoogleUserAccount(
           picture?: string;
         };
         if (typeof data.sub === "string" && data.sub.trim()) {
+          const sub = data.sub.trim();
+          const canonicalId = `google:${sub}`;
+          let drivePermissionId: string | undefined;
+
+          // 嘗試以同一組有效 Token 查得 Drive permissionId 建立經驗證對應（僅此 token 成功才建立，絕不依 email 自動合併）
+          try {
+            const aboutPairRes = await fetchImpl(
+              "https://www.googleapis.com/drive/v3/about?fields=user(permissionId)",
+              {
+                headers: { Authorization: `Bearer ${accessToken}` },
+              },
+            );
+            if (aboutPairRes.ok) {
+              const pairJson = (await aboutPairRes.json()) as {
+                user?: { permissionId?: string };
+              };
+              const pid = pairJson.user?.permissionId?.trim();
+              if (pid) {
+                drivePermissionId = pid;
+                await saveVerifiedAccountIdentityLink(canonicalId, `drive:${pid}`).catch(
+                  () => undefined,
+                );
+              }
+            }
+          } catch {
+            // 僅輔助建立對應，失敗不阻斷登入
+          }
+
           return {
-            accountId: `google:${data.sub.trim()}`,
+            accountId: canonicalId,
             email: typeof data.email === "string" ? data.email : undefined,
             displayName: typeof data.name === "string" ? data.name : undefined,
             picture: typeof data.picture === "string" ? data.picture : undefined,
+            googleSub: sub,
+            drivePermissionId,
+            identitySource: drivePermissionId ? "verified_pair" : "oidc_sub",
           };
         }
       }
@@ -93,11 +128,19 @@ async function fetchGoogleUserAccount(
   if (!permissionId) {
     throw new Error("Google API 未回傳穩定的帳戶識別碼（sub / permissionId），無法建立安全帳戶隔離。");
   }
+  const fallbackId = `drive:${permissionId}`;
+  const linkedCanonicalId = await lookupCanonicalAccountIdForDrivePermission(fallbackId).catch(
+    () => null,
+  );
+  const resolvedId = linkedCanonicalId ?? fallbackId;
   return {
-    accountId: `drive:${permissionId}`,
+    accountId: resolvedId,
     email: aboutJson.user?.emailAddress,
     displayName: aboutJson.user?.displayName,
     picture: aboutJson.user?.photoLink,
+    googleSub: linkedCanonicalId ? linkedCanonicalId.slice("google:".length) : undefined,
+    drivePermissionId: permissionId,
+    identitySource: linkedCanonicalId ? "verified_pair" : "drive_permission_id",
   };
 }
 

@@ -1,4 +1,10 @@
 import type { StemMetadata } from "@/lib/separation/stemTypes";
+import type {
+  ProjectSongArtifactRef,
+  ProjectSongAvailabilityState,
+  ProjectSongBackupStatus,
+  ProjectSongOriginalBackupRef,
+} from "../projects/projectTypes.ts";
 
 export type TrackStatus = "stopped" | "playing" | "paused";
 export type TrackSyncMode = "free" | "global-bpm" | "manual-rate";
@@ -157,6 +163,11 @@ export type BandSong = {
   driveExport?: DriveExportStatusSummary | null;
   importedStemOrigin?: ImportedStemOrigin | null;
   sourceAudioMissing?: boolean;
+  projectEntryId?: string;
+  availabilityState?: ProjectSongAvailabilityState;
+  backupStatus?: ProjectSongBackupStatus;
+  artifactRef?: ProjectSongArtifactRef | null;
+  originalBackup?: ProjectSongOriginalBackupRef | null;
 };
 
 export type BandTrack = {

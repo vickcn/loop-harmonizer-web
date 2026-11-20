@@ -20,6 +20,7 @@ export interface PersistedDriveAccountRecord {
   rootFolderId: string;
   songsFolderId: string;
   sessionsFolderId: string;
+  projectsFolderId?: string;
   updatedAt: number;
 }
 
@@ -39,6 +40,7 @@ export async function savePersistedDriveAccountFolders(
     rootFolderId: record.rootFolderId,
     songsFolderId: record.songsFolderId,
     sessionsFolderId: record.sessionsFolderId,
+    projectsFolderId: record.projectsFolderId,
     updatedAt: record.updatedAt,
   };
   await idbPut("driveAccounts", full);

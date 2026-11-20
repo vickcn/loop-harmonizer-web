@@ -131,6 +131,8 @@ import {
   type StorageStatsSummary,
 } from "@/lib/storage/songSessionStore";
 import { SongCard } from "./SongCard";
+import { ProjectToolbar, type ProjectBusyState } from "./ProjectToolbar";
+import { ProjectManagerDialog, type ProjectDialogMode } from "./ProjectManagerDialog";
 import { IconActionButton } from "./IconActionButton";
 import { GoogleDrivePickerButton } from "./GoogleDrivePickerButton";
 import { GoogleAccountButton } from "@/components/google/GoogleAccountButton";
@@ -138,6 +140,53 @@ import { DriveExportDialog } from "./DriveExportDialog";
 import { DriveLibraryDialog } from "./DriveLibraryDialog";
 import { ResourceGuardModal, type ResourceGuardConfirmSelection } from "./ResourceGuardModal";
 import { ConfirmDeleteDialog } from "./ConfirmDeleteDialog";
+import { idbPut } from "@/lib/storage/indexedDb";
+import {
+  getProjectRecord,
+  setActiveProjectId,
+  subscribeProjectSyncBroadcast,
+} from "@/lib/storage/projectStore";
+import type {
+  BandProject,
+  PersistedProjectRecord,
+  ProjectListEntrySummary,
+  ProjectStorageProvider,
+} from "@/lib/projects/projectTypes";
+import {
+  buildProjectFromBandSongs,
+  computeEntryBackupStatus,
+} from "@/lib/projects/projectModel";
+import {
+  ProjectAutoSyncController,
+  type ProjectDriveSyncOutcome,
+} from "@/lib/projects/projectDriveSync";
+import {
+  assessProjectOfflineDownload,
+  downloadEntireProjectOffline,
+  projectToBandSongsMetadataOnly,
+  restoreSingleProjectSongOnDemand,
+  type ProjectOfflineAssessment,
+  type ProjectOfflineDownloadProgress,
+} from "@/lib/projects/projectRestoreManager";
+import {
+  checkCloudArtifactReferencesAcrossProjects,
+  isAudioHashReferencedAcrossWorkspace,
+} from "@/lib/projects/projectResourceReferences";
+import {
+  createNewProject,
+  deleteProjectSafely,
+  listAllProjectsForUi,
+  migrateLegacyBandSessionToProject,
+  openProjectMetadataAndEntries,
+  promoteLocalProjectToDrive,
+  renameProject,
+  resolveProjectConflict,
+  restoreLastActiveProjectOrNull,
+  saveLocalProjectSnapshot,
+  saveProjectAs,
+  type ProjectAuthContext,
+  type PromoteLocalToDriveProgress,
+} from "@/lib/projects/projectManager";
 import { sharedGoogleAccountManager } from "@/lib/google/googleAccountManager";
 import {
   isGoogleDrivePickerConfigured,
@@ -373,10 +422,49 @@ export function BandMixer() {
   const persistSongDebouncedRef = useRef<(songId: string, delayMs?: number) => void>(() => undefined);
   const mountedRef = useRef(true);
   const hydratedCompletedJobsRef = useRef<Set<string>>(new Set());
+  const [activeProjectRecord, setActiveProjectRecord] = useState<PersistedProjectRecord | null>(null);
+  const activeProjectRecordRef = useRef<PersistedProjectRecord | null>(null);
+  const activeProjectIdRef = useRef<string | null>(null);
+  const [hasLegacyWorkspaceSongs, setHasLegacyWorkspaceSongs] = useState(false);
+  const [projectBusyState, setProjectBusyState] = useState<ProjectBusyState | null>(null);
+  const [projectDialogMode, setProjectDialogMode] = useState<ProjectDialogMode>(null);
+  const [projectRenameTarget, setProjectRenameTarget] = useState<{ projectId: string; name: string } | null>(null);
+  const [projectDialogError, setProjectDialogError] = useState<string | null>(null);
+  const [projectListEntries, setProjectListEntries] = useState<ProjectListEntrySummary[]>([]);
+  const [projectListLoading, setProjectListLoading] = useState(false);
+  const [projectListError, setProjectListError] = useState<string | null>(null);
+  const cloudProjectsMapRef = useRef(new Map<string, { project: BandProject; driveVersion?: string | null }>());
+  const [promoteProgress, setPromoteProgress] = useState<PromoteLocalToDriveProgress | null>(null);
+  const [promoteBackupFailures, setPromoteBackupFailures] = useState<Array<{ entryId: string; displayName: string; reason: string }>>([]);
+  const promoteAbortRef = useRef<AbortController | null>(null);
+  const [offlineAssessment, setOfflineAssessment] = useState<ProjectOfflineAssessment | null>(null);
+  const [offlineAssessmentLoading, setOfflineAssessmentLoading] = useState(false);
+  const [offlineDownloadProgress, setOfflineDownloadProgress] = useState<ProjectOfflineDownloadProgress | null>(null);
+  const [offlineDownloadResult, setOfflineDownloadResult] = useState<{
+    completedCount: number;
+    reusedCount: number;
+    failedSongs: Array<{ entryId: string; displayName: string; reason: string }>;
+    cancelled: boolean;
+  } | null>(null);
+  const offlineDownloadAbortRef = useRef<AbortController | null>(null);
+  const [restoringOnDemandBySongId, setRestoringOnDemandBySongId] = useState<Record<string, string>>({});
+  const autoSyncControllerRef = useRef<ProjectAutoSyncController | null>(null);
+  const projectOpGenerationRef = useRef(0);
   const backgroundSeparationJobs = useSyncExternalStore(
     sharedSeparationJobManager.subscribe.bind(sharedSeparationJobManager),
     sharedSeparationJobManager.getSnapshot,
     sharedSeparationJobManager.getSnapshot,
+  );
+  const otherProjectJobs = backgroundSeparationJobs.filter(
+    (job) =>
+      Boolean(job.projectId) &&
+      job.projectId !== (activeProjectRecord?.projectId ?? null) &&
+      (job.stage === "preparing" ||
+        job.stage === "downloading" ||
+        job.stage === "processing" ||
+        job.stage === "finalizing" ||
+        job.stage === "pausing" ||
+        job.stage === "cancelling"),
   );
 
   const getEngine = useCallback(() => {
@@ -417,6 +505,11 @@ export function BandMixer() {
   }, [session]);
 
   useEffect(() => {
+    activeProjectRecordRef.current = activeProjectRecord;
+    activeProjectIdRef.current = activeProjectRecord?.projectId ?? null;
+  }, [activeProjectRecord]);
+
+  useEffect(() => {
     selectionRef.current = selection;
   }, [selection]);
 
@@ -431,10 +524,20 @@ export function BandMixer() {
   // BandMixer 僅訂閱全域投影；明確映射所有階段（含 completed），不以未掛載 UI 重建 Worker 或降級 completed。
   useEffect(() => {
     if (backgroundSeparationJobs.length === 0) return;
+    const currentProjId = activeProjectRecord?.projectId ?? null;
     setSession((previous) => {
       let changed = false;
       const songs = previous.songs.map((song) => {
-        const matchingJobs = backgroundSeparationJobs.filter((candidate) => candidate.songId === song.id);
+        const matchingJobs = backgroundSeparationJobs.filter((candidate) => {
+          const idMatch =
+            candidate.songId === song.id ||
+            (Boolean(candidate.entryId) && candidate.entryId === (song.projectEntryId ?? song.id));
+          if (!idMatch) return false;
+          if (currentProjId) {
+            return candidate.projectId === currentProjId;
+          }
+          return !candidate.projectId;
+        });
         const job = matchingJobs.reduce<typeof matchingJobs[number] | undefined>((best, candidate) => {
           if (!best) return candidate;
           const bestActive =
@@ -507,7 +610,7 @@ export function BandMixer() {
       });
       return changed ? { ...previous, songs } : previous;
     });
-  }, [backgroundSeparationJobs]);
+  }, [backgroundSeparationJobs, activeProjectRecord?.projectId]);
 
   const showShortcutHint = useCallback((message: string) => {
     setShortcutHint(message);
@@ -660,7 +763,76 @@ export function BandMixer() {
     }
   }, [patchSongMetadataOnly, refreshCacheStats, showShortcutHint]);
 
+  const getProjectAuthContext = useCallback((): ProjectAuthContext => {
+    const snap = sharedGoogleAccountManager.getSnapshot();
+    const token = sharedGoogleAccountManager.getValidAccessToken();
+    return {
+      accountId: snap.account?.accountId ?? null,
+      accessToken: token,
+      generation: snap.generation,
+      isGenerationValid: (gen, acc) => sharedGoogleAccountManager.isGenerationValid(gen, acc),
+      onAuthExpired: () => sharedGoogleAccountManager.markTokenExpired(snap.generation),
+    };
+  }, []);
+
+  if (!autoSyncControllerRef.current) {
+    autoSyncControllerRef.current = new ProjectAutoSyncController({
+      getAuthContext: getProjectAuthContext,
+      onStatusChanged: (projectId, outcome) => {
+        if (!mountedRef.current || activeProjectIdRef.current !== projectId) return;
+        if ("record" in outcome && outcome.record) {
+          activeProjectRecordRef.current = outcome.record;
+          setActiveProjectRecord(outcome.record);
+        } else if (outcome.status === "conflict") {
+          void getProjectRecord(projectId).then((fresh) => {
+            if (fresh && mountedRef.current && activeProjectIdRef.current === projectId) {
+              activeProjectRecordRef.current = fresh;
+              setActiveProjectRecord(fresh);
+            }
+          });
+        }
+      },
+    });
+  }
+
+  const scheduleActiveProjectSave = useCallback((
+    songsOverride?: readonly BandSong[],
+    options?: { immediateLocal?: boolean; syncImmediately?: boolean; incrementRevision?: boolean },
+  ) => {
+    const current = activeProjectRecordRef.current;
+    if (!current) return;
+    const nextSongs = songsOverride ?? sessionRef.current.songs;
+    const builtProject = buildProjectFromBandSongs({
+      existingProject: current.project,
+      songs: nextSongs,
+      incrementRevision: options?.incrementRevision ?? true,
+    });
+    const nextRecord: PersistedProjectRecord = {
+      ...current,
+      project: builtProject,
+      localRevision: builtProject.revision,
+      dirty: current.storageProvider === "google_drive" ? true : false,
+      syncStatus:
+        current.storageProvider === "google_drive"
+          ? current.syncStatus === "conflict"
+            ? "conflict"
+            : "dirty"
+          : "local_only",
+      lastSavedAt: Date.now(),
+    };
+    activeProjectRecordRef.current = nextRecord;
+    setActiveProjectRecord(nextRecord);
+    autoSyncControllerRef.current?.scheduleProjectEdit(nextRecord, {
+      immediateLocal: options?.immediateLocal,
+      syncImmediately: options?.syncImmediately,
+    });
+  }, []);
+
   const persistSongDebounced = useCallback((songId: string, delayMs = 300) => {
+    if (activeProjectRecordRef.current) {
+      scheduleActiveProjectSave(sessionRef.current.songs);
+      return;
+    }
     const current = sessionRef.current.songs.find((candidate) => candidate.id === songId);
     if (current?.sourceAudioHash && current.persistenceStatus === "saved") {
       patchSongMetadataOnly(songId, { persistenceStatus: "saving", persistenceMessage: "儲存中…" });
@@ -671,7 +843,7 @@ export function BandMixer() {
       handlePersistResult,
       delayMs,
     );
-  }, [handlePersistResult, patchSongMetadataOnly]);
+  }, [handlePersistResult, patchSongMetadataOnly, scheduleActiveProjectSave]);
 
   useEffect(() => {
     persistSongDebouncedRef.current = persistSongDebounced;
@@ -802,26 +974,43 @@ export function BandMixer() {
     };
     engine.seekTracks(stemIds, song.playheadSec);
     applySongToEngine(nextSong);
-    if (song.status === "playing" && targetPlaybackSource === "stems") {
-      void engine.playTracks(stemIds).then(() => {
-        engine.crossfadeTracks([song.sourceAudioId], stemIds);
-      });
-    }
-    const nextSongsSnapshot = sessionRef.current.songs.map((candidate) => candidate.id === song.id ? nextSong : candidate);
-    sessionRef.current = { ...sessionRef.current, songs: nextSongsSnapshot };
-    setSession((previous) => ({ ...previous, songs: previous.songs.map((candidate) => candidate.id === song.id ? nextSong : candidate) }));
-    setSelection((current) => sanitizeMixerSelection(current, nextSongsSnapshot));
-    if (!options?.skipPersist) {
-      setCollapsedIds((previous) => {
-        if (!previous.has(song.id)) return previous;
-        const next = new Set(previous);
-        next.delete(song.id);
-        return next;
-      });
-      persistSongDebounced(song.id);
-    }
-    return nextSong;
-  }, [applySongToEngine, getEngine, persistSongDebounced]);
+      if (song.status === "playing" && targetPlaybackSource === "stems") {
+        void engine.playTracks(stemIds).then(() => {
+          engine.crossfadeTracks([song.sourceAudioId], stemIds);
+        });
+      }
+      if (activeProjectRecordRef.current) {
+        const syncedEntrySong: BandSong = {
+          ...nextSong,
+          projectEntryId: nextSong.projectEntryId ?? nextSong.id,
+          availabilityState: "stems_loaded",
+          persistenceStatus: "saved",
+          persistenceMessage: "已載入分軌",
+        };
+        const projSongsSnapshot = sessionRef.current.songs.map((candidate) => candidate.id === song.id ? syncedEntrySong : candidate);
+        sessionRef.current = { ...sessionRef.current, songs: projSongsSnapshot };
+        setSession((previous) => ({ ...previous, songs: previous.songs.map((candidate) => candidate.id === song.id ? syncedEntrySong : candidate) }));
+        setSelection((current) => sanitizeMixerSelection(current, projSongsSnapshot));
+        if (!options?.skipPersist) {
+          scheduleActiveProjectSave(projSongsSnapshot);
+        }
+        return syncedEntrySong;
+      }
+      const nextSongsSnapshot = sessionRef.current.songs.map((candidate) => candidate.id === song.id ? nextSong : candidate);
+      sessionRef.current = { ...sessionRef.current, songs: nextSongsSnapshot };
+      setSession((previous) => ({ ...previous, songs: previous.songs.map((candidate) => candidate.id === song.id ? nextSong : candidate) }));
+      setSelection((current) => sanitizeMixerSelection(current, nextSongsSnapshot));
+      if (!options?.skipPersist) {
+        setCollapsedIds((previous) => {
+          if (!previous.has(song.id)) return previous;
+          const next = new Set(previous);
+          next.delete(song.id);
+          return next;
+        });
+        persistSongDebounced(song.id);
+      }
+      return nextSong;
+  }, [applySongToEngine, getEngine, persistSongDebounced, scheduleActiveProjectSave]);
 
   const installChunkedStemSet = useCallback(async (
     song: BandSong,
@@ -905,6 +1094,7 @@ export function BandMixer() {
       separationUsesChunkPlayback: true,
       playbackSource: targetPlaybackSource,
       cacheKey,
+      ...(activeProjectRecordRef.current ? { availabilityState: "stems_loaded" as const, persistenceStatus: "saved" as const } : {}),
     };
     const nextSong: BandSong = {
       ...latestFromRef,
@@ -1982,6 +2172,7 @@ export function BandMixer() {
         if (previousAccountId) {
           clearResumableSessionUrisForAccount(previousAccountId);
           clearCachedFolderLayoutForAccount(previousAccountId);
+          autoSyncControllerRef.current?.invalidateAccount(previousAccountId);
         }
         driveImportAbortRef.current?.abort();
         driveImportAbortRef.current = null;
@@ -1990,6 +2181,10 @@ export function BandMixer() {
         driveExportAbortRef.current = null;
         driveRestoreAbortRef.current?.abort();
         driveRestoreAbortRef.current = null;
+        promoteAbortRef.current?.abort();
+        promoteAbortRef.current = null;
+        offlineDownloadAbortRef.current?.abort();
+        offlineDownloadAbortRef.current = null;
         setDriveImportProgress(null);
         setDriveExportSubmitting(false);
         setDriveExportProgressBySongId({});
@@ -1999,18 +2194,57 @@ export function BandMixer() {
           setDriveLibraryEntries([]);
           setDriveLibraryInvalidEntries([]);
           setDriveLibraryError(null);
+          cloudProjectsMapRef.current.clear();
+          setProjectListEntries((prev) => prev.filter((item) => item.storageProvider === "local"));
           if (reason !== "switched") {
             setDriveLibraryOpen(false);
+          }
+          const activeProj = activeProjectRecordRef.current;
+          if (
+            reason === "switched" &&
+            activeProj &&
+            activeProj.storageProvider === "google_drive" &&
+            (!previousAccountId || activeProj.ownerAccountId === previousAccountId)
+          ) {
+            const engine = getEngine();
+            sessionRef.current.songs.forEach((s) => {
+              const ids = [s.sourceAudioId, ...s.stemIds];
+              engine.stopTracks(ids);
+              ids.forEach((id) => engine.removeTrack(id));
+            });
+            sourceFilesRef.current.clear();
+            stemResultsRef.current.clear();
+            activeProjectRecordRef.current = null;
+            activeProjectIdRef.current = null;
+            setActiveProjectRecord(null);
+            setSession((prev) => ({ ...prev, songs: [] }));
+            setSelection(EMPTY_MIXER_SELECTION);
+            void setActiveProjectId(null).then(() => {
+              if (mountedRef.current) {
+                setRestoreAttempt((n) => n + 1);
+              }
+            });
+            showShortcutHint("已切換 Google 帳號，已卸載前帳號的雲端專案畫面（本機快取安全保留）。");
           }
         }
         if (reason === "expired") {
           setDriveExportNeedsReauth(true);
           setDriveExportError("Google 授權已過期，請重新授權後接續上傳。");
+          const activeProj = activeProjectRecordRef.current;
+          if (activeProj && activeProj.storageProvider === "google_drive" && activeProj.dirty) {
+            const waitingProj: PersistedProjectRecord = {
+              ...activeProj,
+              syncStatus: "waiting_auth",
+              lastError: "Google 授權已過期，請重新授權後同步變更（本機已安全保存）。",
+            };
+            activeProjectRecordRef.current = waitingProj;
+            setActiveProjectRecord(waitingProj);
+          }
         }
       },
     );
     return unsubscribeAccountEnd;
-  }, []);
+  }, [getEngine, showShortcutHint]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -2033,14 +2267,24 @@ export function BandMixer() {
     };
   }, []);
 
-  // 當全域分軌任務在背景／其他路由完成或結束時，若 BandMixer 處於掛載狀態，自動載入分軌播放資源並解除專注模式
+  // 當全域分軌任務在背景／其他路由完成或結束時，若 BandMixer 處於掛載狀態，僅為所屬目前專案載入分軌播放資源並解除專注模式
   useEffect(() => {
+    const currentProjId = activeProjectRecord?.projectId ?? null;
     for (const job of backgroundSeparationJobs) {
-      const targetSong = sessionRef.current.songs.find((item) => item.id === job.songId);
+      if (currentProjId) {
+        if (job.projectId !== currentProjId) continue;
+      } else if (job.projectId) {
+        continue;
+      }
+      const targetSong = sessionRef.current.songs.find(
+        (item) =>
+          item.id === job.songId ||
+          (Boolean(job.entryId) && (item.projectEntryId ?? item.id) === job.entryId),
+      );
       if (!targetSong) continue;
 
       if (job.stage === "completed") {
-        const hydrationKey = `${job.taskId}:${job.generation}:${targetSong.separationMode ?? ""}`;
+        const hydrationKey = `${currentProjId ?? "legacy"}:${job.taskId}:${job.generation}:${targetSong.separationMode ?? ""}`;
         const needsStemAttach =
           !targetSong.separationUsesChunkPlayback ||
           targetSong.stemIds.length === 0 ||
@@ -2050,10 +2294,15 @@ export function BandMixer() {
         }
         hydratedCompletedJobsRef.current.add(hydrationKey);
         void (async () => {
-          const latest = sessionRef.current.songs.find((item) => item.id === job.songId);
+          if (currentProjId !== activeProjectIdRef.current) return;
+          const latest = sessionRef.current.songs.find(
+            (item) =>
+              item.id === job.songId ||
+              (Boolean(job.entryId) && (item.projectEntryId ?? item.id) === job.entryId),
+          );
           if (!latest || !mountedRef.current) return;
           const validation = await verifyAuthoritativeCheckpointForSong(latest, true).catch(() => null);
-          if (!mountedRef.current) return;
+          if (!mountedRef.current || currentProjId !== activeProjectIdRef.current) return;
           if (isValidationCompleted(validation) && validation?.checkpoint) {
             const resolvedMode =
               latest.separationMode ?? validation.checkpoint.requestedMode ?? "four_stem";
@@ -2083,6 +2332,16 @@ export function BandMixer() {
               job.message || `分段分離完成（共 ${validation.checkpoint.totalChunks} 段按需播放）。`,
               { preferredSource: latest.playbackSource === "original" ? "stems" : latest.playbackSource, skipPersist: true },
             );
+            if (currentProjId) {
+              const latestRec = await getProjectRecord(currentProjId).catch(() => null);
+              if (latestRec && mountedRef.current && activeProjectIdRef.current === currentProjId) {
+                activeProjectRecordRef.current = latestRec;
+                setActiveProjectRecord(latestRec);
+                if (latestRec.storageProvider === "google_drive" && latestRec.dirty) {
+                  autoSyncControllerRef.current?.scheduleProjectEdit(latestRec);
+                }
+              }
+            }
             if (separationFocusRef.current?.active && separationFocusRef.current.songId === latest.id) {
               await finishSeparationFocus({
                 songId: latest.id,
@@ -2106,7 +2365,7 @@ export function BandMixer() {
         });
       }
     }
-  }, [backgroundSeparationJobs, finishSeparationFocus, installChunkedStemSet, refreshCacheStats, verifyAuthoritativeCheckpointForSong]);
+  }, [backgroundSeparationJobs, activeProjectRecord?.projectId, finishSeparationFocus, installChunkedStemSet, refreshCacheStats, verifyAuthoritativeCheckpointForSong]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2115,10 +2374,40 @@ export function BandMixer() {
     const runRestore = async () => {
       setRestoringSession(true);
       setRestoreError("");
-      setRestoringMessage("正在從本機資料庫恢復歌曲與設定…");
+      setRestoringMessage("正在檢查作用中專案與本機歌曲資料庫…");
       try {
-        const persisted = await loadPersistedBandSession();
+        const authSnap = sharedGoogleAccountManager.getSnapshot();
+        const validToken = sharedGoogleAccountManager.getValidAccessToken();
+        const [activeProj, persisted] = await Promise.all([
+          restoreLastActiveProjectOrNull({
+            currentAccountId: authSnap.account?.accountId ?? null,
+          }),
+          loadPersistedBandSession(),
+        ]);
         if (cancelled) return;
+        setHasLegacyWorkspaceSongs(persisted.songs.length > 0);
+
+        if (activeProj) {
+          setRestoringMessage(`正在開啟專案「${activeProj.project.name}」（僅讀取 Metadata，不一次下載或解碼全部歌曲）…`);
+          const projSongs = await projectToBandSongsMetadataOnly(activeProj.project, {
+            currentAccountId: authSnap.account?.accountId ?? null,
+            hasValidGoogleToken: Boolean(authSnap.account && validToken),
+          });
+          if (cancelled) return;
+          activeProjectRecordRef.current = activeProj;
+          activeProjectIdRef.current = activeProj.projectId;
+          setActiveProjectRecord(activeProj);
+          sessionRef.current = { ...sessionRef.current, songs: projSongs };
+          setSession((previous) => ({ ...previous, songs: projSongs }));
+          setSelection(projSongs.length > 0 ? { songId: projSongs[0].id, stemId: null } : EMPTY_MIXER_SELECTION);
+          if (activeProj.storageProvider === "google_drive" && activeProj.dirty && authSnap.account?.accountId && validToken) {
+            void autoSyncControllerRef.current?.triggerDriveSync(activeProj.projectId);
+          }
+          setRestoringSession(false);
+          setRestoringMessage("");
+          return;
+        }
+
         if (persisted.songs.length === 0) {
           setRestoringSession(false);
           setRestoringMessage("");
@@ -2367,14 +2656,34 @@ export function BandMixer() {
     const onVisibilityChange = () => {
       if (document.visibilityState === "hidden") {
         void flushPendingSongPersists();
+        void autoSyncControllerRef.current?.flushLocalSaves();
       }
     };
     const onPageHide = () => {
       void flushPendingSongPersists();
+      void autoSyncControllerRef.current?.flushLocalSaves();
+    };
+    const onOnline = () => {
+      const accountId = sharedGoogleAccountManager.getSnapshot().account?.accountId;
+      if (accountId) {
+        void autoSyncControllerRef.current?.resumePendingForAccount(accountId);
+      }
     };
 
     document.addEventListener("visibilitychange", onVisibilityChange);
     window.addEventListener("pagehide", onPageHide);
+    window.addEventListener("online", onOnline);
+
+    const unsubscribeProjectBroadcast = subscribeProjectSyncBroadcast((msg) => {
+      if (cancelled) return;
+      if (msg.type === "project-deleted" && msg.projectId === activeProjectIdRef.current) {
+        activeProjectRecordRef.current = null;
+        activeProjectIdRef.current = null;
+        setActiveProjectRecord(null);
+        setSession((prev) => ({ ...prev, songs: [] }));
+        showShortcutHint("目前開啟的專案已在其他分頁刪除。");
+      }
+    });
 
     const currentTabId = getOrCreateTabId();
     const unsubscribeLease = sharedSeparationLeaseManager.onBroadcast((leaseMsg) => {
@@ -2468,9 +2777,12 @@ export function BandMixer() {
       cancelled = true;
       unsubscribeLease();
       unsubscribeSync();
+      unsubscribeProjectBroadcast();
       document.removeEventListener("visibilitychange", onVisibilityChange);
       window.removeEventListener("pagehide", onPageHide);
+      window.removeEventListener("online", onOnline);
       void flushPendingSongPersists();
+      void autoSyncControllerRef.current?.flushLocalSaves();
     };
   }, [applySongToEngine, getEngine, hydrateOnePersistedSong, installChunkedStemSet, patchSongMetadataOnly, refreshCacheStats, refreshResourceProfile, restoreAttempt, restoreCachedStems, showCardFeedback, showShortcutHint, verifyAuthoritativeCheckpointForSong]);
 
@@ -2494,7 +2806,7 @@ export function BandMixer() {
           if (Math.abs(position - song.playheadSec) < 0.03) return song;
           changed = true;
           const lastSaved = lastPlayheadPersistAtRef.current.get(song.id) ?? 0;
-          if (song.sourceAudioHash && now - lastSaved >= 2000) {
+          if (!activeProjectIdRef.current && song.sourceAudioHash && now - lastSaved >= 2000) {
             lastPlayheadPersistAtRef.current.set(song.id, now);
             scheduleSongPersist(
               song.id,
@@ -2521,19 +2833,38 @@ export function BandMixer() {
         return;
       }
     }
+    const patchKeys = Object.keys(patch) as Array<keyof BandSong>;
+    const isTransientPlaybackOnlyPatch =
+      patchKeys.length > 0 &&
+      patchKeys.every(
+        (key) =>
+          key === "status" ||
+          key === "playheadSec" ||
+          key === "selected" ||
+          key === "audioLoadState",
+      );
+
     let shouldPersist = false;
+    const nextSongs = sessionRef.current.songs.map((song) => {
+      if (song.id !== songId) return song;
+      const normalized: Partial<BandSong> = { ...patch };
+      if ("originalBpm" in normalized) normalized.originalBpm = clampBpm(normalized.originalBpm ?? song.originalBpm);
+      if ("targetBpm" in normalized) normalized.targetBpm = clampBpm(normalized.targetBpm ?? song.targetBpm);
+      if ("keyShiftSemitones" in normalized) normalized.keyShiftSemitones = Math.max(-12, Math.min(12, Math.round(normalized.keyShiftSemitones ?? 0)));
+      const next = { ...song, ...normalized };
+      applySongAudioPatch(song, next);
+      shouldPersist = activeProjectRecordRef.current
+        ? !isTransientPlaybackOnlyPatch
+        : Boolean(next.sourceAudioHash);
+      return next;
+    });
+    sessionRef.current = { ...sessionRef.current, songs: nextSongs };
     setSession((previous) => ({
       ...previous,
       songs: previous.songs.map((song) => {
         if (song.id !== songId) return song;
-        const normalized: Partial<BandSong> = { ...patch };
-        if ("originalBpm" in normalized) normalized.originalBpm = clampBpm(normalized.originalBpm ?? song.originalBpm);
-        if ("targetBpm" in normalized) normalized.targetBpm = clampBpm(normalized.targetBpm ?? song.targetBpm);
-        if ("keyShiftSemitones" in normalized) normalized.keyShiftSemitones = Math.max(-12, Math.min(12, Math.round(normalized.keyShiftSemitones ?? 0)));
-        const next = { ...song, ...normalized };
-        applySongAudioPatch(song, next);
-        shouldPersist = Boolean(next.sourceAudioHash);
-        return next;
+        const matched = nextSongs.find((candidate) => candidate.id === songId);
+        return matched ?? song;
       }),
     }));
     if (shouldPersist) {
@@ -2542,10 +2873,37 @@ export function BandMixer() {
   }, [applySongAudioPatch, isFocusLocked, persistSongDebounced, showCardFeedback, showShortcutHint]);
 
   const persistNewOrRelinkedSong = useCallback(async (song: BandSong, file: Blob, sourceAudioHash: string, force = false) => {
+    if (activeProjectRecordRef.current) {
+      try {
+        await idbPut("audioFiles", {
+          key: sourceAudioHash,
+          sourceAudioHash,
+          blob: file,
+          fileName: song.fileName,
+          mimeType: song.mimeType || file.type || "",
+          sizeBytes: file.size,
+          lastModified: song.fileLastModified || Date.now(),
+          createdAt: Date.now(),
+        });
+        patchSongMetadataOnly(song.id, {
+          persistenceStatus: "saved",
+          persistenceMessage: "已保存本機音檔於目前專案",
+          hasConflict: false,
+        });
+        scheduleActiveProjectSave(sessionRef.current.songs, { immediateLocal: true });
+      } catch (err) {
+        patchSongMetadataOnly(song.id, {
+          persistenceStatus: "error",
+          persistenceMessage: err instanceof Error ? err.message : "無法寫入本機音檔資料庫。",
+        });
+      }
+      void refreshCacheStats();
+      return;
+    }
     const res = await saveSongWithAudioFile({ song, file, sourceAudioHash, force });
     handlePersistResult(song.id, res);
     void refreshCacheStats();
-  }, [handlePersistResult, refreshCacheStats]);
+  }, [handlePersistResult, patchSongMetadataOnly, refreshCacheStats, scheduleActiveProjectSave]);
 
   /** 共用單首匯入核心：本機檔案與 Google Drive 音檔皆走同一套持久化、設定還原與快取比對管線。 */
   const importSingleSongCore = async (
@@ -2583,6 +2941,7 @@ export function BandMixer() {
           : options.source
         : { provider: "local" };
 
+      const activeProj = activeProjectRecordRef.current;
       const baseSong = createBandSong({
         id: songId,
         name: file.name.replace(/\.[^.]+$/, ""),
@@ -2599,6 +2958,13 @@ export function BandMixer() {
         persistenceMessage: "儲存中…",
         audioLoadState: shouldDeferDecode ? "unloaded" : "ready",
         source: songSource,
+        ...(activeProj
+          ? {
+              projectEntryId: songId,
+              availabilityState: "local_playable" as const,
+              backupStatus: songSource.provider === "google_drive" ? ("cross_device_ready" as const) : ("local_only" as const),
+            }
+          : {}),
       });
       const restoredRates = saved ? sanitizeSongSavedRates(saved.savedRates) : [1];
       const song: BandSong = saved
@@ -2629,6 +2995,7 @@ export function BandMixer() {
       if (!shouldDeferDecode) {
         applySongToEngine(song);
       }
+      sessionRef.current = { ...sessionRef.current, songs: [...sessionRef.current.songs, song] };
       setSession((previous) => ({ ...previous, songs: [...previous.songs, song] }));
       setSelection((previous) => (previous.songId ? previous : { songId: song.id, stemId: null }));
 
@@ -2927,7 +3294,9 @@ export function BandMixer() {
   };
 
   const handleRestoreOriginalFromDrive = async (song: BandSong) => {
-    if (song.source?.provider !== "google_drive") return;
+    const driveSource = song.source?.provider === "google_drive" ? song.source : null;
+    const backupRef = song.originalBackup?.driveFileId ? song.originalBackup : null;
+    if (!driveSource && !backupRef) return;
     if (isFocusLocked()) {
       showCardFeedback(song.id, "分離專注模式啟動中，暫時無法從 Drive 恢復原曲。");
       return;
@@ -2946,7 +3315,7 @@ export function BandMixer() {
       }
     }
     if (!token || !authSnap.account) return;
-    const expectedAccountId = song.source.authorizedAccountId;
+    const expectedAccountId = driveSource?.authorizedAccountId ?? backupRef?.ownerAccountId;
     if (expectedAccountId && authSnap.account.accountId !== expectedAccountId) {
       showCardFeedback(
         song.id,
@@ -2959,13 +3328,13 @@ export function BandMixer() {
     try {
       const verifiedMeta = await resolveDriveFileForDownload(
         {
-          id: song.source.fileId,
-          name: song.source.fileName,
-          mimeType: song.source.mimeType,
-          sizeBytes: song.source.sizeBytes,
-          resourceKey: song.source.resourceKey,
-          driveId: song.source.driveId,
-          modifiedTime: song.source.modifiedTime,
+          id: driveSource?.fileId ?? backupRef!.driveFileId,
+          name: driveSource?.fileName ?? backupRef!.fileName,
+          mimeType: driveSource?.mimeType ?? backupRef!.mimeType,
+          sizeBytes: driveSource?.sizeBytes ?? backupRef!.sizeBytes,
+          resourceKey: driveSource?.resourceKey,
+          driveId: driveSource?.driveId,
+          modifiedTime: driveSource?.modifiedTime ?? backupRef?.backedUpAt,
         },
         { accessToken: token },
       );
@@ -3004,16 +3373,19 @@ export function BandMixer() {
         sourceAudioHash: newHash,
         sourceAudioMissing: false,
         audioLoadState: "ready",
+        availabilityState: song.stemIds.length > 0 ? "stems_loaded" : "local_playable",
         persistenceStatus: "saving",
         persistenceMessage: "正在保存恢復的原曲…",
-        source: {
-          ...song.source,
-          fileId: verifiedMeta.pickedFileId,
-          resourceKey: verifiedMeta.resourceKey,
-          targetResourceKey: verifiedMeta.targetResourceKey,
-          modifiedTime: verifiedMeta.modifiedTime,
-          sourceAudioHash: newHash,
-        },
+        source: driveSource
+          ? {
+              ...driveSource,
+              fileId: verifiedMeta.pickedFileId,
+              resourceKey: verifiedMeta.resourceKey,
+              targetResourceKey: verifiedMeta.targetResourceKey,
+              modifiedTime: verifiedMeta.modifiedTime,
+              sourceAudioHash: newHash,
+            }
+          : song.source,
       };
 
       if (hashChanged) {
@@ -3035,6 +3407,10 @@ export function BandMixer() {
 
       engine.seekTracks([updatedSong.sourceAudioId, ...updatedSong.stemIds], updatedSong.playheadSec);
       applySongToEngine(updatedSong);
+      sessionRef.current = {
+        ...sessionRef.current,
+        songs: sessionRef.current.songs.map((item) => (item.id === song.id ? updatedSong : item)),
+      };
       setSession((prev) => ({
         ...prev,
         songs: prev.songs.map((item) => (item.id === song.id ? updatedSong : item)),
@@ -3193,7 +3569,12 @@ export function BandMixer() {
       showShortcutHint(msg);
       return;
     }
-    if (song.persistenceStatus === "missing_audio" || song.persistenceStatus === "restoring") {
+    const activeProjForPlay = activeProjectRecordRef.current;
+    const isOnDemandCandidate = Boolean(
+      activeProjForPlay &&
+      (song.availabilityState === "cloud_not_downloaded" || song.availabilityState === "needs_reauth"),
+    );
+    if (!isOnDemandCandidate && (song.persistenceStatus === "missing_audio" || song.persistenceStatus === "restoring")) {
       const msg = song.persistenceStatus === "restoring"
         ? "正在恢復音檔，請稍候再播放。"
         : "此歌曲缺少本機原始音檔，請先重新選取音檔。";
@@ -3212,7 +3593,139 @@ export function BandMixer() {
       return next;
     });
     try {
-      const ready = await ensureSongAudioReady(song);
+      let songForReady = song;
+      if (activeProjForPlay) {
+        const entry = activeProjForPlay.project.songs.find(
+          (item) => item.entryId === (song.projectEntryId ?? song.id),
+        );
+        const needsCloudRestore = Boolean(
+          entry &&
+          (song.availabilityState === "cloud_not_downloaded" ||
+            song.availabilityState === "needs_reauth" ||
+            (song.playbackSource === "stems" &&
+              entry.artifactRef?.manifestFileId &&
+              song.stemIds.length === 0 &&
+              !song.separationUsesChunkPlayback) ||
+            (song.sourceAudioMissing &&
+              (entry.originalBackup?.driveFileId ||
+                (entry.source.provider === "google_drive" && entry.source.fileId)))),
+        );
+        if (entry && needsCloudRestore) {
+          const authSnap = sharedGoogleAccountManager.getSnapshot();
+          const validToken = sharedGoogleAccountManager.getValidAccessToken();
+          const hasCloudRef = Boolean(
+            entry.artifactRef?.manifestFileId ||
+              entry.originalBackup?.driveFileId ||
+              (entry.source.provider === "google_drive" && entry.source.fileId),
+          );
+          if (hasCloudRef && (!authSnap.account || !validToken)) {
+            patchSongMetadataOnly(song.id, {
+              availabilityState: "needs_reauth",
+              persistenceMessage: "需先登入或重新授權 Google 帳號才能按需下載此曲。",
+            });
+            const msg = "此歌曲尚未下載至本機，請先重新授權 Google 帳號後再點擊播放。";
+            setPlaybackErrors((previous) => ({ ...previous, [song.id]: msg }));
+            showShortcutHint(msg);
+            return;
+          }
+          setRestoringOnDemandBySongId((prev) => ({
+            ...prev,
+            [song.id]: "正在檢查本機並按需恢復雲端歌曲…",
+          }));
+          patchSongMetadataOnly(song.id, { availabilityState: "downloading" });
+          try {
+            const cap = await collectDeviceCapabilities();
+            const restored = await restoreSingleProjectSongOnDemand({
+              project: activeProjForPlay.project,
+              entry,
+              accountId: authSnap.account?.accountId ?? null,
+              accessToken: validToken,
+              generation: authSnap.generation,
+              isGenerationValid: (g, a) => sharedGoogleAccountManager.isGenerationValid(g, a),
+              includeOriginalAudio:
+                song.playbackSource === "original" ||
+                Boolean(
+                  entry.originalBackup?.driveFileId ||
+                    (entry.source.provider === "google_drive" && entry.source.fileId),
+                ),
+              capabilities: cap,
+              onProgress: (prog) => {
+                setRestoringOnDemandBySongId((prev) => ({
+                  ...prev,
+                  [song.id]: prog.message,
+                }));
+              },
+            });
+            if (activeProjectIdRef.current !== activeProjForPlay.projectId) {
+              return;
+            }
+            const updatedSong = {
+              ...song,
+              ...restored.song,
+              id: song.id,
+              sourceAudioId: song.sourceAudioId,
+            };
+            sessionRef.current = {
+              ...sessionRef.current,
+              songs: sessionRef.current.songs.map((item) =>
+                item.id === song.id ? updatedSong : item,
+              ),
+            };
+            setSession((prev) => ({
+              ...prev,
+              songs: prev.songs.map((item) => (item.id === song.id ? updatedSong : item)),
+            }));
+            songForReady = updatedSong;
+            if (
+              (restored.importedStemRecord || restored.checkpointTaskId) &&
+              entry.artifactRef
+            ) {
+              const totalSamples =
+                restored.importedStemRecord?.totalSamples ?? entry.artifactRef.totalSamples;
+              const sampleRate =
+                restored.importedStemRecord?.sampleRate ?? entry.artifactRef.sampleRate;
+              const totalChunks =
+                restored.importedStemRecord?.totalChunks ?? updatedSong.separationTotalChunks ?? 1;
+              songForReady = await installChunkedStemSet(
+                updatedSong,
+                {
+                  taskId: restored.importedStemRecord?.importId ?? restored.checkpointTaskId!,
+                  mode: entry.artifactRef.separationMode,
+                  sampleRate,
+                  totalSamples,
+                  totalChunks,
+                  committedBytes:
+                    restored.importedStemRecord?.committedBytes ??
+                    updatedSong.separationCommittedBytes ??
+                    0,
+                  durationSeconds: totalSamples / sampleRate,
+                },
+                updatedSong.cacheKey ?? "",
+                restored.reusedLocal
+                  ? "已重用相容本機分軌，準備播放。"
+                  : "已完成單曲按需恢復，準備播放。",
+                {
+                  preferredSource: entry.settings.playbackSource,
+                  skipPersist: true,
+                  stemLayout: restored.importedStemRecord?.stemLayout ?? "four_stem",
+                  isImportedStem: Boolean(restored.importedStemRecord),
+                },
+              );
+            }
+            if (restored.originalAudioWarning) {
+              showCardFeedback(song.id, restored.originalAudioWarning);
+            }
+          } finally {
+            setRestoringOnDemandBySongId((prev) => {
+              if (!(song.id in prev)) return prev;
+              const next = { ...prev };
+              delete next[song.id];
+              return next;
+            });
+          }
+        }
+      }
+      const ready = await ensureSongAudioReady(songForReady);
       if (!ready) return;
       if (isFocusLocked()) {
         const msg = "分離專注模式已啟動，取消本次播放。";
@@ -3543,6 +4056,10 @@ export function BandMixer() {
       } else {
         applySongToEngine(result.changedSong);
       }
+      const nextSongs = sessionRef.current.songs.map((candidate) => (
+        candidate.id === result.changedSong!.id ? result.changedSong! : candidate
+      ));
+      sessionRef.current = { ...sessionRef.current, songs: nextSongs };
       setSession((previous) => ({
         ...previous,
         songs: previous.songs.map((candidate) => (
@@ -3570,6 +4087,10 @@ export function BandMixer() {
       } else {
         applySongToEngine(result.changedSong);
       }
+      const nextSongsSolo = sessionRef.current.songs.map((candidate) => (
+        candidate.id === result.changedSong!.id ? result.changedSong! : candidate
+      ));
+      sessionRef.current = { ...sessionRef.current, songs: nextSongsSolo };
       setSession((previous) => ({
         ...previous,
         songs: previous.songs.map((candidate) => (
@@ -3630,6 +4151,10 @@ export function BandMixer() {
       await engine.playTracks(newIds);
       engine.crossfadeTracks(oldIds, newIds);
     }
+    sessionRef.current = {
+      ...sessionRef.current,
+      songs: sessionRef.current.songs.map((candidate) => candidate.id === song.id ? nextSong : candidate),
+    };
     setSession((previous) => ({
       ...previous,
       songs: previous.songs.map((candidate) => candidate.id === song.id ? nextSong : candidate),
@@ -3951,6 +4476,7 @@ export function BandMixer() {
       stemChannels: [],
       playbackSource: "original",
       cacheKey: null,
+      artifactRef: null,
       separationStatus: "not_started",
       separationStage: "idle",
       separationProgress: 0,
@@ -4002,12 +4528,18 @@ export function BandMixer() {
     latestSong.stemIds.forEach((id) => engine.removeTrack(id));
     stemResultsRef.current.delete(latestSong.id);
 
+    sessionRef.current = {
+      ...sessionRef.current,
+      songs: sessionRef.current.songs.map((item) => (item.id === latestSong.id ? clearedSong : item)),
+    };
     setSession((previous) => ({
       ...previous,
       songs: previous.songs.map((item) => (item.id === latestSong.id ? clearedSong : item)),
     }));
     applySongToEngine(clearedSong);
-    if (clearedSong.sourceAudioHash && clearedSong.persistenceStatus !== "missing_audio") {
+    if (activeProjectRecordRef.current) {
+      scheduleActiveProjectSave(nextSongsSnapshot, { immediateLocal: true });
+    } else if (clearedSong.sourceAudioHash && clearedSong.persistenceStatus !== "missing_audio") {
       await saveSongStateRecord(clearedSong, { allowResetSeparation: true }).catch(() => undefined);
     } else {
       persistSongDebounced(latestSong.id, 0);
@@ -4438,6 +4970,8 @@ export function BandMixer() {
     // 將實際執行、Web Lock、Checkpoint/Chunk 提交、持久化與資源清理全數交由全域 Runner + JobManager 接管
     const outcome = await sharedSeparationJobManager.runSongSeparation({
       songId: song.id,
+      projectId: activeProjectIdRef.current,
+      entryId: song.projectEntryId ?? song.id,
       taskId: checkpointTaskId,
       songName: latestReadySong.name,
       mode: effectiveMode,
@@ -4646,19 +5180,24 @@ export function BandMixer() {
       return;
     }
     let shouldPersist = false;
+    const nextSongs = sessionRef.current.songs.map((candidate) => {
+      if (candidate.id !== song.id) return candidate;
+      const next: BandSong = {
+        ...candidate,
+        stemChannels: candidate.stemChannels.map((channel) => (
+          channel.id === stemId ? { ...channel, ...patch } : channel
+        )),
+      };
+      applySongAudioPatch(candidate, next);
+      shouldPersist = Boolean(activeProjectRecordRef.current || next.sourceAudioHash);
+      return next;
+    });
+    sessionRef.current = { ...sessionRef.current, songs: nextSongs };
     setSession((previous) => ({
       ...previous,
       songs: previous.songs.map((candidate) => {
         if (candidate.id !== song.id) return candidate;
-        const next: BandSong = {
-          ...candidate,
-          stemChannels: candidate.stemChannels.map((channel) => (
-            channel.id === stemId ? { ...channel, ...patch } : channel
-          )),
-        };
-        applySongAudioPatch(candidate, next);
-        shouldPersist = Boolean(next.sourceAudioHash);
-        return next;
+        return nextSongs.find((n) => n.id === song.id) ?? candidate;
       }),
     }));
     if (shouldPersist) {
@@ -4887,11 +5426,48 @@ export function BandMixer() {
     const remainingSongs = sessionRef.current.songs.filter((candidate) => candidate.id !== song.id);
     try {
       await restorePromiseRef.current.catch(() => undefined);
-      const result = await removePersistedSong({
-        song,
-        deleteLocalData,
-        inMemoryRemainingSongs: remainingSongs,
-      });
+      let sharedWithOtherSongs = false;
+      if (activeProjectRecordRef.current) {
+        const activeProjId = activeProjectRecordRef.current.projectId;
+        const nextEntrySongs = remainingSongs;
+        scheduleActiveProjectSave(nextEntrySongs, { immediateLocal: true });
+        await autoSyncControllerRef.current?.flushLocalSaves();
+        if (deleteLocalData && song.sourceAudioHash) {
+          const refCheck = await isAudioHashReferencedAcrossWorkspace(song.sourceAudioHash, {
+            excludeProjectId: activeProjId,
+          }).catch(() => ({ referenced: true, referencingProjectIds: [], referencedByLegacySession: true }));
+          const usedInCurrentProject = nextEntrySongs.some((s) => s.sourceAudioHash === song.sourceAudioHash);
+          sharedWithOtherSongs = refCheck.referenced || usedInCurrentProject;
+          if (!sharedWithOtherSongs) {
+            await releaseCheckpointReferenceAndMaybeGc({
+              taskId: song.separationTaskId ?? null,
+              sourceAudioHash: song.sourceAudioHash,
+              songId: song.id,
+              cacheKeyToRelease: song.cacheKey ?? null,
+              knownInMemorySongs: nextEntrySongs,
+              knownRemovedSongIds: removedSongIdsRef.current,
+              source: "BandMixer.removeProjectSong",
+            }).catch(() => undefined);
+            if (song.importedStemOrigin?.importId) {
+              await releaseImportedStemReferenceAndMaybeGc({
+                importId: song.importedStemOrigin.importId,
+                songId: song.id,
+                knownInMemorySongs: nextEntrySongs,
+              }).catch(() => undefined);
+            }
+            if (song.cacheKey) {
+              await deleteCachedStemSet(song.cacheKey).catch(() => undefined);
+            }
+          }
+        }
+      } else {
+        const result = await removePersistedSong({
+          song,
+          deleteLocalData,
+          inMemoryRemainingSongs: remainingSongs,
+        });
+        sharedWithOtherSongs = result.sharedWithOtherSongs;
+      }
 
       removedSongIdsRef.current.add(song.id);
       unregisterTransientSongAudio(song.id);
@@ -4915,11 +5491,12 @@ export function BandMixer() {
       sourceFilesRef.current.delete(song.id);
       stemResultsRef.current.delete(song.id);
       savedSettingsRef.current.delete(song.id);
+      sessionRef.current = { ...sessionRef.current, songs: remainingSongs };
       setSession((previous) => ({ ...previous, songs: previous.songs.filter((candidate) => candidate.id !== song.id) }));
       setSelection((previous) => sanitizeMixerSelection(previous, remainingSongs));
 
-      if (deleteLocalData && result.sharedWithOtherSongs) {
-        showShortcutHint(`已移除「${song.name}」；另有其他歌曲共用此音檔，已保留共用資料。`);
+      if (deleteLocalData && sharedWithOtherSongs) {
+        showShortcutHint(`已移除「${song.name}」；另有其他歌曲或專案共用此音檔，已保留共用資料。`);
       } else if (deleteLocalData) {
         showShortcutHint(`已移除「${song.name}」並刪除未共用的本機音檔與分離快取。`);
       } else {
@@ -5105,7 +5682,64 @@ export function BandMixer() {
             format: selectionInput.format,
             exportedAt: Date.now(),
           };
-          updateSong(targetSong.id, { driveExport: nextDriveExport }, { persistDelayMs: 50 });
+          const artifactChecksums: Record<string, string> = {};
+          for (const [role, desc] of Object.entries(result.manifest.artifacts)) {
+            if (desc?.checksum) artifactChecksums[role] = desc.checksum;
+          }
+          const nextArtifactRef = {
+            manifestFileId: result.manifestFileId,
+            revisionId: result.revisionId,
+            sourceAudioHash: result.manifest.source.sourceAudioHash || targetSong.sourceAudioHash || "",
+            separationMode: result.manifest.separation.mode,
+            modelVersion: result.manifest.separation.modelVersion,
+            processingVersion: result.manifest.separation.processingVersion,
+            sampleRate: result.manifest.separation.sampleRate,
+            channelCount: 2 as const,
+            totalSamples: result.manifest.separation.totalSamples,
+            pcmFormat: result.manifest.separation.format,
+            artifactChecksums: Object.keys(artifactChecksums).length > 0 ? artifactChecksums : undefined,
+            derivedFrom: result.manifest.separation.derivedFrom ?? null,
+            localTaskId: targetSong.separationTaskId ?? null,
+            localSourceType: targetSong.importedStemOrigin
+              ? ("imported_stem" as const)
+              : targetSong.separationTaskId
+                ? ("demucs_checkpoint" as const)
+                : null,
+          };
+          const nextBackupStatus = computeEntryBackupStatus(
+            {
+              source: targetSong.source ?? { provider: "local" },
+              originalBackup: targetSong.originalBackup ?? null,
+              artifactRef: nextArtifactRef,
+              settings: {
+                displayName: targetSong.name,
+                fileName: targetSong.fileName,
+                originalBpm: targetSong.originalBpm,
+                targetBpm: targetSong.targetBpm,
+                tempoMode: targetSong.tempoMode,
+                manualRate: targetSong.manualRate,
+                fineRateOffset: targetSong.fineRateOffset,
+                savedRates: targetSong.savedRates,
+                keyShiftSemitones: targetSong.keyShiftSemitones,
+                masterVolume: targetSong.masterVolume,
+                muted: Boolean(targetSong.muted),
+                loop: targetSong.loop,
+                playbackSource: targetSong.playbackSource,
+                separationMode: targetSong.separationMode,
+                stemChannels: [],
+              },
+            },
+            snap.account.accountId,
+          );
+          updateSong(
+            targetSong.id,
+            {
+              driveExport: nextDriveExport,
+              artifactRef: nextArtifactRef,
+              ...(activeProjectRecordRef.current ? { backupStatus: nextBackupStatus } : {}),
+            },
+            { persistDelayMs: 50 },
+          );
         }
         showCardFeedback(targetSong.id, "已將分軌與設定成功儲存至 Google Drive。");
         setDriveExportModalSongId(null);
@@ -5231,7 +5865,51 @@ export function BandMixer() {
         onProgress: (p) => setDriveRestoreProgress(p),
       });
 
-      const song = restored.song;
+      const song = activeProjectRecordRef.current
+        ? {
+            ...restored.song,
+            projectEntryId: restored.song.id,
+            availabilityState: "stems_loaded" as const,
+            backupStatus: computeEntryBackupStatus(
+              {
+                source: restored.song.source ?? { provider: "local" },
+                originalBackup: restored.song.originalBackup ?? null,
+                artifactRef: restored.song.importedStemOrigin
+                  ? {
+                      manifestFileId: restored.song.importedStemOrigin.manifestFileId,
+                      revisionId: restored.song.importedStemOrigin.revisionId,
+                      sourceAudioHash: restored.song.sourceAudioHash ?? "",
+                      separationMode: restored.song.separationMode ?? "four_stem",
+                      modelVersion: DEMUCS_MODEL_VERSION,
+                      processingVersion: SEPARATION_PROCESSING_VERSION,
+                      sampleRate: restored.importedStemRecord?.sampleRate ?? 44100,
+                      channelCount: 2 as const,
+                      totalSamples: restored.importedStemRecord?.totalSamples ?? Math.round(restored.song.durationSec * 44100),
+                      pcmFormat: restored.song.importedStemOrigin.pcmFormat,
+                    }
+                  : null,
+                settings: {
+                  displayName: restored.song.name,
+                  fileName: restored.song.fileName,
+                  originalBpm: restored.song.originalBpm,
+                  targetBpm: restored.song.targetBpm,
+                  tempoMode: restored.song.tempoMode,
+                  manualRate: restored.song.manualRate,
+                  fineRateOffset: restored.song.fineRateOffset,
+                  savedRates: restored.song.savedRates,
+                  keyShiftSemitones: restored.song.keyShiftSemitones,
+                  masterVolume: restored.song.masterVolume,
+                  muted: Boolean(restored.song.muted),
+                  loop: restored.song.loop,
+                  playbackSource: restored.song.playbackSource,
+                  separationMode: restored.song.separationMode,
+                  stemChannels: [],
+                },
+              },
+              snap.account.accountId,
+            ),
+          }
+        : restored.song;
       if (restored.restoredOriginalAudio) {
         const audioRec = await getPersistedAudioBlobByKey(song.sourceAudioHash!).catch(() => null);
         if (audioRec?.blob) {
@@ -5244,10 +5922,14 @@ export function BandMixer() {
         }
       }
 
+      sessionRef.current = { ...sessionRef.current, songs: [...sessionRef.current.songs, song] };
       setSession((prev) => ({
         ...prev,
         songs: [...prev.songs, song],
       }));
+      if (activeProjectRecordRef.current) {
+        scheduleActiveProjectSave(sessionRef.current.songs, { immediateLocal: true });
+      }
       setSelection((prev) => (prev.songId ? prev : { songId: song.id, stemId: null }));
 
       if (song.separationTaskId && song.separationTotalChunks) {
@@ -5313,6 +5995,21 @@ export function BandMixer() {
         const token = sharedGoogleAccountManager.getValidAccessToken();
         if (!token || !snap.account) {
           return { status: "error", message: "Google 授權已過期，請重新登入後再試。" };
+        }
+        const refCheck = await checkCloudArtifactReferencesAcrossProjects({
+          manifestFileId: entry.manifestFileId,
+          revisionId: entry.manifest.revisionId,
+          sourceAudioHash: entry.manifest.source.sourceAudioHash,
+          accountId: snap.account.accountId,
+          accessToken: token,
+        });
+        if (!refCheck.safeToDelete) {
+          return {
+            status: "blocked",
+            reason:
+              refCheck.reason ||
+              `仍有雲端專案（${refCheck.referencingProjectNames.join("、")}）引用此分軌成果，為防止破壞其他專案已保護拒絕刪除。`,
+          };
         }
         await deleteDriveRevisionArtifacts({
           entry,
@@ -5531,10 +6228,15 @@ export function BandMixer() {
   const moveSong = (fromId: string, toId: string) => {
     if (fromId === toId) return;
     const nextSongs = reorderSongList(sessionRef.current.songs, fromId, toId);
+    sessionRef.current = { ...sessionRef.current, songs: nextSongs };
     setSession((previous) => ({
       ...previous,
       songs: reorderSongList(previous.songs, fromId, toId),
     }));
+    if (activeProjectRecordRef.current) {
+      scheduleActiveProjectSave(nextSongs, { immediateLocal: true });
+      return;
+    }
     void restorePromiseRef.current
       .catch(() => undefined)
       .then(() => savePersistedSongOrder(nextSongs.map((item) => item.id)));
@@ -5641,6 +6343,610 @@ export function BandMixer() {
     };
   }, []);
 
+  const clearWorkspaceForProjectSwitch = useCallback(async () => {
+    await Promise.all([
+      flushPendingSongPersists().catch(() => undefined),
+      autoSyncControllerRef.current?.flushLocalSaves().catch(() => undefined),
+    ]);
+    const engine = getEngine();
+    for (const s of sessionRef.current.songs) {
+      const ids = [s.sourceAudioId, ...s.stemIds];
+      engine.stopTracks(ids);
+      ids.forEach((id) => engine.removeTrack(id));
+    }
+    sourceFilesRef.current.clear();
+    stemResultsRef.current.clear();
+    persistedMetaBySongIdRef.current.clear();
+    savedSettingsRef.current.clear();
+    separationTokensRef.current.clear();
+    hydratedCompletedJobsRef.current.clear();
+    setPlaybackErrors({});
+    setCardFeedbacks({});
+    setRestoringOnDemandBySongId({});
+    setSelection(EMPTY_MIXER_SELECTION);
+  }, [getEngine]);
+
+  const applyProjectWorkspaceState = useCallback((record: PersistedProjectRecord, songs: BandSong[]) => {
+    activeProjectRecordRef.current = record;
+    activeProjectIdRef.current = record.projectId;
+    setActiveProjectRecord(record);
+    sessionRef.current = { ...sessionRef.current, songs };
+    setSession((prev) => ({ ...prev, songs }));
+    setSelection(songs.length > 0 ? { songId: songs[0].id, stemId: null } : EMPTY_MIXER_SELECTION);
+  }, []);
+
+  const refreshProjectListEntries = useCallback(async () => {
+    const auth = getProjectAuthContext();
+    setProjectListLoading(true);
+    setProjectListError(null);
+    try {
+      const res = await listAllProjectsForUi({
+        currentAccountId: auth.accountId,
+        accessToken: auth.accessToken,
+        includeCloud: Boolean(auth.accountId && auth.accessToken),
+      });
+      if (!mountedRef.current) return;
+      cloudProjectsMapRef.current = res.cloudProjectsMap;
+      setProjectListEntries(res.projects);
+      setProjectListError(res.cloudError ?? null);
+    } catch (err) {
+      if (mountedRef.current) {
+        setProjectListError(err instanceof Error ? err.message : "無法載入專案清單。");
+      }
+    } finally {
+      if (mountedRef.current) {
+        setProjectListLoading(false);
+      }
+    }
+  }, [getProjectAuthContext]);
+
+  const openProjectModal = (
+    mode: Exclude<ProjectDialogMode, null>,
+    renameTarget?: { projectId: string; name: string } | null,
+  ) => {
+    setProjectDialogError(null);
+    setProjectRenameTarget(renameTarget ?? null);
+    setProjectDialogMode(mode);
+    if (mode === "list") {
+      void refreshProjectListEntries();
+    }
+  };
+
+  const handleOpenProjectEntry = async (entry: ProjectListEntrySummary) => {
+    const gen = ++projectOpGenerationRef.current;
+    setProjectDialogError(null);
+    setProjectBusyState({ action: "open", message: `正在載入專案「${entry.name}」Metadata…` });
+    try {
+      await clearWorkspaceForProjectSwitch();
+      if (gen !== projectOpGenerationRef.current || !mountedRef.current) return;
+      const auth = getProjectAuthContext();
+      const cloudHint = cloudProjectsMapRef.current.get(entry.projectId);
+      const res = await openProjectMetadataAndEntries({
+        projectId: entry.projectId,
+        cloudEntryHint: cloudHint,
+        auth,
+        setActive: true,
+      });
+      if (gen !== projectOpGenerationRef.current || !mountedRef.current) return;
+      applyProjectWorkspaceState(res.record, res.songs);
+      setProjectDialogMode(null);
+      if (res.remoteAheadAvailable) {
+        showShortcutHint("雲端有更新版本，請於衝突選單確認處理方式。");
+      } else {
+        showShortcutHint(`已開啟專案「${res.record.project.name}」（僅載入 Metadata，點擊播放再按需下載/解碼）。`);
+      }
+      void refreshCacheStats();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "開啟專案失敗。";
+      setProjectDialogError(msg);
+      showShortcutHint(msg);
+    } finally {
+      if (gen === projectOpGenerationRef.current && mountedRef.current) {
+        setProjectBusyState(null);
+      }
+    }
+  };
+
+  const handleCreateProjectSubmit = async (params: {
+    name: string;
+    description?: string;
+    storageProvider: ProjectStorageProvider;
+  }) => {
+    const gen = ++projectOpGenerationRef.current;
+    setProjectDialogError(null);
+    setProjectBusyState({
+      action: "create",
+      message: params.storageProvider === "google_drive"
+        ? `正在建立 Google Drive 專案「${params.name}」…`
+        : `正在建立本機專案「${params.name}」…`,
+    });
+    try {
+      await clearWorkspaceForProjectSwitch();
+      const auth = getProjectAuthContext();
+      const { record, syncOutcome } = await createNewProject({
+        name: params.name,
+        description: params.description,
+        storageProvider: params.storageProvider,
+        auth,
+        setActive: true,
+        syncImmediatelyIfDrive: params.storageProvider === "google_drive",
+      });
+      if (gen !== projectOpGenerationRef.current || !mountedRef.current) return;
+      applyProjectWorkspaceState(record, []);
+      setProjectDialogMode(null);
+      if (syncOutcome && syncOutcome.status !== "synced") {
+        showShortcutHint(`已建立本機草稿；雲端同步狀態：${syncOutcome.status === "waiting_auth" ? "等待重新授權" : "待同步"}`);
+      } else {
+        showShortcutHint(`已建立新專案「${record.project.name}」。`);
+      }
+      void refreshProjectListEntries();
+    } catch (err) {
+      setProjectDialogError(err instanceof Error ? err.message : "建立專案失敗。");
+    } finally {
+      if (gen === projectOpGenerationRef.current && mountedRef.current) {
+        setProjectBusyState(null);
+      }
+    }
+  };
+
+  const handleSaveAsProjectSubmit = async (params: {
+    name: string;
+    description?: string;
+    storageProvider: ProjectStorageProvider;
+  }) => {
+    const gen = ++projectOpGenerationRef.current;
+    setProjectDialogError(null);
+    setProjectBusyState({
+      action: "save_as",
+      message: `正在另存為新專案「${params.name}」…`,
+    });
+    try {
+      const currentProj = activeProjectRecordRef.current?.project;
+      const sourceProj =
+        currentProj ??
+        buildProjectFromBandSongs({
+          existingProject: {
+            schemaVersion: 1,
+            application: "loop-harmonizer",
+            projectId: "legacy-snapshot",
+            name: "目前工作空間",
+            storageProvider: "local",
+            revision: 1,
+            revisionToken: "r1-legacy",
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            masterSettings: {},
+            songs: [],
+          },
+          songs: sessionRef.current.songs,
+          incrementRevision: false,
+        });
+
+      const auth = getProjectAuthContext();
+      const { record } = await saveProjectAs({
+        sourceProject: sourceProj,
+        currentSongs: sessionRef.current.songs,
+        name: params.name,
+        description: params.description,
+        storageProvider: params.storageProvider,
+        auth,
+        setActive: true,
+      });
+      await clearWorkspaceForProjectSwitch();
+      const opened = await openProjectMetadataAndEntries({
+        projectId: record.projectId,
+        auth,
+        setActive: true,
+      });
+      if (gen !== projectOpGenerationRef.current || !mountedRef.current) return;
+      applyProjectWorkspaceState(opened.record, opened.songs);
+      setProjectDialogMode(null);
+      showShortcutHint(`已另存新專案「${opened.record.project.name}」（未重複複製 WAV 與分軌快取）。`);
+      void refreshProjectListEntries();
+    } catch (err) {
+      setProjectDialogError(err instanceof Error ? err.message : "另存新專案失敗。");
+    } finally {
+      if (gen === projectOpGenerationRef.current && mountedRef.current) {
+        setProjectBusyState(null);
+      }
+    }
+  };
+
+  const handleRenameProjectSubmit = async (params: { projectId: string; name: string }) => {
+    const gen = ++projectOpGenerationRef.current;
+    setProjectDialogError(null);
+    setProjectBusyState({ action: "rename", message: "正在重新命名專案…" });
+    try {
+      const auth = getProjectAuthContext();
+      const { record } = await renameProject({
+        projectId: params.projectId,
+        newName: params.name,
+        auth,
+      });
+      if (gen !== projectOpGenerationRef.current || !mountedRef.current) return;
+      if (activeProjectIdRef.current === record.projectId) {
+        activeProjectRecordRef.current = record;
+        setActiveProjectRecord(record);
+      }
+      setProjectDialogMode(null);
+      showShortcutHint(`已將專案重新命名為「${record.project.name}」。`);
+      void refreshProjectListEntries();
+    } catch (err) {
+      setProjectDialogError(err instanceof Error ? err.message : "重新命名失敗。");
+    } finally {
+      if (gen === projectOpGenerationRef.current && mountedRef.current) {
+        setProjectBusyState(null);
+      }
+    }
+  };
+
+  const handleManualSaveProject = async () => {
+    const active = activeProjectRecordRef.current;
+    if (!active) {
+      if (hasLegacyWorkspaceSongs) {
+        await handleMigrateLegacyWorkspace();
+      }
+      return;
+    }
+    const gen = ++projectOpGenerationRef.current;
+    setProjectBusyState({
+      action: "save",
+      message: active.storageProvider === "google_drive" ? "正在儲存並同步至 Google Drive…" : "正在儲存本機專案…",
+    });
+    try {
+      const updated = await saveLocalProjectSnapshot({
+        projectId: active.projectId,
+        songs: sessionRef.current.songs,
+        incrementRevision: true,
+      });
+      if (!updated || gen !== projectOpGenerationRef.current || !mountedRef.current) return;
+      activeProjectRecordRef.current = updated;
+      setActiveProjectRecord(updated);
+      if (updated.storageProvider === "google_drive") {
+        const outcome: ProjectDriveSyncOutcome | null =
+          (await autoSyncControllerRef.current?.triggerDriveSync(updated.projectId)) ?? null;
+        if (outcome?.status === "synced") {
+          activeProjectRecordRef.current = outcome.record;
+          setActiveProjectRecord(outcome.record);
+          showShortcutHint(`已同步「${outcome.record.project.name}」（v${outcome.record.localRevision}）至 Google Drive。`);
+        } else if (outcome?.status === "conflict") {
+          showShortcutHint("偵測到跨裝置版本衝突，請選擇衝突處理方式。");
+          openProjectModal("conflict");
+        } else if (outcome?.status === "waiting_auth") {
+          showShortcutHint("已安全儲存於本機，等待重新授權 Google 後同步。");
+        }
+      } else {
+        showShortcutHint(`已保存本機專案「${updated.project.name}」（v${updated.localRevision}）。`);
+      }
+    } finally {
+      if (gen === projectOpGenerationRef.current && mountedRef.current) {
+        setProjectBusyState(null);
+      }
+    }
+  };
+
+  const handlePromoteToDrive = async (params: { backupLocalOriginals: boolean }) => {
+    const active = activeProjectRecordRef.current;
+    if (!active) return;
+    const auth = getProjectAuthContext();
+    if (!auth.accountId || !auth.accessToken) {
+      setProjectDialogError("將專案儲存到 Google Drive 需要先登入 Google 帳號。");
+      return;
+    }
+    const gen = ++projectOpGenerationRef.current;
+    const controller = new AbortController();
+    promoteAbortRef.current = controller;
+    setProjectDialogError(null);
+    setPromoteBackupFailures([]);
+    setProjectBusyState({ action: "promote", message: "正在準備儲存專案至 Google Drive…" });
+    try {
+      const res = await promoteLocalProjectToDrive({
+        projectId: active.projectId,
+        currentSongs: sessionRef.current.songs,
+        auth,
+        backupLocalOriginals: params.backupLocalOriginals,
+        inMemoryFilesBySongId: sourceFilesRef.current,
+        signal: controller.signal,
+        onProgress: (p) => {
+          setPromoteProgress(p);
+          setProjectBusyState({ action: "promote", message: p.message });
+        },
+      });
+      if (gen !== projectOpGenerationRef.current || !mountedRef.current) return;
+      const mappedSongs = await projectToBandSongsMetadataOnly(res.record.project, {
+        currentAccountId: auth.accountId,
+        hasValidGoogleToken: Boolean(auth.accountId && auth.accessToken),
+      });
+      const mergedSongs = sessionRef.current.songs.map((cur) => {
+        const m = mappedSongs.find((x) => x.id === cur.id);
+        return m ? { ...cur, backupStatus: m.backupStatus, originalBackup: m.originalBackup, artifactRef: m.artifactRef } : cur;
+      });
+      applyProjectWorkspaceState(res.record, mergedSongs);
+      setPromoteBackupFailures(res.originalBackupFailures);
+      if (res.originalBackupFailures.length === 0) {
+        setProjectDialogMode(null);
+        showShortcutHint(`已將專案「${res.record.project.name}」儲存至 Google Drive。`);
+      }
+      void refreshProjectListEntries();
+    } catch (err) {
+      setProjectDialogError(err instanceof Error ? err.message : "儲存至 Google Drive 失敗。");
+    } finally {
+      promoteAbortRef.current = null;
+      setPromoteProgress(null);
+      if (gen === projectOpGenerationRef.current && mountedRef.current) {
+        setProjectBusyState(null);
+      }
+    }
+  };
+
+  const handleOpenOfflineDialog = async () => {
+    const active = activeProjectRecordRef.current;
+    if (!active) return;
+    setOfflineDownloadResult(null);
+    setOfflineDownloadProgress(null);
+    setOfflineAssessment(null);
+    openProjectModal("offline");
+    const auth = getProjectAuthContext();
+    if (!auth.accountId || !auth.accessToken) {
+      setProjectDialogError("下載專案供離線使用需要先登入 Google 帳號。");
+      return;
+    }
+    setOfflineAssessmentLoading(true);
+    try {
+      const cap = await collectDeviceCapabilities();
+      const assessment = await assessProjectOfflineDownload({
+        project: active.project,
+        accountId: auth.accountId,
+        accessToken: auth.accessToken,
+        capabilities: cap,
+      });
+      if (mountedRef.current) {
+        setOfflineAssessment(assessment);
+      }
+    } catch (err) {
+      if (mountedRef.current) {
+        setProjectDialogError(err instanceof Error ? err.message : "無法評估離線下載容量。");
+      }
+    } finally {
+      if (mountedRef.current) {
+        setOfflineAssessmentLoading(false);
+      }
+    }
+  };
+
+  const handleStartOfflineDownload = async () => {
+    const active = activeProjectRecordRef.current;
+    if (!active) return;
+    const auth = getProjectAuthContext();
+    if (!auth.accountId || !auth.accessToken) {
+      setProjectDialogError("缺少有效的 Google 帳號授權。");
+      return;
+    }
+    const controller = new AbortController();
+    offlineDownloadAbortRef.current = controller;
+    setProjectDialogError(null);
+    setOfflineDownloadResult(null);
+    try {
+      const cap = await collectDeviceCapabilities();
+      const result = await downloadEntireProjectOffline({
+        project: active.project,
+        accountId: auth.accountId,
+        accessToken: auth.accessToken,
+        generation: auth.generation,
+        isGenerationValid: auth.isGenerationValid,
+        includeOriginalAudio: true,
+        capabilities: cap,
+        signal: controller.signal,
+        onProgress: (p) => setOfflineDownloadProgress(p),
+      });
+      if (!mountedRef.current) return;
+      setOfflineDownloadResult(result);
+      if (activeProjectIdRef.current === active.projectId) {
+        const refreshedSongs = await projectToBandSongsMetadataOnly(active.project, {
+          currentAccountId: auth.accountId,
+          hasValidGoogleToken: true,
+        });
+        const merged = sessionRef.current.songs.map((cur) => {
+          const fresh = refreshedSongs.find((x) => x.id === cur.id);
+          return fresh
+            ? {
+                ...cur,
+                availabilityState: fresh.availabilityState,
+                sourceAudioMissing: fresh.sourceAudioMissing,
+                importedStemOrigin: fresh.importedStemOrigin,
+                separationTaskId: fresh.separationTaskId,
+                separationCompletedChunks: fresh.separationCompletedChunks,
+                separationTotalChunks: fresh.separationTotalChunks,
+                separationCommittedBytes: fresh.separationCommittedBytes,
+              }
+            : cur;
+        });
+        sessionRef.current = { ...sessionRef.current, songs: merged };
+        setSession((prev) => ({ ...prev, songs: merged }));
+      }
+      void refreshCacheStats();
+    } catch (err) {
+      setProjectDialogError(err instanceof Error ? err.message : "離線下載失敗。");
+    } finally {
+      offlineDownloadAbortRef.current = null;
+      setOfflineDownloadProgress(null);
+    }
+  };
+
+  const executeConflictResolution = async (params: {
+    strategy: "load_remote" | "save_local_as_new" | "overwrite_remote";
+    newProjectNameForSaveAs?: string;
+  }) => {
+    const active = activeProjectRecordRef.current;
+    if (!active) return;
+    const gen = ++projectOpGenerationRef.current;
+    setProjectDialogError(null);
+    setProjectBusyState({ action: "conflict", message: "正在套用版本衝突處理…" });
+    try {
+      const auth = getProjectAuthContext();
+      const res = await resolveProjectConflict({
+        projectId: active.projectId,
+        strategy: params.strategy,
+        newProjectNameForSaveAs: params.newProjectNameForSaveAs,
+        auth,
+      });
+      if (gen !== projectOpGenerationRef.current || !mountedRef.current) return;
+      await clearWorkspaceForProjectSwitch();
+      const nextSongs = await projectToBandSongsMetadataOnly(res.activeRecord.project, {
+        currentAccountId: auth.accountId,
+        hasValidGoogleToken: Boolean(auth.accountId && auth.accessToken),
+      });
+      await setActiveProjectId(res.activeRecord.projectId);
+      applyProjectWorkspaceState(res.activeRecord, nextSongs);
+      setProjectDialogMode(null);
+      showShortcutHint(`已完成版本衝突處理，目前專案為「${res.activeRecord.project.name}」。`);
+      void refreshProjectListEntries();
+    } catch (err) {
+      setProjectDialogError(err instanceof Error ? err.message : "處理版本衝突失敗。");
+    } finally {
+      if (gen === projectOpGenerationRef.current && mountedRef.current) {
+        setProjectBusyState(null);
+      }
+    }
+  };
+
+  const handleResolveProjectConflict = (params: {
+    strategy: "load_remote" | "save_local_as_new" | "overwrite_remote";
+    newProjectNameForSaveAs?: string;
+  }) => {
+    if (params.strategy === "overwrite_remote") {
+      const active = activeProjectRecordRef.current;
+      openDeleteConfirmDialog({
+        title: "明確確認以本機版本取代雲端專案",
+        subtitle: active?.project.name,
+        deleteItems: [
+          "將 Google Drive 上現行 project.json 指向此裝置的本機版本（舊遠端版本仍會保留歷史 Revision 快照與衝突備份）",
+        ],
+        preserveItems: [
+          "revisions/ 目錄下的不可變歷史與衝突快照",
+          "所有 songs/ 原始音檔與分軌 WAV 成果",
+        ],
+        recoverability: "可從 .loopHarmonizer/projects/project_<id>/revisions/ 檢視先前遠端快照。",
+        confirmLabel: "確認覆寫雲端專案",
+        danger: true,
+        onExecute: async () => {
+          await executeConflictResolution({ strategy: "overwrite_remote" });
+          return { status: "success" };
+        },
+      });
+      return;
+    }
+    void executeConflictResolution(params);
+  };
+
+  const handleMigrateLegacyWorkspace = async () => {
+    const gen = ++projectOpGenerationRef.current;
+    setProjectBusyState({ action: "migrate", message: "正在將目前工作空間另存為本機專案…" });
+    try {
+      const res = await migrateLegacyBandSessionToProject({
+        songsOverride: activeProjectRecordRef.current ? undefined : sessionRef.current.songs,
+        setActive: true,
+      });
+      if (gen !== projectOpGenerationRef.current || !mountedRef.current) return;
+      const auth = getProjectAuthContext();
+      const nextSongs = await projectToBandSongsMetadataOnly(res.record.project, {
+        currentAccountId: auth.accountId,
+        hasValidGoogleToken: Boolean(auth.accountId && auth.accessToken),
+      });
+      await clearWorkspaceForProjectSwitch();
+      applyProjectWorkspaceState(res.record, nextSongs);
+      setProjectDialogMode(null);
+      showShortcutHint(
+        res.created
+          ? `已將目前工作空間另存為本機專案「${res.record.project.name}」（原始工作階段完整保留且未上傳至雲端）。`
+          : `先前已建立對應專案「${res.record.project.name}」，已直接切換開啟。`,
+      );
+      void refreshProjectListEntries();
+    } catch (err) {
+      showShortcutHint(err instanceof Error ? err.message : "工作空間遷移失敗。");
+    } finally {
+      if (gen === projectOpGenerationRef.current && mountedRef.current) {
+        setProjectBusyState(null);
+      }
+    }
+  };
+
+  const requestDeleteProject = (target?: {
+    projectId: string;
+    name: string;
+    storageProvider: ProjectStorageProvider;
+  }) => {
+    const resolvedTarget = target ?? (
+      activeProjectRecordRef.current
+        ? {
+            projectId: activeProjectRecordRef.current.projectId,
+            name: activeProjectRecordRef.current.project.name,
+            storageProvider: activeProjectRecordRef.current.storageProvider,
+          }
+        : null
+    );
+    if (!resolvedTarget) return;
+
+    const isCloud = resolvedTarget.storageProvider === "google_drive";
+    openDeleteConfirmDialog(
+      {
+        title: "刪除專案",
+        subtitle: resolvedTarget.name,
+        deleteItems: [
+          "將移除此專案及其混音設定，歌曲原始音檔及共用分軌成果仍會保留。",
+          "此專案的本機 IndexedDB Metadata、排序與專案同步佇列",
+          ...(isCloud ? ["若勾選下方選項：將同時將 Google Drive 上此專案的專案資料夾移至垃圾桶（不刪除 songs/ 分軌與原曲）"] : []),
+        ],
+        preserveItems: [
+          "所有歌曲原始音檔（本機 audioFiles 與 Drive Picker 原曲）",
+          "所有共用 Demucs Checkpoint、Imported Stem 與 Google Drive .loopHarmonizer/songs/ 成果庫",
+          "其他專案以及舊版預設 Band Mixer 工作階段",
+        ],
+        recoverability: isCloud
+          ? "僅刪除本機不會影響雲端複本；若同時刪除雲端專案，需至 Google Drive 垃圾桶復原。"
+          : "本機專案結構移除後不可恢復，但歌曲原曲與分軌成果完整保留，隨時可於新專案重新加入。",
+        checkboxLabel: isCloud ? "同時刪除 Google Drive 上的雲端專案資料夾" : undefined,
+        checkboxDescription: isCloud
+          ? "只刪除目前帳號對此 Project ID 管理的專案資料夾；絕不刪除共用歌曲成果庫與他人共享原曲。"
+          : undefined,
+        confirmLabel: "確認刪除專案",
+        danger: true,
+        onExecute: async (alsoDeleteCloud) => {
+          const auth = getProjectAuthContext();
+          const scope = isCloud && alsoDeleteCloud ? "cloud_and_local" : "local_only";
+          await deleteProjectSafely({
+            projectId: resolvedTarget.projectId,
+            scope,
+            auth,
+            autoSyncController: autoSyncControllerRef.current ?? undefined,
+          });
+          if (activeProjectIdRef.current === resolvedTarget.projectId) {
+            await clearWorkspaceForProjectSwitch();
+            activeProjectRecordRef.current = null;
+            activeProjectIdRef.current = null;
+            setActiveProjectRecord(null);
+            setSession((prev) => ({ ...prev, songs: [] }));
+            setRestoreAttempt((n) => n + 1);
+          }
+          void refreshProjectListEntries();
+          showShortcutHint(`已刪除專案「${resolvedTarget.name}」（原始音檔與共用分軌成果已安全保留）。`);
+          return { status: "success" };
+        },
+      },
+      false,
+    );
+  };
+
+  const exitProjectToLegacyWorkspace = async () => {
+    await clearWorkspaceForProjectSwitch();
+    await setActiveProjectId(null);
+    activeProjectRecordRef.current = null;
+    activeProjectIdRef.current = null;
+    setActiveProjectRecord(null);
+    setSession((prev) => ({ ...prev, songs: [] }));
+    setRestoreAttempt((n) => n + 1);
+  };
+
   const selectedSongs = session.songs.filter((song) => song.selected);
   const hasMultipleSelectedSongs = selectedSongs.length > 1;
   const focusLocked = Boolean(separationFocus?.active) || sharedSeparationJobManager.isGlobalFocusActive();
@@ -5660,6 +6966,48 @@ export function BandMixer() {
 
   return (
     <div className={`grid mixer-shell${hasMultipleSelectedSongs ? " has-selected" : ""}`} style={{ gap: 16 }}>
+      <ProjectToolbar
+        activeProject={activeProjectRecord}
+        songCount={session.songs.length}
+        hasLegacySongs={hasLegacyWorkspaceSongs}
+        isGoogleConfigured={isGoogleDrivePickerConfigured()}
+        projectBusyState={projectBusyState}
+        focusLocked={focusLocked}
+        otherProjectJobs={otherProjectJobs}
+        onNewProject={() => openProjectModal("create")}
+        onOpenProjectList={() => openProjectModal("list")}
+        onSaveProject={() => void handleManualSaveProject()}
+        onSaveAsProject={() => openProjectModal("save_as")}
+        onPromoteToDrive={() => openProjectModal("promote")}
+        onOpenOfflineDownload={() => void handleOpenOfflineDialog()}
+        onMigrateLegacy={() => void handleMigrateLegacyWorkspace()}
+        onRenameProject={() => {
+          const active = activeProjectRecordRef.current;
+          if (active) {
+            openProjectModal("rename", {
+              projectId: active.projectId,
+              name: active.project.name,
+            });
+          }
+        }}
+        onDeleteProject={() => requestDeleteProject()}
+        onOpenConflict={() => openProjectModal("conflict")}
+        onReauthorizeSync={() => {
+          void sharedGoogleAccountManager
+            .reauthorize()
+            .then(() => {
+              const active = activeProjectRecordRef.current;
+              if (active) {
+                void autoSyncControllerRef.current?.triggerDriveSync(active.projectId);
+              }
+            })
+            .catch((err) => {
+              const msg = err instanceof Error ? err.message : "重新授權失敗。";
+              if (!/已取消/.test(msg)) showShortcutHint(msg);
+            });
+        }}
+        onReturnToLegacyWorkspace={activeProjectRecord ? () => void exitProjectToLegacyWorkspace() : undefined}
+      />
       <div className="card row mixer-upload" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
         <button
           type="button"
@@ -6183,6 +7531,8 @@ export function BandMixer() {
                 isDragging={draggingId === song.id}
                 isActive={selection.songId === song.id}
                 isStartingPlayback={startingSongIds.has(song.id)}
+                isRestoringOnDemand={Boolean(restoringOnDemandBySongId[song.id])}
+                onDemandRestoreMessage={restoringOnDemandBySongId[song.id] ?? null}
                 separationFocusLocked={focusLocked}
                 playbackError={playbackErrors[song.id] ?? null}
                 actionFeedback={cardFeedbacks[song.id] ?? null}
@@ -6367,6 +7717,64 @@ export function BandMixer() {
           if (!restoringManifestId) {
             setDriveLibraryOpen(false);
           }
+        }}
+      />
+      <ProjectManagerDialog
+        open={Boolean(projectDialogMode)}
+        mode={projectDialogMode}
+        activeProject={activeProjectRecord}
+        renameTarget={projectRenameTarget}
+        projects={projectListEntries}
+        projectsLoading={projectListLoading}
+        cloudError={projectListError}
+        account={googleAuth.account}
+        isGoogleConfigured={isGoogleDrivePickerConfigured()}
+        hasLegacyWorkspaceSongs={hasLegacyWorkspaceSongs}
+        busyMessage={projectBusyState?.message ?? null}
+        errorMessage={projectDialogError}
+        promoteProgress={promoteProgress}
+        promoteBackupFailures={promoteBackupFailures}
+        offlineAssessment={offlineAssessment}
+        offlineAssessmentLoading={offlineAssessmentLoading}
+        offlineDownloadProgress={offlineDownloadProgress}
+        offlineDownloadResult={offlineDownloadResult}
+        onClose={() => {
+          if (!projectBusyState && !promoteProgress && !offlineDownloadProgress) {
+            setProjectDialogMode(null);
+            setProjectDialogError(null);
+          }
+        }}
+        onChangeMode={(m) => {
+          setProjectDialogError(null);
+          setProjectDialogMode(m);
+        }}
+        onRefreshProjects={() => void refreshProjectListEntries()}
+        onOpenProject={(entry) => void handleOpenProjectEntry(entry)}
+        onCreateProject={(p) => void handleCreateProjectSubmit(p)}
+        onSaveAsProject={(p) => void handleSaveAsProjectSubmit(p)}
+        onRenameProject={(p) => void handleRenameProjectSubmit(p)}
+        onStartRenameFromList={(entry) => {
+          openProjectModal("rename", {
+            projectId: entry.projectId,
+            name: entry.name,
+          });
+        }}
+        onDeleteProjectEntry={(entry) =>
+          requestDeleteProject({
+            projectId: entry.projectId,
+            name: entry.name,
+            storageProvider: entry.storageProvider,
+          })
+        }
+        onPromoteToDrive={(p) => void handlePromoteToDrive(p)}
+        onCancelPromote={() => promoteAbortRef.current?.abort()}
+        onStartOfflineDownload={() => void handleStartOfflineDownload()}
+        onCancelOfflineDownload={() => offlineDownloadAbortRef.current?.abort()}
+        onResolveConflict={(p) => handleResolveProjectConflict(p)}
+        onMigrateLegacyWorkspace={() => void handleMigrateLegacyWorkspace()}
+        onSignInGoogle={async () => {
+          await sharedGoogleAccountManager.signIn();
+          void refreshProjectListEntries();
         }}
       />
     </div>

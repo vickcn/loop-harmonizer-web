@@ -18,7 +18,7 @@ import {
   unpinTaskForDriveTransfer,
 } from "../storage/driveTransferStore.ts";
 import { getImportedStemRecord } from "../storage/importedStemStore.ts";
-import { getCheckpoint } from "../storage/separationCheckpointStore.ts";
+import { getCheckpoint, recordCheckpointExportedRevision } from "../storage/separationCheckpointStore.ts";
 import { DEMUCS_SAMPLE_RATE, DEMUCS_STRIDE_SAMPLES } from "../storage/separationChunkStore.ts";
 import { uploadDriveMultipartJson } from "./driveClient.ts";
 import {
@@ -496,6 +496,17 @@ export async function exportSongArtifactsToDrive(params: {
       message: "正在驗證成果並發布 completed manifest.json…",
     });
 
+    const derivedFrom =
+      mode === "two_stem" && song.artifactRef?.derivedFrom
+        ? song.artifactRef.derivedFrom
+        : mode === "two_stem" && taskId && !song.importedStemOrigin
+          ? {
+              sourceMode: "four_stem" as const,
+              modelVersion,
+              processingVersion,
+            }
+          : null;
+
     const manifest = buildDriveSongManifest({
       songId: song.id,
       songName: song.name,
@@ -515,6 +526,7 @@ export async function exportSongArtifactsToDrive(params: {
       sampleRate,
       totalSamples,
       format: selection.format,
+      derivedFrom,
       artifacts,
       sessionFileId,
     });
@@ -535,6 +547,10 @@ export async function exportSongArtifactsToDrive(params: {
       signal: params.signal,
       fetchImpl: params.fetchImpl,
     });
+
+    if (pinnedTaskId) {
+      await recordCheckpointExportedRevision(pinnedTaskId, revisionId).catch(() => undefined);
+    }
 
     params.onProgress?.({
       stage: "completed",

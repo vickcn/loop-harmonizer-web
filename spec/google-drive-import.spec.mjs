@@ -203,7 +203,7 @@ test("executeSequentialDriveImport downloads strictly concurrency=1 and cancels 
 test("Drive Source persists across IDB round-trip without tokens and modified Drive file yields new sourceAudioHash cache key", async () => {
   configureInMemoryIdbForTests();
   try {
-    assert.equal(INDEXEDDB_VERSION, 5);
+    assert.equal(INDEXEDDB_VERSION, 6);
     const song = createBandSong({
       id: "song_drive_1",
       name: "GraceSong",

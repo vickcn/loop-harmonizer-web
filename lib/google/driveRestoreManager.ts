@@ -14,10 +14,12 @@ import {
   type ImportedStemRecord,
   addImportedStemReference,
   createImportedStemId,
-  findImportedStemByHash,
+  findImportedStemStrict,
   saveImportedStemsAtomically,
   validateImportedStemIntegrity,
 } from "../storage/importedStemStore.ts";
+import { isArtifactRefStrictlyCompatible } from "../projects/projectModel.ts";
+import type { ProjectSongArtifactRef, ProjectSongSettings } from "../projects/projectTypes.ts";
 import { hashSourceAudio } from "../storage/separationCache.ts";
 import {
   addCheckpointReference,
@@ -181,24 +183,63 @@ export async function listDriveLibraryEntries(params: {
       let localSourceType: DriveLibraryEntry["localSourceType"] = null;
 
       if (localCp) {
-        const cpCheck = await validateAndPrepareResume(localCp.taskId, {
-          sourceAudioAvailable: true,
+        const expectedRef: ProjectSongArtifactRef = {
+          manifestFileId: file.id,
+          revisionId: manifest.revisionId,
           sourceAudioHash: manifest.source.sourceAudioHash,
-          totalSamples: localCp.totalSamples,
-          sampleRate: localCp.sampleRate,
-        }).catch(() => null);
-        if (isValidationCompleted(cpCheck)) {
-          localAlreadyAvailable = true;
-          localSourceType = "demucs_checkpoint";
+          separationMode: manifest.separation.mode,
+          modelVersion: manifest.separation.modelVersion,
+          processingVersion: manifest.separation.processingVersion,
+          sampleRate: manifest.separation.sampleRate,
+          channelCount: manifest.separation.channelCount,
+          totalSamples: manifest.separation.totalSamples,
+          derivedFrom: manifest.separation.derivedFrom ?? null,
+        };
+        const compat = isArtifactRefStrictlyCompatible(
+          expectedRef,
+          {
+            sourceAudioHash: localCp.sourceAudioHash,
+            separationMode: localCp.requestedMode,
+            modelVersion: localCp.modelVersion,
+            processingVersion: localCp.processingVersion,
+            sampleRate: localCp.sampleRate,
+            channelCount: 2,
+            totalSamples: localCp.totalSamples,
+            exportedRevisionIds: localCp.exportedRevisionIds,
+          },
+          { requireExactRevision: true },
+        );
+        if (compat.compatible) {
+          const cpCheck = await validateAndPrepareResume(localCp.taskId, {
+            sourceAudioAvailable: true,
+            sourceAudioHash: manifest.source.sourceAudioHash,
+            totalSamples: localCp.totalSamples,
+            sampleRate: localCp.sampleRate,
+          }).catch(() => null);
+          if (isValidationCompleted(cpCheck)) {
+            localAlreadyAvailable = true;
+            localSourceType = "demucs_checkpoint";
+          }
         }
       }
 
       if (!localAlreadyAvailable) {
-        const localImp = await findImportedStemByHash({
+        const checksums: Record<string, string> = {};
+        for (const role of requiredStemRolesForMode(manifest.separation.mode)) {
+          const cs = manifest.artifacts[role]?.checksum;
+          if (cs) checksums[role] = cs;
+        }
+        const localImp = await findImportedStemStrict({
           sourceAudioHash: manifest.source.sourceAudioHash,
           mode: manifest.separation.mode,
           modelVersion: manifest.separation.modelVersion,
           processingVersion: manifest.separation.processingVersion,
+          sampleRate: manifest.separation.sampleRate,
+          channelCount: manifest.separation.channelCount,
+          totalSamples: manifest.separation.totalSamples,
+          expectedRevisionId: manifest.revisionId,
+          expectedChecksums: checksums,
+          expectedDerivedFrom: manifest.separation.derivedFrom ?? null,
         }).catch(() => null);
         if (localImp) {
           const impCheck = await validateImportedStemIntegrity(localImp.importId).catch(() => ({
@@ -361,13 +402,59 @@ function buildRestoredBandSongFromManifest(params: {
   };
 }
 
+/** 依 manifestFileId 讀取並驗證單一 Drive Manifest（絕不掃描全庫，亦不下載 WAV）。 */
+export async function fetchDriveManifestByFileId(params: {
+  manifestFileId: string;
+  expectedAccountId: string;
+  accessToken: string;
+  signal?: AbortSignal;
+  fetchImpl?: typeof fetch;
+}): Promise<DriveLibraryEntry> {
+  const [meta, raw] = await Promise.all([
+    getDriveFileMetadata(params.manifestFileId, {
+      accessToken: params.accessToken,
+      fields: "id,name,parents,trashed,appProperties",
+      fileName: "manifest.json",
+      signal: params.signal,
+      fetchImpl: params.fetchImpl,
+    }).catch(() => null),
+    downloadDriveJson<unknown>({
+      fileId: params.manifestFileId,
+      accessToken: params.accessToken,
+      fileName: "manifest.json",
+      signal: params.signal,
+      fetchImpl: params.fetchImpl,
+    }),
+  ]);
+  if (meta?.trashed) {
+    throw new Error("指定的雲端分軌 Manifest 已被移至垃圾桶。");
+  }
+  const validation = validateDriveSongManifest(raw, {
+    expectedAccountId: params.expectedAccountId,
+  });
+  if (!validation.valid || !validation.manifest) {
+    throw new Error(`雲端成果 Manifest 無效：${validation.reasons.join("；")}`);
+  }
+  const manifest = validation.manifest;
+  return {
+    manifestFileId: params.manifestFileId,
+    revisionFolderId: meta?.parents?.[0],
+    manifest,
+    totalStemBytes: getManifestTotalStemBytes(manifest),
+    localAlreadyAvailable: false,
+    localSourceType: null,
+    sourceLikelyAvailableOnDrive:
+      manifest.source.provider === "google_drive" && Boolean(manifest.source.fileId),
+  };
+}
+
 /**
  * 跨裝置恢復單首雲端歌曲成果：
  * 1. 驗證帳戶、Manifest Schema 與版本相容性；
- * 2. 若本機已有相同完成分軌，零重複下載；
+ * 2. 若本機已有嚴格符合版本與規格的完成分軌，零重複下載；
  * 3. 下載 WAV 後驗證檔案大小、Checksum 與 WAV Header/取樣率/總樣本數；
  * 4. 建立正式 ImportedStemRecord + Chunk（不偽造非法 Demucs Checkpoint）；
- * 5. 恢復混音設定並選擇性恢復原曲。
+ * 5. 恢復混音設定（若提供專案設定則以其為準）並選擇性恢復原曲。
  */
 export async function restoreSongFromDrive(params: {
   entry: DriveLibraryEntry;
@@ -376,6 +463,11 @@ export async function restoreSongFromDrive(params: {
   generation: number;
   isGenerationValid: (generation: number, accountId: string) => boolean;
   includeOriginalAudio?: boolean;
+  originalBackupDriveFileId?: string;
+  expectedRevisionId?: string;
+  strictRevisionMatch?: boolean;
+  projectSettingsOverride?: ProjectSongSettings;
+  skipLegacySessionSongSave?: boolean;
   capabilities?: DeviceCapabilitiesSnapshot | null;
   songIdOverride?: string;
   signal?: AbortSignal;
@@ -400,6 +492,12 @@ export async function restoreSongFromDrive(params: {
   }
   const manifest = manifestValidation.manifest;
 
+  if (params.expectedRevisionId && manifest.revisionId !== params.expectedRevisionId) {
+    throw new Error(
+      `雲端 Manifest 版本不符（專案指定 ${params.expectedRevisionId}，雲端回傳 ${manifest.revisionId}）。`,
+    );
+  }
+
   if (
     !SUPPORTED_IMPORT_MODEL_VERSIONS.has(manifest.separation.modelVersion) ||
     !SUPPORTED_IMPORT_PROCESSING_VERSIONS.has(manifest.separation.processingVersion)
@@ -413,9 +511,32 @@ export async function restoreSongFromDrive(params: {
     params.songIdOverride ??
     `song_drive_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 
-  // 讀取 session.json（混音設定）
+  // 讀取 session.json（混音設定），但若提供專案設定覆蓋則優先以專案為準
   let sessionPayload: DriveSongSessionPayload | null = null;
-  if (manifest.sessionFileId) {
+  if (params.projectSettingsOverride) {
+    const p = params.projectSettingsOverride;
+    sessionPayload = {
+      schemaVersion: 1,
+      application: "loop-harmonizer",
+      songId,
+      name: p.displayName,
+      fileName: p.fileName,
+      originalBpm: p.originalBpm,
+      targetBpm: p.targetBpm,
+      tempoMode: p.tempoMode,
+      manualRate: p.manualRate,
+      fineRateOffset: p.fineRateOffset,
+      savedRates: p.savedRates,
+      keyShiftSemitones: p.keyShiftSemitones,
+      masterVolume: p.masterVolume,
+      muted: p.muted,
+      loop: p.loop,
+      playbackSource: p.playbackSource,
+      separationMode: p.separationMode,
+      stemChannels: p.stemChannels.map((c) => ({ ...c })),
+      updatedAt: new Date().toISOString(),
+    };
+  } else if (manifest.sessionFileId) {
     sessionPayload = await downloadDriveJson<DriveSongSessionPayload>({
       fileId: manifest.sessionFileId,
       accessToken,
@@ -425,11 +546,32 @@ export async function restoreSongFromDrive(params: {
     }).catch(() => null);
   }
 
-  // 先檢查本機是否已存在相同來源且完整的分離成果（有則不重複下載）
+  // 先檢查本機是否已存在嚴格相容且完整的分離成果（嚴格比對 hash/mode/model/processing/sampleRate/channel/totalSamples/revisionId/checksum）
   params.onProgress?.({
     stage: "checking_local",
-    message: "正在比對本機是否已存有相同分軌成果…",
+    message: "正在比對本機是否已存有完全相容之分軌成果…",
   });
+
+  const requireExactRevision = params.strictRevisionMatch ?? Boolean(params.expectedRevisionId);
+  const expectedChecksums: Record<string, string> = {};
+  for (const role of requiredStemRolesForMode(manifest.separation.mode)) {
+    const cs = manifest.artifacts[role]?.checksum;
+    if (cs) expectedChecksums[role] = cs;
+  }
+  const expectedArtifactRef: ProjectSongArtifactRef = {
+    manifestFileId: entry.manifestFileId,
+    revisionId: manifest.revisionId,
+    sourceAudioHash: manifest.source.sourceAudioHash,
+    separationMode: manifest.separation.mode,
+    modelVersion: manifest.separation.modelVersion,
+    processingVersion: manifest.separation.processingVersion,
+    sampleRate: manifest.separation.sampleRate,
+    channelCount: manifest.separation.channelCount,
+    totalSamples: manifest.separation.totalSamples,
+    pcmFormat: manifest.separation.format,
+    artifactChecksums: expectedChecksums,
+    derivedFrom: manifest.separation.derivedFrom ?? null,
+  };
 
   const existingCp = await findCompletedCheckpointBySourceAudioHash(
     manifest.source.sourceAudioHash,
@@ -444,30 +586,52 @@ export async function restoreSongFromDrive(params: {
   let reusedLocalStems = false;
 
   if (existingCp) {
-    const cpCheck = await validateAndPrepareResume(existingCp.taskId, {
-      sourceAudioAvailable: true,
-      sourceAudioHash: manifest.source.sourceAudioHash,
-      totalSamples: existingCp.totalSamples,
-      sampleRate: existingCp.sampleRate,
-    }).catch(() => null);
-    if (isValidationCompleted(cpCheck)) {
-      reusedCheckpointTaskId = existingCp.taskId;
-      reusedLocalStems = true;
-      await addCheckpointReference({
-        taskId: existingCp.taskId,
-        songId,
-        mode: manifest.separation.mode,
-        source: "driveRestoreManager.reuseLocalCheckpoint",
-      }).catch(() => undefined);
+    const cpCompat = isArtifactRefStrictlyCompatible(
+      expectedArtifactRef,
+      {
+        sourceAudioHash: existingCp.sourceAudioHash,
+        separationMode: existingCp.requestedMode,
+        modelVersion: existingCp.modelVersion,
+        processingVersion: existingCp.processingVersion,
+        sampleRate: existingCp.sampleRate,
+        channelCount: 2,
+        totalSamples: existingCp.totalSamples,
+        exportedRevisionIds: existingCp.exportedRevisionIds,
+      },
+      { requireExactRevision },
+    );
+    if (cpCompat.compatible) {
+      const cpCheck = await validateAndPrepareResume(existingCp.taskId, {
+        sourceAudioAvailable: true,
+        sourceAudioHash: manifest.source.sourceAudioHash,
+        totalSamples: existingCp.totalSamples,
+        sampleRate: existingCp.sampleRate,
+      }).catch(() => null);
+      if (isValidationCompleted(cpCheck)) {
+        reusedCheckpointTaskId = existingCp.taskId;
+        reusedLocalStems = true;
+        await addCheckpointReference({
+          taskId: existingCp.taskId,
+          songId,
+          mode: manifest.separation.mode,
+          source: "driveRestoreManager.reuseLocalCheckpoint",
+        }).catch(() => undefined);
+      }
     }
   }
 
   if (!reusedLocalStems) {
-    const existingImp = await findImportedStemByHash({
+    const existingImp = await findImportedStemStrict({
       sourceAudioHash: manifest.source.sourceAudioHash,
       mode: manifest.separation.mode,
       modelVersion: manifest.separation.modelVersion,
       processingVersion: manifest.separation.processingVersion,
+      sampleRate: manifest.separation.sampleRate,
+      channelCount: manifest.separation.channelCount,
+      totalSamples: manifest.separation.totalSamples,
+      expectedRevisionId: requireExactRevision ? manifest.revisionId : undefined,
+      expectedChecksums,
+      expectedDerivedFrom: manifest.separation.derivedFrom ?? null,
     }).catch(() => null);
 
     if (existingImp) {
@@ -702,6 +866,7 @@ export async function restoreSongFromDrive(params: {
         totalChunks,
         committedBytes,
         checksumsByRole,
+        derivedFrom: manifest.separation.derivedFrom ?? null,
         referencedBySongIds: [songId],
         createdAt: now,
         updatedAt: now,
@@ -710,18 +875,18 @@ export async function restoreSongFromDrive(params: {
     });
   }
 
-  // 選擇性恢復原曲（僅限 source.provider === "google_drive" 且使用者要求）
+  // 選擇性恢復原曲（支援 Drive 來源 File ID 與專案備份之本機原曲 File ID）
   let restoredOriginalAudio = false;
   let originalAudioWarning: string | undefined;
   let restoredOriginalFile: File | null = null;
 
-  if (
-    params.includeOriginalAudio &&
-    manifest.source.provider === "google_drive" &&
-    manifest.source.fileId
-  ) {
+  const originalDriveFileId =
+    params.originalBackupDriveFileId ||
+    (manifest.source.provider === "google_drive" ? manifest.source.fileId : undefined);
+
+  if (params.includeOriginalAudio && originalDriveFileId) {
     try {
-      const meta = await getDriveFileMetadata(manifest.source.fileId, {
+      const meta = await getDriveFileMetadata(originalDriveFileId, {
         accessToken,
         resourceKey: manifest.source.resourceKey,
         fileName: manifest.source.fileName,
@@ -731,7 +896,7 @@ export async function restoreSongFromDrive(params: {
       if (!meta.trashed && meta.capabilities?.canDownload !== false) {
         const downloaded = await downloadDriveFileBlob(
           {
-            pickedFileId: manifest.source.fileId,
+            pickedFileId: originalDriveFileId,
             resolvedFileId: meta.id,
             name: meta.name || manifest.source.fileName,
             mimeType: meta.mimeType || manifest.source.mimeType || "audio/mpeg",
@@ -782,15 +947,36 @@ export async function restoreSongFromDrive(params: {
       : undefined,
   });
 
-  if (restoredOriginalFile) {
-    await saveSongWithAudioFile({
-      song,
-      file: restoredOriginalFile,
-      sourceAudioHash: manifest.source.sourceAudioHash,
-      force: true,
-    });
-  } else {
-    await saveSongStateRecord(song, { force: true });
+  if (!params.skipLegacySessionSongSave) {
+    if (restoredOriginalFile) {
+      await saveSongWithAudioFile({
+        song,
+        file: restoredOriginalFile,
+        sourceAudioHash: manifest.source.sourceAudioHash,
+        force: true,
+      });
+    } else {
+      await saveSongStateRecord(song, { force: true });
+    }
+  } else if (restoredOriginalFile) {
+    // 專案模式僅透過既有內容雜湊存下原曲至 audioFiles，不污染舊版 default session 的 songs store
+    const { getPersistedAudioBlobByKey } = await import("../storage/songSessionStore.ts");
+    const { idbPut } = await import("../storage/indexedDb.ts");
+    const existsAudio = await getPersistedAudioBlobByKey(manifest.source.sourceAudioHash).catch(
+      () => null,
+    );
+    if (!existsAudio) {
+      await idbPut("audioFiles", {
+        key: manifest.source.sourceAudioHash,
+        sourceAudioHash: manifest.source.sourceAudioHash,
+        blob: restoredOriginalFile,
+        fileName: song.fileName,
+        mimeType: song.mimeType || restoredOriginalFile.type || "",
+        sizeBytes: song.fileSizeBytes ?? restoredOriginalFile.size,
+        lastModified: song.fileLastModified ?? Date.now(),
+        createdAt: Date.now(),
+      }).catch(() => undefined);
+    }
   }
 
   params.onProgress?.({
