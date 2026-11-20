@@ -380,7 +380,6 @@ test("Offline edits save locally first and sync on reconnect; 401 moves to waiti
     const statuses = [];
     const controller = new ProjectAutoSyncController({
       localDebounceMs: 5,
-      driveDebounceMs: 10,
       isOnline: () => online,
       getAuthContext: () => currentAuth,
       syncDriveFn: (syncParams) => saveProjectToDrive({ ...syncParams, fetchImpl: server.fetchImpl }),
@@ -388,16 +387,25 @@ test("Offline edits save locally first and sync on reconnect; 401 moves to waiti
     });
 
     // 1. 離線編輯先寫入本機 IndexedDB，不會丟失資料
-    controller.scheduleProjectEdit(rec, { immediateLocal: true, syncImmediately: true });
+    controller.scheduleProjectEdit(rec, { immediateLocal: true });
     await new Promise((r) => setTimeout(r, 30));
     const localAfterOffline = await getProjectRecord(rec.projectId);
     assert.ok(localAfterOffline);
     assert.equal(localAfterOffline.dirty, true);
+    // 一般編輯只保存本機：不會自動同步，也不會有任何 Drive 寫入
+    assert.equal(statuses.includes("error"), false);
+    assert.equal(server.uploadsByAuth.length, 0);
+    const offlineManual = await controller.syncProjectManually(rec.projectId);
+    assert.equal(offlineManual?.status, "error");
     assert.equal(statuses.includes("error"), true);
 
-    // 2. 恢復連線 -> trigger reconnect sync 成功同步至 Drive
+    // 2. 恢復連線 -> 不自動同步；使用者手動按同步才成功寫入 Drive
     online = true;
-    await controller.resumePendingForAccount("google:user-a");
+    const pending = await controller.listPendingSyncProjects("google:user-a");
+    assert.deepEqual(pending.dirtyProjectIds, [rec.projectId]);
+    assert.equal(server.uploadsByAuth.length, 0);
+    assert.equal((await getProjectRecord(rec.projectId)).dirty, true);
+    await controller.syncProjectManually(rec.projectId);
     const syncedRec = await getProjectRecord(rec.projectId);
     assert.equal(syncedRec.syncStatus, "synced");
     assert.equal(syncedRec.dirty, false);
@@ -415,7 +423,7 @@ test("Offline edits save locally first and sync on reconnect; 401 moves to waiti
       syncStatus: "dirty",
     };
     controller.scheduleProjectEdit(dirtyRec, { immediateLocal: true });
-    await controller.triggerDriveSync(rec.projectId);
+    await controller.syncProjectManually(rec.projectId);
     const waitingRec = await getProjectRecord(rec.projectId);
     assert.equal(waitingRec.syncStatus, "waiting_auth");
 
@@ -592,7 +600,6 @@ test("P0 race: concurrent edits during v10 Drive upload (both flushed and within
     const statusEvents = [];
     const controller = new ProjectAutoSyncController({
       localDebounceMs: 60,
-      driveDebounceMs: 200,
       retryBackoffMs: [20, 40],
       getAuthContext: () => auth,
       syncDriveFn: (syncParams) => saveProjectToDrive({ ...syncParams, fetchImpl: wrappedFetch }),
@@ -614,7 +621,7 @@ test("P0 race: concurrent edits during v10 Drive upload (both flushed and within
     holdV10Patch = patchDeferred;
 
     // 1. 開始同步 v10（會停在 PATCH project.json 的 Deferred Promise）
-    const v10SyncPromise = controller.triggerDriveSync(rec.projectId);
+    const v10SyncPromise = controller.syncProjectManually(rec.projectId);
     await holdV10Entered.promise;
 
     // 2. 同步卡在半途期間：先編輯形成 localRevision=11 且讓它寫進 IDB，再編輯形成 localRevision=12 停在 Debounce 記憶體內
@@ -657,8 +664,15 @@ test("P0 race: concurrent edits during v10 Drive upload (both flushed and within
     assert.equal(firstOutcome?.record.project.songs[0].settings.targetBpm, 142);
     assert.equal(firstOutcome?.record.lastSyncedRemoteRevision, 10);
 
-    // 等待 follow-up sync 自動把 v12 同步上 Drive
-    await new Promise((r) => setTimeout(r, 120));
+    // 不會自動發起第二次同步：靜置後 v12 仍為 dirty，需使用者再次按下同步鈕
+    await new Promise((r) => setTimeout(r, 400));
+    const stillDirty = await getProjectRecord(rec.projectId);
+    assert.equal(stillDirty.localRevision, 12);
+    assert.equal(stillDirty.dirty, true);
+    const syncedRevBeforeSecond = stillDirty.lastSyncedRemoteRevision;
+    assert.equal(syncedRevBeforeSecond, 10);
+    const secondManual = await controller.syncProjectManually(rec.projectId);
+    assert.equal(secondManual?.status, "synced");
     const afterFollowUp = await getProjectRecord(rec.projectId);
     assert.equal(afterFollowUp.localRevision, 12);
     assert.equal(afterFollowUp.dirty, false);
@@ -688,62 +702,69 @@ test("P0 race: concurrent edits during v10 Drive upload (both flushed and within
     };
     await saveProjectRecord(rec13);
 
-    // 4a. 503 retryable 失敗後自動重試期間又有新編輯 -> 最終必須保留最新修改並成功同步
+    // 4a. 手動同步 503 暫時性失敗 -> 同一次操作有限退避重試；退避期間新增的編輯不得被本次上傳，也不自動發起新同步
     let transient503Count = 1;
-    let first503Done = false;
-    const retryHold = createDeferred();
-    const retryCtrl = new ProjectAutoSyncController({
+    let retryCtrl;
+    const retryUploadedBpm = [];
+    retryCtrl = new ProjectAutoSyncController({
       localDebounceMs: 20,
-      driveDebounceMs: 50,
       retryBackoffMs: [25],
       getAuthContext: () => auth,
       syncDriveFn: async (syncParams) => {
+        retryUploadedBpm.push(syncParams.record.project.songs[0].settings.targetBpm);
         if (transient503Count > 0) {
           transient503Count -= 1;
-          return saveProjectToDrive({
+          const failed = await saveProjectToDrive({
             ...syncParams,
             fetchImpl: async () => new Response("Retryable 503", { status: 503 }),
           });
+          // 在退避期間使用者又編輯（localRevision=14）
+          const rec13b = {
+            ...rec13,
+            localRevision: 14,
+            project: {
+              ...rec13.project,
+              revision: 14,
+              revisionToken: "r14-retry-tok",
+              songs: [{ ...rec13.project.songs[0], settings: { ...rec13.project.songs[0].settings, targetBpm: 158 } }],
+            },
+          };
+          retryCtrl.scheduleProjectEdit(rec13b, { immediateLocal: true });
+          await retryCtrl.flushLocalSaves({ projectId: rec.projectId });
+          return failed;
         }
-        const out = await saveProjectToDrive({ ...syncParams, fetchImpl: server.fetchImpl });
-        if (out.status === "synced" && first503Done) {
-          retryHold.resolve();
-        }
-        return out;
+        return saveProjectToDrive({ ...syncParams, fetchImpl: server.fetchImpl });
       },
     });
-    const firstRetryTry = await retryCtrl.triggerDriveSync(rec.projectId);
-    assert.equal(firstRetryTry?.status, "error");
-    const rec13b = {
-      ...rec13,
-      localRevision: 14,
-      project: {
-        ...rec13.project,
-        revision: 14,
-        revisionToken: "r14-retry-tok",
-        songs: [{ ...rec13.project.songs[0], settings: { ...rec13.project.songs[0].settings, targetBpm: 158 } }],
-      },
-    };
-    retryCtrl.scheduleProjectEdit(rec13b, { immediateLocal: true });
-    first503Done = true;
-    await retryCtrl.triggerDriveSync(rec.projectId);
+    const retryOutcome = await retryCtrl.syncProjectManually(rec.projectId);
+    assert.equal(retryOutcome?.status, "synced");
+    assert.equal(retryOutcome?.superseded, true);
+    // 兩次嘗試上傳的內容都是同步開始時的快照（155 BPM），從未上傳 158
+    assert.deepEqual(retryUploadedBpm, [155, 155]);
     const dbAfterRetry = await getProjectRecord(rec.projectId);
     assert.equal(dbAfterRetry.localRevision, 14);
     assert.equal(dbAfterRetry.project.songs[0].settings.targetBpm, 158);
-    assert.equal(dbAfterRetry.syncStatus, "synced");
+    assert.equal(dbAfterRetry.dirty, true);
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(retryUploadedBpm.length, 2); // 沒有自動第二次同步
+    const retryManual2 = await retryCtrl.syncProjectManually(rec.projectId);
+    assert.equal(retryManual2?.status, "synced");
+    assert.equal((await getProjectRecord(rec.projectId)).dirty, false);
     await retryCtrl.dispose();
+    const dbAfterRetryFinal = await getProjectRecord(rec.projectId);
+    assert.equal(dbAfterRetryFinal.syncStatus, "synced");
 
     // 4b. 401 waiting_auth 與帳號切換競態
     const dirtyBefore401 = {
-      ...dbAfterRetry,
+      ...dbAfterRetryFinal,
       dirty: true,
       syncStatus: "dirty",
       localRevision: 15,
       project: {
-        ...dbAfterRetry.project,
+        ...dbAfterRetryFinal.project,
         revision: 15,
         revisionToken: "r15-tok",
-        songs: [{ ...dbAfterRetry.project.songs[0], settings: { ...dbAfterRetry.project.songs[0].settings, targetBpm: 161 } }],
+        songs: [{ ...dbAfterRetryFinal.project.songs[0], settings: { ...dbAfterRetryFinal.project.songs[0].settings, targetBpm: 161 } }],
       },
     };
     await saveProjectRecord(dirtyBefore401);
@@ -913,7 +934,6 @@ test("P1-2: account switch, sign out, token expiry, project switch, and dispose 
     let activeUiAccount = "google:acc-a";
     const ctrl = new ProjectAutoSyncController({
       localDebounceMs: 500,
-      driveDebounceMs: 4000,
       getAuthContext: () => currentAuth,
       syncDriveFn: (p) => saveProjectToDrive({ ...p, fetchImpl: server.fetchImpl }),
       onStatusChanged: (pid, outcome) => {
@@ -982,6 +1002,308 @@ test("P1-2: account switch, sign out, token expiry, project switch, and dispose 
     assert.equal((await getProjectRecord(pDispose.projectId))?.project.name, "Saved On Dispose");
   } finally {
     clearCachedFolderLayoutForAccount();
+    resetInMemoryIdbForTests();
+  }
+});
+
+// ───────────────────────── 本機儲存與手動雲端同步分離 ─────────────────────────
+
+function createCountingDriveFetch(server) {
+  const writes = [];
+  const all = [];
+  const fetchImpl = async (url, init) => {
+    const method = (init?.method ?? "GET").toUpperCase();
+    all.push(method);
+    if (method !== "GET") writes.push(`${method} ${String(url)}`);
+    return server.fetchImpl(url, init);
+  };
+  return { fetchImpl, writes, all };
+}
+
+function makeDriveProjectRecord(name, accountId = "google:user-a") {
+  return createInitialPersistedProjectRecord(
+    createEmptyProject({ name, storageProvider: "google_drive", ownerAccountId: accountId }),
+    { dirty: true, syncStatus: "dirty" },
+  );
+}
+
+test("Manual sync split: 100 local edits and local save button never issue any Drive write request", async () => {
+  configureInMemoryIdbForTests();
+  clearCachedFolderLayoutForAccount();
+  try {
+    const server = createProjectDriveMockServer();
+    const counting = createCountingDriveFetch(server);
+    const auth = {
+      accountId: "google:user-a",
+      accessToken: "token-a",
+      generation: 1,
+      isGenerationValid: (g, a) => g === 1 && a === "google:user-a",
+    };
+    let syncCalls = 0;
+    const ctrl = new ProjectAutoSyncController({
+      localDebounceMs: 5,
+      getAuthContext: () => auth,
+      syncDriveFn: (p) => {
+        syncCalls += 1;
+        return saveProjectToDrive({ ...p, fetchImpl: counting.fetchImpl });
+      },
+    });
+
+    const base = makeDriveProjectRecord("Slider Storm");
+    await saveProjectRecord(base);
+    let latest = base;
+    for (let i = 1; i <= 100; i += 1) {
+      latest = {
+        ...latest,
+        localRevision: base.localRevision + i,
+        dirty: true,
+        syncStatus: "dirty",
+        project: {
+          ...latest.project,
+          name: `Slider Storm ${i}`,
+          revision: base.localRevision + i,
+          revisionToken: `slider-tok-${i}`,
+          parentRevisionId: latest.project.revisionToken,
+        },
+      };
+      ctrl.scheduleProjectEdit(latest);
+    }
+    await new Promise((r) => setTimeout(r, 60));
+    const afterDebounce = await getProjectRecord(base.projectId);
+    assert.equal(afterDebounce.project.name, "Slider Storm 100");
+    assert.equal(afterDebounce.dirty, true);
+    assert.equal(counting.all.length, 0);
+    assert.equal(syncCalls, 0);
+
+    // 儲存本機：立即 flush Debounce，等待 IDB 完成才回報 ok，且不呼叫 Drive
+    const next = {
+      ...latest,
+      localRevision: latest.localRevision + 1,
+      project: {
+        ...latest.project,
+        name: "Saved By Button",
+        revision: latest.localRevision + 1,
+        revisionToken: "button-tok",
+        parentRevisionId: latest.project.revisionToken,
+      },
+    };
+    const slowCtrl = new ProjectAutoSyncController({
+      localDebounceMs: 5000,
+      getAuthContext: () => auth,
+      syncDriveFn: (p) => {
+        syncCalls += 1;
+        return saveProjectToDrive({ ...p, fetchImpl: counting.fetchImpl });
+      },
+    });
+    slowCtrl.scheduleProjectEdit(next); // 停在 5 秒 Debounce 內
+    assert.equal((await getProjectRecord(base.projectId)).project.name, "Slider Storm 100");
+    const saveRes = await slowCtrl.saveProjectLocallyNow(base.projectId);
+    assert.equal(saveRes.ok, true);
+    assert.equal((await getProjectRecord(base.projectId)).project.name, "Saved By Button");
+    assert.equal(counting.all.length, 0);
+    assert.equal(syncCalls, 0);
+
+    // IndexedDB 寫入失敗：回報失敗，不顯示成功
+    slowCtrl.scheduleProjectEdit({ ...next, localRevision: next.localRevision + 1, project: { ...next.project, revision: next.localRevision + 1, revisionToken: "button-tok-2" } });
+    setInMemoryIdbHooksForTests({
+      beforeWrite(storeName) {
+        if (storeName === "projects") throw new Error("Simulated IDB write error");
+      },
+    });
+    const failRes = await slowCtrl.saveProjectLocallyNow(base.projectId);
+    assert.equal(failRes.ok, false);
+    // 本機保存失敗時，手動同步不得開始任何雲端寫入
+    slowCtrl.scheduleProjectEdit({ ...next, localRevision: next.localRevision + 2, project: { ...next.project, revision: next.localRevision + 2, revisionToken: "button-tok-3" } });
+    const blockedSync = await slowCtrl.syncProjectManually(base.projectId);
+    assert.equal(blockedSync?.status, "error");
+    assert.equal(syncCalls, 0);
+    assert.equal(counting.all.length, 0);
+    setInMemoryIdbHooksForTests({});
+    await ctrl.dispose();
+    await slowCtrl.dispose();
+  } finally {
+    setInMemoryIdbHooksForTests({});
+    clearCachedFolderLayoutForAccount();
+    resetInMemoryIdbForTests();
+  }
+});
+
+test("Manual sync split: only the sync button writes Drive; double click is single-flight; unchanged project creates no new write; retry stops after account switch", async () => {
+  configureInMemoryIdbForTests();
+  clearCachedFolderLayoutForAccount();
+  try {
+    const server = createProjectDriveMockServer();
+    const counting = createCountingDriveFetch(server);
+    const gate = createDeferred();
+    let holdFirstWrite = true;
+    const gatedFetch = async (url, init) => {
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (method !== "GET" && holdFirstWrite) {
+        holdFirstWrite = false;
+        await gate.promise;
+      }
+      return counting.fetchImpl(url, init);
+    };
+    const auth = {
+      accountId: "google:user-a",
+      accessToken: "token-a",
+      generation: 1,
+      isGenerationValid: (g, a) => g === auth.generation && a === auth.accountId,
+    };
+    let syncCalls = 0;
+    const ctrl = new ProjectAutoSyncController({
+      localDebounceMs: 5,
+      getAuthContext: () => auth,
+      syncDriveFn: (p) => {
+        syncCalls += 1;
+        return saveProjectToDrive({ ...p, fetchImpl: gatedFetch });
+      },
+    });
+    const rec = makeDriveProjectRecord("Manual Only");
+    await saveProjectRecord(rec);
+
+    // 連續點擊：第一個尚在進行時第二個直接被拒絕，不排隊
+    const first = ctrl.syncProjectManually(rec.projectId);
+    await new Promise((r) => setTimeout(r, 20));
+    const second = await ctrl.syncProjectManually(rec.projectId);
+    assert.equal(second?.status, "cancelled");
+    assert.equal(ctrl.isManualSyncRunning(rec.projectId), true);
+    gate.resolve();
+    const firstOutcome = await first;
+    assert.equal(firstOutcome?.status, "synced");
+    assert.equal(syncCalls, 1);
+    assert.equal(ctrl.isManualSyncRunning(rec.projectId), false);
+    const writesAfterFirst = counting.writes.length;
+    assert.ok(writesAfterFirst > 0);
+    const synced = await getProjectRecord(rec.projectId);
+    assert.equal(synced.dirty, false);
+    assert.equal(synced.syncStatus, "synced");
+
+    // 內容未變更、遠端也沒有更新：再次同步不得建立新 Revision / 不得寫 project.json
+    const third = await ctrl.syncProjectManually(rec.projectId);
+    assert.ok(third);
+    assert.equal(counting.writes.length, writesAfterFirst);
+    assert.equal((await getProjectRecord(rec.projectId)).syncStatus, "synced");
+
+    // 手動同步的有限重試：退避期間帳戶切換 -> 之後不會再嘗試
+    const retryRec = makeDriveProjectRecord("Retry Cancel");
+    await saveProjectRecord(retryRec);
+    let attempts = 0;
+    const retryCtrl = new ProjectAutoSyncController({
+      localDebounceMs: 5,
+      retryBackoffMs: [150],
+      maxRetries: 3,
+      getAuthContext: () => auth,
+      syncDriveFn: async (p) => {
+        attempts += 1;
+        return { status: "error", record: p.record, retryable: true, errorMessage: "HTTP 503" };
+      },
+    });
+    const retryPromise = retryCtrl.syncProjectManually(retryRec.projectId);
+    await new Promise((r) => setTimeout(r, 40));
+    await retryCtrl.invalidateAccount("google:user-a");
+    const retryOutcome = await retryPromise;
+    assert.equal(retryOutcome?.status, "cancelled");
+    await new Promise((r) => setTimeout(r, 400));
+    assert.equal(attempts, 1);
+
+    // 有限重試：永遠 503 時最多 1 + maxRetries 次，不會無限重試
+    let boundedAttempts = 0;
+    const boundedCtrl = new ProjectAutoSyncController({
+      localDebounceMs: 5,
+      retryBackoffMs: [5],
+      maxRetries: 2,
+      getAuthContext: () => auth,
+      syncDriveFn: async (p) => {
+        boundedAttempts += 1;
+        return { status: "error", record: p.record, retryable: true, errorMessage: "HTTP 503" };
+      },
+    });
+    const boundedOutcome = await boundedCtrl.syncProjectManually(retryRec.projectId);
+    assert.equal(boundedOutcome?.status, "error");
+    assert.equal(boundedAttempts, 3);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(boundedAttempts, 3);
+    await ctrl.dispose();
+    await boundedCtrl.dispose();
+  } finally {
+    clearCachedFolderLayoutForAccount();
+    resetInMemoryIdbForTests();
+  }
+});
+
+test("Manual sync split: renameProject and saveLocalProjectSnapshot stay local; unchanged snapshot creates no new revision", async () => {
+  configureInMemoryIdbForTests();
+  clearCachedFolderLayoutForAccount();
+  try {
+    const server = createProjectDriveMockServer();
+    const counting = createCountingDriveFetch(server);
+    const rec = makeDriveProjectRecord("Rename Local");
+    await saveProjectRecord({ ...rec, dirty: false, syncStatus: "synced" });
+    const { renameProject, saveLocalProjectSnapshot } = await import("../lib/projects/projectManager.ts");
+    const { record: renamed } = await renameProject({
+      projectId: rec.projectId,
+      newName: "Renamed Offline",
+      auth: {
+        accountId: "google:user-a",
+        accessToken: "token-a",
+        generation: 1,
+        isGenerationValid: () => true,
+      },
+      fetchImpl: counting.fetchImpl,
+    });
+    assert.equal(renamed.project.name, "Renamed Offline");
+    assert.equal(renamed.dirty, true);
+    assert.equal(renamed.syncStatus, "dirty");
+    assert.equal(counting.all.length, 0);
+
+    const same = await saveLocalProjectSnapshot({ projectId: rec.projectId, songs: [] });
+    assert.equal(same.localRevision, renamed.localRevision);
+    assert.equal(same.project.revisionToken, renamed.project.revisionToken);
+    assert.equal(counting.all.length, 0);
+  } finally {
+    clearCachedFolderLayoutForAccount();
+    resetInMemoryIdbForTests();
+  }
+});
+
+test("Local multi-tab race: same revision with different token keeps both sides; idempotent retry is not a conflict", async () => {
+  configureInMemoryIdbForTests();
+  try {
+    const { saveLocalProjectEditAtomically, getProjectRecord: getRec } = await import("../lib/storage/projectStore.ts");
+    const base = createInitialPersistedProjectRecord(
+      createEmptyProject({ name: "Tab Race", storageProvider: "local" }),
+      { dirty: false, syncStatus: "local_only" },
+    );
+    await saveProjectRecord(base);
+    const mk = (token, name, rev = base.localRevision + 1) => ({
+      ...base,
+      localRevision: rev,
+      project: { ...base.project, name, revision: rev, revisionToken: token, parentRevisionId: base.project.revisionToken },
+    });
+
+    const tabA = mk("tok-tab-a", "Tab A edit");
+    const tabB = mk("tok-tab-b", "Tab B edit");
+    const a1 = await saveLocalProjectEditAtomically(tabA);
+    assert.equal(a1.saved, true);
+    // 冪等重試（同版本、同 token）不應誤判為衝突
+    const a2 = await saveLocalProjectEditAtomically(tabA);
+    assert.equal(a2.saved, true);
+    // 另一分頁同版本號、不同 token：不得覆寫，並保留其修改為本機衝突快照
+    const b = await saveLocalProjectEditAtomically(tabB);
+    assert.equal(b.saved, false);
+    assert.equal(b.reason, "concurrent_edit");
+    assert.ok(b.conflictSnapshotKey);
+    assert.equal((await getRec(base.projectId)).project.name, "Tab A edit");
+    const { getIdbRecordForTests } = await import("../lib/storage/indexedDb.ts");
+    if (typeof getIdbRecordForTests === "function") {
+      const snap = await getIdbRecordForTests("projectPreferences", b.conflictSnapshotKey);
+      assert.equal(snap.snapshot.project.name, "Tab B edit");
+    }
+    // 較新版本號則正常寫入
+    const next = mk("tok-tab-a-2", "Tab A edit 2", base.localRevision + 2);
+    assert.equal((await saveLocalProjectEditAtomically(next)).saved, true);
+  } finally {
     resetInMemoryIdbForTests();
   }
 });

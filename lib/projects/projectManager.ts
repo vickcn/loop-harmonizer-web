@@ -29,6 +29,7 @@ import {
 import {
   bandSongToProjectEntry,
   buildProjectFromBandSongs,
+  isProjectContentEqual,
   cloneProjectForSaveAs,
   computeLegacySessionFingerprint,
   computeProjectBackupSummary,
@@ -124,11 +125,21 @@ export async function saveLocalProjectSnapshot(params: {
   const existing = await getProjectRecord(params.projectId);
   if (!existing) return null;
 
+  const baseProject = {
+    ...existing.project,
+    name: params.nameOverride ? sanitizeProjectName(params.nameOverride) : existing.project.name,
+  };
+  // 內容完全未變更時不建立新版本、不改變 dirty 狀態
+  const unchangedProbe = buildProjectFromBandSongs({
+    existingProject: baseProject,
+    songs: params.songs,
+    incrementRevision: false,
+  });
+  if (isProjectContentEqual(existing.project, unchangedProbe)) {
+    return existing;
+  }
   const builtProject = buildProjectFromBandSongs({
-    existingProject: {
-      ...existing.project,
-      name: params.nameOverride ? sanitizeProjectName(params.nameOverride) : existing.project.name,
-    },
+    existingProject: baseProject,
     songs: params.songs,
     incrementRevision: params.incrementRevision ?? true,
   });
@@ -152,7 +163,7 @@ export async function saveLocalProjectSnapshot(params: {
     if (saved.reason === "stale_revision" && saved.currentRecord) {
       return saved.currentRecord;
     }
-    if (saved.reason === "idb_error") {
+    if (saved.reason === "idb_error" || saved.reason === "concurrent_edit") {
       throw new Error(saved.errorMessage || "儲存本機專案至 IndexedDB 失敗。");
     }
     return null;
@@ -262,34 +273,13 @@ export async function renameProject(params: {
     if (saved.reason === "project_deleted") {
       throw new Error("此專案已被刪除，無法重新命名。");
     }
-    if (saved.reason === "stale_revision") {
+    if (saved.reason === "stale_revision" || saved.reason === "concurrent_edit") {
       throw new Error("本機專案剛有較新變更，請重新開啟後再重新命名。");
     }
     throw new Error(saved.errorMessage || "寫入專案新名稱至本機資料庫失敗。");
   }
 
-  if (
-    saved.record.storageProvider === "google_drive" &&
-    params.auth?.accountId &&
-    params.auth.accessToken &&
-    saved.record.ownerAccountId === params.auth.accountId
-  ) {
-    const syncOutcome = await saveProjectToDrive({
-      record: saved.record,
-      accountId: params.auth.accountId,
-      accessToken: params.auth.accessToken,
-      generation: params.auth.generation,
-      isGenerationValid: params.auth.isGenerationValid,
-      fetchImpl: params.fetchImpl,
-    });
-    return {
-      record:
-        syncOutcome.status === "synced"
-          ? syncOutcome.record
-          : (await getProjectRecord(params.projectId)) ?? saved.record,
-      syncOutcome,
-    };
-  }
+  // 重新命名只更新本機並標記 dirty；Google Drive 同步須由使用者按下同步鈕。
   return { record: saved.record };
 }
 
@@ -642,6 +632,51 @@ export async function deleteProjectSafely(params: {
     deletedCloud,
     cloudError,
   };
+}
+
+/**
+ * 手動同步發現遠端較新且本機沒有未同步修改時，使用者明確同意後才載入遠端版本：
+ * 若本機已有 dirty 修改或版本已變動則拒絕，避免以遠端覆蓋本機較新設定。
+ */
+export async function loadRemoteAheadProject(params: {
+  projectId: string;
+  remoteProject: BandProject;
+  expectedLocalRevisionToken: string;
+}): Promise<PersistedProjectRecord> {
+  const existing = await getProjectRecord(params.projectId);
+  if (!existing) throw new Error("找不到要載入遠端版本的專案。");
+  if (existing.dirty || existing.project.revisionToken !== params.expectedLocalRevisionToken) {
+    throw new Error("本機已有較新的修改，未載入遠端版本；請再次按同步以取得衝突處理選項。");
+  }
+  const remoteProj = params.remoteProject;
+  const loaded: PersistedProjectRecord = {
+    ...existing,
+    project: {
+      ...remoteProj,
+      driveFolderId: remoteProj.driveFolderId ?? existing.project.driveFolderId,
+      driveProjectFileId: remoteProj.driveProjectFileId ?? existing.project.driveProjectFileId,
+      driveRevisionsFolderId:
+        remoteProj.driveRevisionsFolderId ?? existing.project.driveRevisionsFolderId,
+    },
+    localBaseRevision: remoteProj.revision,
+    localBaseRevisionToken: remoteProj.revisionToken,
+    localRevision: remoteProj.revision,
+    lastSyncedRemoteRevision: remoteProj.revision,
+    lastSyncedRemoteRevisionToken: remoteProj.revisionToken,
+    dirty: false,
+    syncStatus: "synced",
+    syncGeneration: existing.syncGeneration + 1,
+    pendingRevisionPublish: null,
+    lastSavedAt: Date.now(),
+    lastSyncedAt: Date.now(),
+    conflictInfo: null,
+    lastError: null,
+  };
+  const saved = await saveProjectRecord(loaded);
+  if (!saved.saved) {
+    throw new Error(saved.errorMessage || "載入遠端版本並寫入本機失敗。");
+  }
+  return saved.record;
 }
 
 export async function resolveProjectConflict(params: {

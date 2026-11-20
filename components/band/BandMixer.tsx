@@ -155,6 +155,7 @@ import type {
 } from "@/lib/projects/projectTypes";
 import {
   buildProjectFromBandSongs,
+  isProjectContentEqual,
   computeEntryBackupStatus,
 } from "@/lib/projects/projectModel";
 import {
@@ -180,6 +181,7 @@ import {
   migrateLegacyBandSessionToProject,
   openProjectMetadataAndEntries,
   promoteLocalProjectToDrive,
+  loadRemoteAheadProject,
   renameProject,
   resolveProjectConflict,
   restoreLastActiveProjectOrNull,
@@ -451,6 +453,7 @@ export function BandMixer() {
   const offlineDownloadAbortRef = useRef<AbortController | null>(null);
   const [restoringOnDemandBySongId, setRestoringOnDemandBySongId] = useState<Record<string, string>>({});
   const autoSyncControllerRef = useRef<ProjectAutoSyncController | null>(null);
+  const [localSaveState, setLocalSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const projectOpGenerationRef = useRef(0);
   const backgroundSeparationJobs = useSyncExternalStore(
     sharedSeparationJobManager.subscribe.bind(sharedSeparationJobManager),
@@ -825,13 +828,17 @@ export function BandMixer() {
       onStatusChanged: (projectId, outcome) => {
         if (!mountedRef.current || activeProjectIdRef.current !== projectId) return;
         if (outcome.status === "local_save_error") {
+          setLocalSaveState("error");
           showShortcutHint(outcome.errorMessage || "寫入本機專案資料庫失敗。");
           return;
+        }
+        if (outcome.status === "local_saved") {
+          setLocalSaveState("saved");
         }
         if ("record" in outcome && outcome.record) {
           applyActiveProjectRecordMonotonically(outcome.record);
           if (outcome.status === "synced" && outcome.superseded) {
-            showShortcutHint("同步期間偵測到新的本機變更，已保留最新設定並排程下一次同步。");
+            showShortcutHint("本次同步完成，但仍有較新的本機修改尚未同步。");
           }
         } else if (outcome.status === "conflict") {
           void getProjectRecord(projectId).then((fresh) => {
@@ -846,7 +853,7 @@ export function BandMixer() {
 
   const scheduleActiveProjectSave = useCallback((
     songsOverride?: readonly BandSong[],
-    options?: { immediateLocal?: boolean; syncImmediately?: boolean; incrementRevision?: boolean },
+    options?: { immediateLocal?: boolean; incrementRevision?: boolean },
   ) => {
     const current = activeProjectRecordRef.current;
     if (!current) return;
@@ -871,9 +878,10 @@ export function BandMixer() {
     };
     activeProjectRecordRef.current = nextRecord;
     setActiveProjectRecord(nextRecord);
+    setLocalSaveState("saving");
+    // 一般編輯只做本機儲存並標記 dirty；Google Drive 同步須由使用者按下同步鈕
     autoSyncControllerRef.current?.scheduleProjectEdit(nextRecord, {
       immediateLocal: options?.immediateLocal,
-      syncImmediately: options?.syncImmediately,
     });
   }, []);
 
@@ -2401,9 +2409,6 @@ export function BandMixer() {
               if (latestRec && mountedRef.current && activeProjectIdRef.current === currentProjId) {
                 activeProjectRecordRef.current = latestRec;
                 setActiveProjectRecord(latestRec);
-                if (latestRec.storageProvider === "google_drive" && latestRec.dirty) {
-                  autoSyncControllerRef.current?.scheduleProjectEdit(latestRec);
-                }
               }
             }
             if (separationFocusRef.current?.active && separationFocusRef.current.songId === latest.id) {
@@ -2464,9 +2469,6 @@ export function BandMixer() {
           sessionRef.current = { ...sessionRef.current, songs: projSongs };
           setSession((previous) => ({ ...previous, songs: projSongs }));
           setSelection(projSongs.length > 0 ? { songId: projSongs[0].id, stemId: null } : EMPTY_MIXER_SELECTION);
-          if (activeProj.storageProvider === "google_drive" && activeProj.dirty && authSnap.account?.accountId && validToken) {
-            void autoSyncControllerRef.current?.triggerDriveSync(activeProj.projectId);
-          }
           setRestoringSession(false);
           setRestoringMessage("");
           return;
@@ -2728,9 +2730,14 @@ export function BandMixer() {
       void autoSyncControllerRef.current?.flushLocalSaves();
     };
     const onOnline = () => {
+      // 網路恢復只保存本機資料並提示待同步專案，絕不自動同步
       const accountId = sharedGoogleAccountManager.getSnapshot().account?.accountId;
       if (accountId) {
-        void autoSyncControllerRef.current?.resumePendingForAccount(accountId);
+        void autoSyncControllerRef.current?.listPendingSyncProjects(accountId).then((res) => {
+          if (res.dirtyProjectIds.length > 0 && mountedRef.current) {
+            showShortcutHint(`已恢復連線；有 ${res.dirtyProjectIds.length} 個專案尚未同步，請手動按「同步至 Google Drive」。`);
+          }
+        });
       }
     };
 
@@ -6655,6 +6662,21 @@ export function BandMixer() {
     }
   };
 
+  /** 若畫面最新設定與目前專案內容不同，先建立最新本機 Snapshot（排入本機 Debounce 佇列）。 */
+  const captureLatestProjectSnapshot = () => {
+    const active = activeProjectRecordRef.current;
+    if (!active) return;
+    const probe = buildProjectFromBandSongs({
+      existingProject: active.project,
+      songs: sessionRef.current.songs,
+      incrementRevision: false,
+    });
+    if (!isProjectContentEqual(active.project, probe)) {
+      scheduleActiveProjectSave(sessionRef.current.songs);
+    }
+  };
+
+  /** 儲存本機：只寫入 IndexedDB，不呼叫任何 Google Drive API。 */
   const handleManualSaveProject = async () => {
     const active = activeProjectRecordRef.current;
     if (!active) {
@@ -6664,37 +6686,105 @@ export function BandMixer() {
       return;
     }
     const gen = ++projectOpGenerationRef.current;
-    setProjectBusyState({
-      action: "save",
-      message: active.storageProvider === "google_drive" ? "正在儲存並同步至 Google Drive…" : "正在儲存本機專案…",
-    });
+    setProjectBusyState({ action: "save", message: "正在儲存本機專案…" });
+    setLocalSaveState("saving");
     try {
-      const updated = await saveLocalProjectSnapshot({
-        projectId: active.projectId,
-        songs: sessionRef.current.songs,
-        incrementRevision: true,
-      });
-      if (!updated || gen !== projectOpGenerationRef.current || !mountedRef.current) return;
-      applyActiveProjectRecordMonotonically(updated);
-      if (updated.storageProvider === "google_drive") {
-        const outcome: ProjectDriveSyncOutcome | null =
-          (await autoSyncControllerRef.current?.triggerDriveSync(updated.projectId)) ?? null;
-        if (outcome?.status === "synced") {
-          applyActiveProjectRecordMonotonically(outcome.record);
-          showShortcutHint(
-            outcome.superseded
-              ? "同步期間偵測到新的本機變更，已保留最新設定並排程下一次同步。"
-              : `已同步「${outcome.record.project.name}」（v${outcome.record.localRevision}）至 Google Drive。`,
-          );
-        } else if (outcome?.status === "conflict") {
-          showShortcutHint("偵測到跨裝置版本衝突，請選擇衝突處理方式。");
-          openProjectModal("conflict");
-        } else if (outcome?.status === "waiting_auth") {
-          showShortcutHint("已安全儲存於本機，等待重新授權 Google 後同步。");
-        }
-      } else {
-        showShortcutHint(`已保存本機專案「${updated.project.name}」（v${updated.localRevision}）。`);
+      captureLatestProjectSnapshot();
+      const res = await autoSyncControllerRef.current?.saveProjectLocallyNow(active.projectId);
+      if (!res || !res.ok) {
+        setLocalSaveState("error");
+        showShortcutHint(res && !res.ok ? `本機儲存失敗：${res.errorMessage}` : "本機儲存失敗。");
+        return;
       }
+      setLocalSaveState("saved");
+      if (!mountedRef.current) return;
+      const saved = res.record;
+      if (saved && activeProjectIdRef.current === saved.projectId) {
+        applyActiveProjectRecordMonotonically(saved);
+      }
+      if (saved?.storageProvider === "google_drive" && saved.dirty) {
+        showShortcutHint("本機已儲存 · 尚未同步至 Google Drive。");
+      } else if (saved?.storageProvider === "google_drive") {
+        showShortcutHint("本機已儲存 · 本機與雲端已同步。");
+      } else {
+        showShortcutHint(`已保存本機專案「${saved?.project.name ?? active.project.name}」。`);
+      }
+    } finally {
+      if (gen === projectOpGenerationRef.current && mountedRef.current) {
+        setProjectBusyState(null);
+      }
+    }
+  };
+
+  /** 同步至 Google Drive：唯一的使用者明確同步入口（純本機專案改走 Promote 流程）。 */
+  const handleSyncProjectToDrive = async (expectedProjectId?: string) => {
+    const active = activeProjectRecordRef.current;
+    if (!active) return;
+    if (expectedProjectId && active.projectId !== expectedProjectId) return;
+    if (active.storageProvider !== "google_drive") {
+      if (!sharedGoogleAccountManager.getSnapshot().account) {
+        showShortcutHint("請先登入 Google 帳號，再將專案儲存到 Google Drive。");
+        return;
+      }
+      openProjectModal("promote");
+      return;
+    }
+    const controller = autoSyncControllerRef.current;
+    if (!controller || controller.isManualSyncRunning(active.projectId)) return;
+    const gen = ++projectOpGenerationRef.current;
+    setProjectBusyState({ action: "sync", message: "正在同步專案至 Google Drive…" });
+    try {
+      captureLatestProjectSnapshot();
+      const outcome: ProjectDriveSyncOutcome | null = await controller.syncProjectManually(active.projectId);
+      if (!mountedRef.current) return;
+      setLocalSaveState("saved");
+      if (!outcome) return;
+      if ("record" in outcome && outcome.record && activeProjectIdRef.current === outcome.record.projectId) {
+        applyActiveProjectRecordMonotonically(outcome.record);
+      }
+      if (outcome.status === "synced") {
+        const summary = outcome.record.project.backupSummary;
+        const unbacked = summary ? summary.localOnlyCount + summary.pendingSyncCount : 0;
+        if (outcome.superseded || outcome.needsFollowUpSync || outcome.record.dirty) {
+          showShortcutHint("本次同步完成，但仍有較新的本機修改尚未同步。");
+        } else if (unbacked > 0) {
+          showShortcutHint("專案設定已同步；部分歌曲成果仍僅存在本機，可由匯出對話框備份。");
+        } else {
+          showShortcutHint(`已同步「${outcome.record.project.name}」（v${outcome.record.localRevision}）至 Google Drive。`);
+        }
+      } else if (outcome.status === "remote_ahead") {
+        const loadRemote =
+          typeof window !== "undefined" &&
+          window.confirm("雲端有較新的版本，且本機沒有未同步修改。要載入雲端版本嗎？");
+        if (loadRemote) {
+          const loaded = await loadRemoteAheadProject({
+            projectId: active.projectId,
+            remoteProject: outcome.remoteProject,
+            expectedLocalRevisionToken: outcome.record.project.revisionToken,
+          });
+          await clearWorkspaceForProjectSwitch();
+          const auth = getProjectAuthContext();
+          const nextSongs = await projectToBandSongsMetadataOnly(loaded.project, {
+            currentAccountId: auth.accountId,
+            hasValidGoogleToken: Boolean(auth.accountId && auth.accessToken),
+          });
+          applyProjectWorkspaceState(loaded, nextSongs);
+          showShortcutHint(`已載入雲端版本（v${loaded.localRevision}）。`);
+        } else {
+          showShortcutHint("雲端有較新版本，尚未載入；本機資料未被覆蓋。");
+        }
+      } else if (outcome.status === "conflict") {
+        showShortcutHint("偵測到跨裝置版本衝突，請選擇衝突處理方式。");
+        openProjectModal("conflict");
+      } else if (outcome.status === "waiting_auth") {
+        showShortcutHint("本機已儲存 · 需要重新授權 Google 後再手動同步。");
+      } else if (outcome.status === "error") {
+        showShortcutHint(`本機已儲存 · 同步失敗：${outcome.errorMessage}`);
+      } else if (outcome.status === "cancelled") {
+        showShortcutHint(outcome.reason);
+      }
+    } catch (err) {
+      showShortcutHint(err instanceof Error ? err.message : "同步失敗，本機資料已保留。");
     } finally {
       if (gen === projectOpGenerationRef.current && mountedRef.current) {
         setProjectBusyState(null);
@@ -7053,7 +7143,9 @@ export function BandMixer() {
         otherProjectJobs={otherProjectJobs}
         onNewProject={() => openProjectModal("create")}
         onOpenProjectList={() => openProjectModal("list")}
+        localSaveState={localSaveState}
         onSaveProject={() => void handleManualSaveProject()}
+        onSyncProject={() => void handleSyncProjectToDrive()}
         onSaveAsProject={() => openProjectModal("save_as")}
         onPromoteToDrive={() => openProjectModal("promote")}
         onOpenOfflineDownload={() => void handleOpenOfflineDialog()}
@@ -7070,12 +7162,13 @@ export function BandMixer() {
         onDeleteProject={() => requestDeleteProject()}
         onOpenConflict={() => openProjectModal("conflict")}
         onReauthorizeSync={() => {
+          const reauthProjectId = activeProjectRecordRef.current?.projectId ?? null;
           void sharedGoogleAccountManager
             .reauthorize()
             .then(() => {
-              const active = activeProjectRecordRef.current;
-              if (active) {
-                void autoSyncControllerRef.current?.triggerDriveSync(active.projectId);
+              // 僅在使用者按下「重新授權並同步」的同一專案上，續行該次明確發起的同步
+              if (reauthProjectId && activeProjectIdRef.current === reauthProjectId) {
+                void handleSyncProjectToDrive(reauthProjectId);
               }
             })
             .catch((err) => {

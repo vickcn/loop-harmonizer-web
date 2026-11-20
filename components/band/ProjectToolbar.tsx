@@ -20,7 +20,9 @@ type Props = {
   otherProjectJobs: readonly SeparationJobState[];
   onNewProject: () => void;
   onOpenProjectList: () => void;
+  localSaveState?: "idle" | "saving" | "saved" | "error";
   onSaveProject: () => void;
+  onSyncProject: () => void;
   onSaveAsProject: () => void;
   onPromoteToDrive: () => void;
   onOpenOfflineDownload: () => void;
@@ -33,13 +35,13 @@ type Props = {
 };
 
 const SYNC_STATUS_META: Record<ProjectSyncStatus, { label: string; toneClass: string }> = {
-  local_only: { label: "已儲存於本機", toneClass: "is-local" },
-  synced: { label: "已同步至 Drive", toneClass: "is-synced" },
-  dirty: { label: "尚未同步", toneClass: "is-dirty" },
-  syncing: { label: "同步中…", toneClass: "is-syncing" },
-  waiting_auth: { label: "需要重新授權", toneClass: "is-warn" },
-  conflict: { label: "有版本衝突", toneClass: "is-conflict" },
-  error: { label: "同步失敗", toneClass: "is-error" },
+  local_only: { label: "僅存於本機", toneClass: "is-local" },
+  synced: { label: "本機與雲端已同步", toneClass: "is-synced" },
+  dirty: { label: "本機已儲存 · 尚未同步", toneClass: "is-dirty" },
+  syncing: { label: "本機已儲存 · 雲端同步中", toneClass: "is-syncing" },
+  waiting_auth: { label: "本機已儲存 · 需要重新授權", toneClass: "is-warn" },
+  conflict: { label: "本機已儲存 · 雲端版本衝突", toneClass: "is-conflict" },
+  error: { label: "本機已儲存 · 同步失敗", toneClass: "is-error" },
 };
 
 function NewProjectIcon() {
@@ -79,6 +81,16 @@ function SaveAsProjectIcon() {
   );
 }
 
+function CloudSyncIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M12 13v8" />
+      <path d="m8 17 4-4 4 4" />
+      <path d="M4 14.9A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242" />
+    </svg>
+  );
+}
+
 function PromoteDriveIcon() {
   return (
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -111,7 +123,16 @@ function RenameIcon() {
 export function ProjectToolbar(props: Props) {
   const { activeProject, projectBusyState } = props;
   const isBusy = Boolean(projectBusyState);
-  const isSyncing = Boolean(activeProject?.syncStatus === "syncing" || projectBusyState?.action === "save" || projectBusyState?.action === "sync");
+  const isSaving = projectBusyState?.action === "save";
+  const isSyncing = Boolean(activeProject?.syncStatus === "syncing" || projectBusyState?.action === "sync");
+  const localSaveMeta =
+    props.localSaveState === "saving"
+      ? { label: "本機儲存中…", toneClass: "is-syncing" }
+      : props.localSaveState === "error"
+        ? { label: "本機儲存失敗", toneClass: "is-error" }
+        : props.localSaveState === "saved"
+          ? { label: "本機已儲存", toneClass: "is-synced" }
+          : null;
   const syncMeta = activeProject
     ? SYNC_STATUS_META[activeProject.syncStatus]
     : { label: props.hasLegacySongs ? "未納入專案（僅本機工作階段）" : "尚未建立專案", toneClass: "is-local" };
@@ -154,7 +175,7 @@ export function ProjectToolbar(props: Props) {
     },
     {
       key: "save-project",
-      label: activeProject?.storageProvider === "google_drive" ? "立即儲存並同步" : "儲存專案",
+      label: activeProject ? "儲存本機" : "儲存專案",
       disabled: disabledAll || (!activeProject && !props.hasLegacySongs),
       disabledReason: isBusy
         ? projectBusyState?.message
@@ -164,15 +185,36 @@ export function ProjectToolbar(props: Props) {
       onSelect: activeProject ? props.onSaveProject : props.onMigrateLegacy,
       renderInline: () => (
         <IconActionButton
-          icon={isSyncing ? <span className="mixer-spinner" aria-hidden="true" /> : <SaveProjectIcon />}
-          label={activeProject ? (activeProject.storageProvider === "google_drive" ? "儲存並同步專案" : "儲存本機專案") : "將目前工作空間另存為專案"}
-          busy={isSyncing}
+          icon={isSaving ? <span className="mixer-spinner" aria-hidden="true" /> : <SaveProjectIcon />}
+          label={activeProject ? "儲存本機（不會同步至 Google Drive）" : "將目前工作空間另存為專案"}
+          busy={isSaving}
           disabled={disabledAll || (!activeProject && !props.hasLegacySongs)}
           disabledReason={isBusy ? projectBusyState?.message : (!activeProject && !props.hasLegacySongs ? "請先新增專案或載入歌曲" : undefined)}
           onClick={activeProject ? props.onSaveProject : props.onMigrateLegacy}
         />
       ),
     },
+    ...(activeProject
+      ? ([
+          {
+            key: "sync-project",
+            label: "同步專案至 Google Drive",
+            disabled: disabledAll || (activeProject.storageProvider === "local" && !props.isGoogleConfigured),
+            disabledReason: isBusy ? projectBusyState?.message : undefined,
+            onSelect: props.onSyncProject,
+            renderInline: () => (
+              <IconActionButton
+                icon={isSyncing ? <span className="mixer-spinner" aria-hidden="true" /> : <CloudSyncIcon />}
+                label="同步專案至 Google Drive"
+                busy={isSyncing}
+                disabled={disabledAll || (activeProject.storageProvider === "local" && !props.isGoogleConfigured)}
+                disabledReason={isBusy ? projectBusyState?.message : undefined}
+                onClick={props.onSyncProject}
+              />
+            ),
+          },
+        ] satisfies AdaptiveActionItem[])
+      : []),
     {
       key: "save-as-project",
       label: "另存新專案",
@@ -317,6 +359,11 @@ export function ProjectToolbar(props: Props) {
             </span>
           </div>
           <div className="project-meta-line">
+            {localSaveMeta && (
+              <span className={`project-sync-pill ${localSaveMeta.toneClass}`} role="status" aria-live="polite">
+                <span>{localSaveMeta.label}</span>
+              </span>
+            )}
             <span className={`project-sync-pill ${syncMeta.toneClass}`} title={activeProject?.lastError || syncMeta.label}>
               {activeProject?.syncStatus === "syncing" && <span className="mixer-spinner" aria-hidden="true" />}
               <span>{syncMeta.label}</span>
@@ -363,8 +410,8 @@ export function ProjectToolbar(props: Props) {
       {activeProject?.syncStatus === "error" && activeProject.lastError && (
         <div role="status" aria-live="polite" className="card-warning-banner project-alert-row">
           <span>雲端同步待處理（本機資料安全保留）：{activeProject.lastError}</span>
-          <button type="button" className="btn mixer-button" style={{ padding: "5px 12px", fontSize: 12 }} onClick={props.onSaveProject}>
-            立即重試同步
+          <button type="button" className="btn mixer-button" style={{ padding: "5px 12px", fontSize: 12 }} onClick={props.onSyncProject}>
+            重新同步
           </button>
         </div>
       )}

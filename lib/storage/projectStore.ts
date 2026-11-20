@@ -194,13 +194,17 @@ export async function isProjectDeleted(projectId: string): Promise<boolean> {
   return Boolean(rec?.deletedIds?.includes(projectId));
 }
 
+export const LOCAL_CONFLICT_SNAPSHOT_PREFIX = "local-conflict-snapshot:";
+
 export type SaveProjectRecordResult =
   | { saved: true; record: PersistedProjectRecord }
   | {
       saved: false;
-      reason: "project_deleted" | "stale_revision" | "idb_error";
+      reason: "project_deleted" | "stale_revision" | "concurrent_edit" | "idb_error";
       errorMessage?: string;
       currentRecord?: PersistedProjectRecord;
+      /** concurrent_edit 時：被保留的本機衝突快照 key（projectPreferences store） */
+      conflictSnapshotKey?: string;
     };
 
 export interface ProjectSyncExpectedBase {
@@ -288,6 +292,34 @@ export async function saveProjectRecord(
             )) as PersistedProjectRecord | undefined;
 
             if (existing) {
+              if (
+                options?.rejectIfStaleRevision &&
+                existing.localRevision === record.localRevision &&
+                existing.project.revisionToken !== record.project.revisionToken
+              ) {
+                // 多分頁同版本號、不同 Revision Token 的並行修改：不靜默覆寫，也不丟棄使用者修改，
+                // 將被拒絕的版本完整保留為本機衝突快照（同一筆冪等重試 token 相同，不會走到這裡）。
+                const conflictSnapshotKey = `${LOCAL_CONFLICT_SNAPSHOT_PREFIX}${record.projectId}:${record.project.revisionToken}`;
+                await idbRequestPromise(
+                  prefStore.put({
+                    key: conflictSnapshotKey,
+                    projectId: record.projectId,
+                    baseRevisionToken: record.project.parentRevisionId ?? null,
+                    snapshot: record,
+                    savedAgainstRecordToken: existing.project.revisionToken,
+                    createdAt: Date.now(),
+                  }),
+                );
+                return {
+                  saved: false as const,
+                  reason: "concurrent_edit" as const,
+                  currentRecord: existing,
+                  conflictSnapshotKey,
+                  errorMessage:
+                    "另一個分頁已用相同版本號寫入不同修改；您的修改已保留為本機衝突快照，未覆寫對方內容。請重新整理後確認。",
+                };
+              }
+
               if (
                 options?.rejectIfStaleRevision &&
                 existing.localRevision > record.localRevision

@@ -42,7 +42,6 @@ import type {
 } from "./projectTypes.ts";
 
 export const PROJECT_SYNC_LOCAL_DEBOUNCE_MS = 500;
-export const PROJECT_SYNC_DRIVE_DEBOUNCE_MS = 4000;
 export const PROJECT_SYNC_RETRY_BACKOFF_MS = [5_000, 15_000, 45_000] as const;
 export const PROJECT_SYNC_MAX_RETRIES = 3;
 
@@ -517,6 +516,45 @@ export async function saveProjectToDrive(params: {
             status: "conflict",
             record: cRes.record,
             conflictInfo: cRes.record.conflictInfo ?? divergedConflict,
+          };
+        }
+
+        if (
+          !remoteAhead &&
+          !record.dirty &&
+          !record.pendingRevisionPublish &&
+          record.syncStatus !== "conflict"
+        ) {
+          // 本機沒有未同步修改、遠端也沒有更新：不建立新 Revision，也不寫 project.json，僅確認同步狀態。
+          const noopCommit = await commitAtomic(
+            "synced",
+            {
+              driveFolderId: folders.projectFolderId,
+              driveProjectFileId: targetFileId,
+              driveRevisionsFolderId: folders.projectRevisionsFolderId,
+              syncedRevision: remoteProject.revision,
+              syncedRevisionToken: remoteProject.revisionToken,
+              knownRemoteRevision: remoteProject.revision,
+              knownRemoteRevisionToken: remoteProject.revisionToken,
+              knownRemoteDriveVersion: remoteDriveVersion,
+              syncedAt: Date.now(),
+              conflictInfo: null,
+              lastError: null,
+            },
+            record.project,
+          );
+          if (!noopCommit.committed) {
+            return noopCommit.outcome === "idb_error"
+              ? { status: "error", record, retryable: true, errorMessage: noopCommit.errorMessage || "寫入同步狀態失敗。" }
+              : { status: "cancelled", reason: noopCommit.errorMessage || "專案狀態已變更。" };
+          }
+          return {
+            status: "synced",
+            record: noopCommit.record,
+            driveVersion: remoteDriveVersion,
+            immutableRevisionFileId: "", // 本次無新 Revision
+            superseded: noopCommit.superseded,
+            needsFollowUpSync: noopCommit.needsFollowUpSync,
           };
         }
 
@@ -1486,7 +1524,6 @@ export interface AutoSyncTimerAdapter {
 
 export interface ProjectAutoSyncControllerDeps {
   localDebounceMs?: number;
-  driveDebounceMs?: number;
   retryBackoffMs?: readonly number[];
   maxRetries?: number;
   timer?: AutoSyncTimerAdapter;
@@ -1518,16 +1555,17 @@ interface ProjectLocalWriteSlot {
 interface ProjectCloudSyncSlot {
   generation: number;
   ownerAccountId: string;
-  driveTimer: ReturnType<typeof setTimeout> | null;
   retryTimer: ReturnType<typeof setTimeout> | null;
+  cancelRetrySleep: (() => void) | null;
   inFlight: Promise<void> | null;
   abortController: AbortController | null;
-  pendingFollowUp: boolean;
+  operationId: number;
   retryAttempt: number;
 }
 
 /**
- * 本機 Debounced 序列化寫入佇列 + 雲端 Google Drive 單飛合併同步控制器：
+ * 本機 Debounced 序列化寫入佇列 + 使用者手動觸發的 Google Drive 單飛同步控制器
+ * （類別名稱沿用 ProjectAutoSyncController 以減少改動；一般專案編輯只保存本機，不再有任何雲端自動同步）：
  * - 徹底分離本機保存（`localSlots`）與雲端傳輸取消（`cloudSlots`）的生命週期：
  *   切換帳號、登出、授權過期、切換專案或元件卸載時，立即中止舊帳戶雲端同步，但保留並安全 flush 尚未寫入之本機修改，絕不遺失，亦不誤將舊帳戶回呼掛載回新帳戶 UI。
  * - 使用者主動刪除專案時先 discard 待存佇列，並受 IndexedDB tombstone 保護絕不復活。
@@ -1539,14 +1577,14 @@ export class ProjectAutoSyncController {
   private readonly localSlots = new Map<string, ProjectLocalWriteSlot>();
   private readonly cloudSlots = new Map<string, ProjectCloudSyncSlot>();
   private readonly localDebounceMs: number;
-  private readonly driveDebounceMs: number;
+  private readonly manualSyncReserved = new Set<string>();
+  private operationSeq = 0;
   private readonly retryBackoffMs: readonly number[];
   private readonly maxRetries: number;
 
   constructor(deps: ProjectAutoSyncControllerDeps) {
     this.deps = deps;
     this.localDebounceMs = deps.localDebounceMs ?? PROJECT_SYNC_LOCAL_DEBOUNCE_MS;
-    this.driveDebounceMs = deps.driveDebounceMs ?? PROJECT_SYNC_DRIVE_DEBOUNCE_MS;
     this.retryBackoffMs = deps.retryBackoffMs ?? PROJECT_SYNC_RETRY_BACKOFF_MS;
     this.maxRetries = deps.maxRetries ?? PROJECT_SYNC_MAX_RETRIES;
     this.timer = deps.timer ?? {
@@ -1582,11 +1620,11 @@ export class ProjectAutoSyncController {
       slot = {
         generation: 1,
         ownerAccountId,
-        driveTimer: null,
         retryTimer: null,
+        cancelRetrySleep: null,
         inFlight: null,
         abortController: null,
-        pendingFollowUp: false,
+        operationId: 0,
         retryAttempt: 0,
       };
       this.cloudSlots.set(projectId, slot);
@@ -1617,7 +1655,7 @@ export class ProjectAutoSyncController {
 
         let savedOk = false;
         let savedRecord = target;
-        let blockedReason: "project_deleted" | "stale_revision" | "idb_error" | undefined;
+        let blockedReason: "project_deleted" | "stale_revision" | "concurrent_edit" | "idb_error" | undefined;
         let errorMessage: string | undefined;
 
         try {
@@ -1689,9 +1727,14 @@ export class ProjectAutoSyncController {
     return flushPromise;
   }
 
+  /**
+   * 一般專案編輯（音量、Key、BPM、速度、Mute/Solo、Loop、排序、改名、分軌引用更新…）：
+   * 只負責「本機 Debounce 儲存」，絕不排程、也絕不隱式觸發任何 Google Drive 同步。
+   * Google Drive 專案由呼叫端先標記 dirty=true；雲端同步必須由使用者透過 `syncProjectManually()` 明確發起。
+   */
   scheduleProjectEdit(
     record: PersistedProjectRecord,
-    options?: { immediateLocal?: boolean; syncImmediately?: boolean },
+    options?: { immediateLocal?: boolean },
   ): void {
     const localSlot = this.getOrCreateLocalSlot(record.projectId, record.ownerAccountId);
     if (localSlot.deleted) return;
@@ -1719,38 +1762,6 @@ export class ProjectAutoSyncController {
         void this.runSerializedLocalFlush(localSlot);
       }, this.localDebounceMs);
     }
-
-    if (record.storageProvider !== "google_drive" || !record.ownerAccountId) {
-      return;
-    }
-
-    const cloudSlot = this.getOrCreateCloudSlot(record.projectId, record.ownerAccountId);
-    if (cloudSlot.retryTimer !== null) {
-      this.timer.clearTimeout(cloudSlot.retryTimer);
-      cloudSlot.retryTimer = null;
-    }
-    cloudSlot.retryAttempt = 0;
-
-    if (cloudSlot.driveTimer !== null) {
-      this.timer.clearTimeout(cloudSlot.driveTimer);
-      cloudSlot.driveTimer = null;
-    }
-
-    if (cloudSlot.inFlight) {
-      // 同步進行中若有新編輯，標記 pendingFollowUp 待目前同步條件提交後自動續傳新版
-      cloudSlot.pendingFollowUp = true;
-      return;
-    }
-
-    if (options?.syncImmediately) {
-      void this.triggerDriveSync(record.projectId);
-      return;
-    }
-
-    cloudSlot.driveTimer = this.timer.setTimeout(() => {
-      cloudSlot.driveTimer = null;
-      void this.triggerDriveSync(record.projectId);
-    }, this.driveDebounceMs);
   }
 
   async flushLocalSaves(options?: {
@@ -1793,19 +1804,103 @@ export class ProjectAutoSyncController {
     return { flushedProjectIds, failed };
   }
 
-  async triggerDriveSync(
+  /**
+   * 「儲存本機」按鈕入口：取消 Debounce、整合最新快照、等待 IndexedDB transaction 確實完成。
+   * 絕不呼叫任何 Google Drive API。回傳 ok=true 才代表本機寫入真正成功。
+   */
+  async saveProjectLocallyNow(
+    projectId: string,
+    latest?: PersistedProjectRecord | null,
+  ): Promise<
+    | { ok: true; record: PersistedProjectRecord | null }
+    | { ok: false; errorMessage: string }
+  > {
+    if (latest && latest.projectId === projectId) {
+      const slot = this.getOrCreateLocalSlot(projectId, latest.ownerAccountId);
+      if (slot.deleted) {
+        return { ok: false, errorMessage: "專案已刪除，無法儲存。" };
+      }
+      if (!slot.pendingRecord || latest.localRevision >= slot.pendingRecord.localRevision) {
+        slot.pendingRecord = latest;
+        slot.ownerAccountId = latest.ownerAccountId;
+      }
+      slot.suppressUi = false;
+    }
+    const res = await this.flushLocalSaves({ projectId, suppressStatusCallback: true });
+    const failure = res.failed.find((f) => f.projectId === projectId);
+    if (failure) {
+      return { ok: false, errorMessage: failure.reason };
+    }
+    const record = await getProjectRecord(projectId).catch(() => null);
+    return { ok: true, record };
+  }
+
+  /** 是否有此專案的手動雲端同步正在進行（含保存本機的前置階段）。 */
+  isManualSyncRunning(projectId: string): boolean {
+    return this.manualSyncReserved.has(projectId);
+  }
+
+  private sleepForRetry(slot: ProjectCloudSyncSlot, ms: number): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      slot.retryTimer = this.timer.setTimeout(() => {
+        slot.retryTimer = null;
+        slot.cancelRetrySleep = null;
+        resolve(true);
+      }, ms);
+      slot.cancelRetrySleep = () => {
+        if (slot.retryTimer !== null) this.timer.clearTimeout(slot.retryTimer);
+        slot.retryTimer = null;
+        slot.cancelRetrySleep = null;
+        resolve(false);
+      };
+    });
+  }
+
+  private cancelCloudSlot(slot: ProjectCloudSyncSlot): void {
+    slot.generation += 1;
+    if (slot.retryTimer !== null) this.timer.clearTimeout(slot.retryTimer);
+    slot.retryTimer = null;
+    slot.cancelRetrySleep?.();
+    slot.abortController?.abort();
+  }
+
+  /**
+   * 使用者明確按下「同步至 Google Drive」才會進入的唯一雲端寫入入口：
+   * - 單一專案單飛：同步進行中再次呼叫不會排隊第二次同步，直接回傳 cancelled（忙碌中）。
+   * - 先 flush 本機待提交修改，確認 IndexedDB 保存成功後才開始任何 Drive 請求。
+   * - 有限退避重試僅限同一次手動操作（429/5xx/短暫網路錯誤），重試以同次操作的內容快照為準，
+   *   不會上傳同步開始之後產生的新版本；帳戶/Generation/刪除/取消後不再繼續。
+   * - 同步期間若有新本機修改，由 commitProjectSyncResultAtomically 保留新版並維持 dirty，
+   *   不會自動發起第二次同步，需使用者再次按下同步鈕。
+   */
+  async syncProjectManually(
     projectId: string,
     options?: { forceReplaceRemote?: boolean },
   ): Promise<ProjectDriveSyncOutcome | null> {
-    const existingCloudSlot = this.cloudSlots.get(projectId);
-    if (existingCloudSlot?.inFlight) {
-      existingCloudSlot.pendingFollowUp = true;
-      await existingCloudSlot.inFlight;
-      return null;
+    if (this.manualSyncReserved.has(projectId)) {
+      return { status: "cancelled", reason: "此專案的雲端同步正在進行中，請稍候完成後再試。" };
     }
+    this.manualSyncReserved.add(projectId);
+    try {
+      return await this.runManualSync(projectId, options);
+    } finally {
+      this.manualSyncReserved.delete(projectId);
+    }
+  }
 
-    // 先把還在 500ms 防抖或佇列中的本機編輯寫入 IDB，確保同步送出前即讀到最新狀態
-    await this.flushLocalSaves({ projectId, suppressStatusCallback: true });
+  private async runManualSync(
+    projectId: string,
+    options?: { forceReplaceRemote?: boolean },
+  ): Promise<ProjectDriveSyncOutcome | null> {
+    // 先把還在 500ms 防抖或佇列中的本機編輯寫入 IDB；失敗則不得開始雲端寫入
+    const flushRes = await this.flushLocalSaves({ projectId, suppressStatusCallback: true });
+    const flushFailure = flushRes.failed.find((f) => f.projectId === projectId);
+    if (flushFailure) {
+      const failedRec = await getProjectRecord(projectId).catch(() => null);
+      const msg = `本機保存失敗，未開始雲端同步：${flushFailure.reason}`;
+      if (!failedRec) return { status: "cancelled", reason: msg };
+      return { status: "error", record: failedRec, retryable: false, errorMessage: msg };
+    }
 
     const latestFromDb = await getProjectRecord(projectId);
     const localSlotPending = this.localSlots.get(projectId)?.pendingRecord ?? null;
@@ -1818,18 +1913,19 @@ export class ProjectAutoSyncController {
       return { status: "cancelled", reason: "專案已刪除。" };
     }
     if (current.syncStatus === "conflict" && !options?.forceReplaceRemote) {
-      return null;
+      return current.conflictInfo
+        ? { status: "conflict", record: current, conflictInfo: current.conflictInfo }
+        : null;
     }
 
     const activeSlot = this.getOrCreateCloudSlot(projectId, current.ownerAccountId);
-    if (activeSlot.driveTimer !== null) {
-      this.timer.clearTimeout(activeSlot.driveTimer);
-      activeSlot.driveTimer = null;
-    }
     if (activeSlot.retryTimer !== null) {
       this.timer.clearTimeout(activeSlot.retryTimer);
       activeSlot.retryTimer = null;
     }
+    activeSlot.retryAttempt = 0;
+    const operationId = ++this.operationSeq;
+    activeSlot.operationId = operationId;
 
     const expectedBase = {
       ownerAccountId: current.ownerAccountId,
@@ -1840,7 +1936,7 @@ export class ProjectAutoSyncController {
 
     const auth = this.deps.getAuthContext();
     if (!auth.accountId || !auth.accessToken || auth.accountId !== current.ownerAccountId) {
-      const waitMsg = "尚未登入或授權過期，等待重新授權後同步（已保存於本機）。";
+      const waitMsg = "尚未登入或授權已過期，請重新授權 Google 後再按「同步」（變更已保存於本機）。";
       const commitRes = await commitProjectSyncResultAtomically({
         projectId,
         expectedBase,
@@ -1857,7 +1953,7 @@ export class ProjectAutoSyncController {
         projectId,
         ownerAccountId: current.ownerAccountId,
         status: "waiting_auth",
-        attempts: activeSlot.retryAttempt,
+        attempts: 0,
         syncGeneration: activeSlot.generation,
         lastError: waitingRec.lastError ?? undefined,
         updatedAt: Date.now(),
@@ -1877,21 +1973,20 @@ export class ProjectAutoSyncController {
         ? navigator.onLine
         : true;
     if (!online) {
-      const offlineMsg = "目前處於離線狀態，待恢復連線後將自動同步。";
+      const offlineMsg = "目前處於離線狀態，請恢復連線後再手動按「同步」（變更已保存於本機）。";
       const commitRes = await commitProjectSyncResultAtomically({
         projectId,
         expectedBase,
         kind: "error",
         remoteMetadata: { lastError: offlineMsg },
       });
-      const offlineRec =
-        commitRes.committed
-          ? commitRes.record
-          : { ...current, syncStatus: "error" as const, lastError: offlineMsg };
+      const offlineRec = commitRes.committed
+        ? commitRes.record
+        : { ...current, syncStatus: "error" as const, lastError: offlineMsg };
       const out: ProjectDriveSyncOutcome = {
         status: "error",
         record: offlineRec,
-        retryable: true,
+        retryable: false,
         errorMessage: offlineMsg,
       };
       this.deps.onStatusChanged?.(projectId, out);
@@ -1902,9 +1997,12 @@ export class ProjectAutoSyncController {
     const capturedAuthGen = auth.generation;
     const controller = new AbortController();
     activeSlot.abortController = controller;
-    activeSlot.pendingFollowUp = false;
 
     const syncFn = this.deps.syncDriveFn ?? saveProjectToDrive;
+    const isInvalidated = () =>
+      activeSlot.generation !== capturedSlotGen ||
+      this.cloudSlots.get(projectId) !== activeSlot ||
+      activeSlot.operationId !== operationId;
     let finalOutcome: ProjectDriveSyncOutcome | null = null;
 
     const run = (async () => {
@@ -1912,80 +2010,38 @@ export class ProjectAutoSyncController {
         projectId,
         ownerAccountId: current.ownerAccountId,
         status: "syncing",
-        attempts: activeSlot.retryAttempt,
+        attempts: 0,
         syncGeneration: capturedSlotGen,
         updatedAt: Date.now(),
       });
 
-      const freshRecord = (await getProjectRecord(projectId)) ?? current;
-      const outcome = await syncFn({
-        record: freshRecord,
-        accountId: auth.accountId!,
-        accessToken: auth.accessToken!,
-        generation: capturedAuthGen,
-        isGenerationValid: (g, a) =>
-          activeSlot.generation === capturedSlotGen &&
-          this.cloudSlots.get(projectId) === activeSlot &&
-          auth.isGenerationValid(g, a),
-        forceReplaceRemote: options?.forceReplaceRemote,
-        onBeforeCommit: async () => {
-          await this.flushLocalSaves({ projectId, suppressStatusCallback: true });
-        },
-        signal: controller.signal,
-      });
-
-      finalOutcome = outcome;
-
-      if (
-        activeSlot.generation !== capturedSlotGen ||
-        this.cloudSlots.get(projectId) !== activeSlot
-      ) {
-        return;
-      }
-
-      if (outcome.status === "waiting_auth") {
-        auth.onAuthExpired?.();
-        await saveProjectSyncJob({
-          projectId,
-          ownerAccountId: current.ownerAccountId,
-          status: "waiting_auth",
-          attempts: activeSlot.retryAttempt,
-          syncGeneration: capturedSlotGen,
-          lastError: outcome.errorMessage,
-          updatedAt: Date.now(),
+      // 同一次手動操作的內容快照：重試時不會把同步開始後新產生的版本當成本次內容上傳
+      let snapshot: PersistedProjectRecord = current;
+      let outcome: ProjectDriveSyncOutcome;
+      for (;;) {
+        outcome = await syncFn({
+          record: snapshot,
+          accountId: auth.accountId!,
+          accessToken: auth.accessToken!,
+          generation: capturedAuthGen,
+          isGenerationValid: (g, a) => !isInvalidated() && auth.isGenerationValid(g, a),
+          forceReplaceRemote: options?.forceReplaceRemote,
+          onBeforeCommit: async () => {
+            await this.flushLocalSaves({ projectId, suppressStatusCallback: true });
+          },
+          signal: controller.signal,
         });
-      } else if (outcome.status === "synced") {
-        activeSlot.retryAttempt = 0;
-        const stillHasLocalPending = Boolean(this.localSlots.get(projectId)?.pendingRecord);
-        if (
-          outcome.superseded ||
-          outcome.needsFollowUpSync ||
-          outcome.record.dirty ||
-          stillHasLocalPending
-        ) {
-          activeSlot.pendingFollowUp = true;
+
+        if (isInvalidated()) {
+          finalOutcome = outcome;
+          return;
         }
-        await saveProjectSyncJob({
-          projectId,
-          ownerAccountId: current.ownerAccountId,
-          status: activeSlot.pendingFollowUp ? "queued" : "idle",
-          attempts: 0,
-          syncGeneration: capturedSlotGen,
-          updatedAt: Date.now(),
-        });
-      } else if (outcome.status === "conflict") {
-        activeSlot.pendingFollowUp = false;
-        await saveProjectSyncJob({
-          projectId,
-          ownerAccountId: current.ownerAccountId,
-          status: "conflict",
-          attempts: activeSlot.retryAttempt,
-          syncGeneration: capturedSlotGen,
-          lastError: outcome.conflictInfo.reason,
-          updatedAt: Date.now(),
-        });
-      } else if (outcome.status === "error") {
-        if (outcome.retryable && activeSlot.retryAttempt < this.maxRetries) {
+
+        if (
+          outcome.status === "error" &&
+          outcome.retryable &&
+          activeSlot.retryAttempt < this.maxRetries
+        ) {
           const delayMs =
             this.retryBackoffMs[
               Math.min(activeSlot.retryAttempt, this.retryBackoffMs.length - 1)
@@ -2001,32 +2057,87 @@ export class ProjectAutoSyncController {
             lastError: outcome.errorMessage,
             updatedAt: Date.now(),
           });
-          activeSlot.retryTimer = this.timer.setTimeout(() => {
-            activeSlot.retryTimer = null;
-            if (
-              activeSlot.generation === capturedSlotGen &&
-              this.cloudSlots.get(projectId) === activeSlot
-            ) {
-              void this.triggerDriveSync(projectId);
-            }
-          }, delayMs);
-        } else {
-          await saveProjectSyncJob({
-            projectId,
-            ownerAccountId: current.ownerAccountId,
-            status: "error",
-            attempts: activeSlot.retryAttempt,
-            syncGeneration: capturedSlotGen,
-            lastError: outcome.errorMessage,
-            updatedAt: Date.now(),
-          });
+          const alive = await this.sleepForRetry(activeSlot, delayMs);
+          if (!alive || isInvalidated() || controller.signal.aborted) {
+            finalOutcome = { status: "cancelled", reason: "手動同步已取消或授權工作階段已變更。" };
+            return;
+          }
+          const fresh = await getProjectRecord(projectId).catch(() => null);
+          if (!fresh || (await isProjectDeleted(projectId))) {
+            finalOutcome = { status: "cancelled", reason: "專案已刪除，中止同步。" };
+            return;
+          }
+          if (
+            fresh.localRevision === snapshot.localRevision &&
+            fresh.project.revisionToken === snapshot.project.revisionToken
+          ) {
+            snapshot = fresh;
+          } else {
+            // 本機已有較新修改：內容仍以本次快照為準，只採用最新同步中繼資料（Drive ID、遠端基準等）
+            snapshot = {
+              ...fresh,
+              localRevision: snapshot.localRevision,
+              project: {
+                ...snapshot.project,
+                driveFolderId: fresh.project.driveFolderId ?? snapshot.project.driveFolderId,
+                driveProjectFileId:
+                  fresh.project.driveProjectFileId ?? snapshot.project.driveProjectFileId,
+                driveRevisionsFolderId:
+                  fresh.project.driveRevisionsFolderId ?? snapshot.project.driveRevisionsFolderId,
+              },
+            };
+          }
+          continue;
         }
+        break;
       }
 
-      if (
-        activeSlot.generation === capturedSlotGen &&
-        this.cloudSlots.get(projectId) === activeSlot
-      ) {
+      finalOutcome = outcome;
+
+      if (outcome.status === "waiting_auth") {
+        auth.onAuthExpired?.();
+        await saveProjectSyncJob({
+          projectId,
+          ownerAccountId: current.ownerAccountId,
+          status: "waiting_auth",
+          attempts: activeSlot.retryAttempt,
+          syncGeneration: capturedSlotGen,
+          lastError: outcome.errorMessage,
+          updatedAt: Date.now(),
+        });
+      } else if (outcome.status === "synced") {
+        // needsFollowUpSync / superseded 僅為「仍有較新本機修改尚未同步」的資訊，不會自動發起新同步
+        await saveProjectSyncJob({
+          projectId,
+          ownerAccountId: current.ownerAccountId,
+          status: "idle",
+          attempts: 0,
+          syncGeneration: capturedSlotGen,
+          updatedAt: Date.now(),
+        });
+      } else if (outcome.status === "conflict") {
+        await saveProjectSyncJob({
+          projectId,
+          ownerAccountId: current.ownerAccountId,
+          status: "conflict",
+          attempts: activeSlot.retryAttempt,
+          syncGeneration: capturedSlotGen,
+          lastError: outcome.conflictInfo.reason,
+          updatedAt: Date.now(),
+        });
+      } else if (outcome.status === "error") {
+        await saveProjectSyncJob({
+          projectId,
+          ownerAccountId: current.ownerAccountId,
+          status: "error",
+          attempts: activeSlot.retryAttempt,
+          syncGeneration: capturedSlotGen,
+          lastError: outcome.errorMessage,
+          updatedAt: Date.now(),
+        });
+      }
+
+      if (!isInvalidated()) {
         this.deps.onStatusChanged?.(projectId, outcome);
       }
     })().finally(() => {
@@ -2036,14 +2147,6 @@ export class ProjectAutoSyncController {
       if (activeSlot.abortController === controller) {
         activeSlot.abortController = null;
       }
-      if (
-        activeSlot.pendingFollowUp &&
-        activeSlot.generation === capturedSlotGen &&
-        this.cloudSlots.get(projectId) === activeSlot
-      ) {
-        activeSlot.pendingFollowUp = false;
-        void this.triggerDriveSync(projectId);
-      }
     });
 
     activeSlot.inFlight = run;
@@ -2051,16 +2154,22 @@ export class ProjectAutoSyncController {
     return finalOutcome;
   }
 
-  async resumePendingForAccount(accountId: string): Promise<void> {
-    if (!accountId) return;
+  /**
+   * 登入、網路恢復、重新授權或元件重新掛載時使用：只保存本機待寫入資料並回報待同步專案，
+   * 絕不自動呼叫 Google Drive 寫入。
+   */
+  async listPendingSyncProjects(
+    accountId: string,
+  ): Promise<{ dirtyProjectIds: string[] }> {
+    if (!accountId) return { dirtyProjectIds: [] };
     await this.flushLocalSaves({ ownerAccountId: accountId, suppressStatusCallback: true });
     const { listCloudCachedProjectRecordsByAccount } = await import("../storage/projectStore.ts");
     const cached = await listCloudCachedProjectRecordsByAccount(accountId);
-    for (const rec of cached) {
-      if (rec.dirty && rec.syncStatus !== "conflict") {
-        await this.triggerDriveSync(rec.projectId);
-      }
-    }
+    return {
+      dirtyProjectIds: cached
+        .filter((rec) => rec.dirty && rec.syncStatus !== "conflict")
+        .map((rec) => rec.projectId),
+    };
   }
 
   invalidateProject(
@@ -2069,11 +2178,7 @@ export class ProjectAutoSyncController {
   ): Promise<void> {
     const cloudSlot = this.cloudSlots.get(projectId);
     if (cloudSlot) {
-      cloudSlot.generation += 1;
-      cloudSlot.pendingFollowUp = false;
-      if (cloudSlot.driveTimer !== null) this.timer.clearTimeout(cloudSlot.driveTimer);
-      if (cloudSlot.retryTimer !== null) this.timer.clearTimeout(cloudSlot.retryTimer);
-      cloudSlot.abortController?.abort();
+      this.cancelCloudSlot(cloudSlot);
       this.cloudSlots.delete(projectId);
     }
 
@@ -2107,11 +2212,7 @@ export class ProjectAutoSyncController {
     if (!accountId) return Promise.resolve();
     for (const [projectId, cloudSlot] of this.cloudSlots.entries()) {
       if (cloudSlot.ownerAccountId === accountId) {
-        cloudSlot.generation += 1;
-        cloudSlot.pendingFollowUp = false;
-        if (cloudSlot.driveTimer !== null) this.timer.clearTimeout(cloudSlot.driveTimer);
-        if (cloudSlot.retryTimer !== null) this.timer.clearTimeout(cloudSlot.retryTimer);
-        cloudSlot.abortController?.abort();
+        this.cancelCloudSlot(cloudSlot);
         this.cloudSlots.delete(projectId);
       }
     }
@@ -2131,11 +2232,7 @@ export class ProjectAutoSyncController {
 
   dispose(): Promise<void> {
     for (const [projectId, cloudSlot] of this.cloudSlots.entries()) {
-      cloudSlot.generation += 1;
-      cloudSlot.pendingFollowUp = false;
-      if (cloudSlot.driveTimer !== null) this.timer.clearTimeout(cloudSlot.driveTimer);
-      if (cloudSlot.retryTimer !== null) this.timer.clearTimeout(cloudSlot.retryTimer);
-      cloudSlot.abortController?.abort();
+      this.cancelCloudSlot(cloudSlot);
       this.cloudSlots.delete(projectId);
     }
 

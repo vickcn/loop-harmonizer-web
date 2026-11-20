@@ -517,6 +517,18 @@ export function buildProjectFromBandSongs(params: {
   };
 }
 
+/** 比較兩份專案的「使用者可見內容」（名稱、說明、混音設定、歌曲），忽略 revision/updatedAt 等版本欄位。 */
+export function isProjectContentEqual(a: BandProject, b: BandProject): boolean {
+  const pick = (p: BandProject) =>
+    JSON.stringify({
+      name: p.name,
+      description: p.description ?? null,
+      masterSettings: p.masterSettings,
+      songs: p.songs,
+    });
+  return pick(a) === pick(b);
+}
+
 export function createInitialPersistedProjectRecord(
   project: BandProject,
   options?: {
