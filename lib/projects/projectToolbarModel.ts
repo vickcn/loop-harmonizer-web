@@ -3,7 +3,7 @@ import type {
   ProjectStorageProvider,
 } from "./projectTypes.ts";
 
-export type LocalSaveState = "idle" | "saving" | "saved" | "error";
+export type LocalSaveState = "idle" | "dirty" | "saving" | "saved" | "error";
 
 export type ProjectToolbarBusyAction =
   | "open"
@@ -132,42 +132,77 @@ export function resolveProjectToolbarStatus(
     };
   }
 
+  const effectiveLocalState: LocalSaveState =
+    input.busyAction === "save"
+      ? "saving"
+      : (input.localSaveState ?? "idle");
+
   let localText = "本機已儲存";
   let localTone: ProjectToolbarStatusView["toneClass"] | null = null;
   let localSpin = false;
 
-  if (input.busyAction === "save" || input.localSaveState === "saving") {
-    localText = "儲存中";
-    localTone = "is-syncing";
-    localSpin = true;
-  } else if (input.localSaveState === "error") {
-    localText = "儲存失敗";
-    localTone = "is-error";
+  switch (effectiveLocalState) {
+    case "saving":
+      localText = "儲存中";
+      localTone = "is-syncing";
+      localSpin = true;
+      break;
+    case "error":
+      localText = "本機儲存失敗";
+      localTone = "is-error";
+      break;
+    case "dirty":
+      localText = "本機有未儲存變更";
+      localTone = "is-dirty";
+      break;
+    case "idle":
+      localText = "本機尚未確認保存";
+      localTone = "is-warn";
+      break;
+    case "saved":
+      localText = "本機已儲存";
+      localTone = null;
+      break;
   }
 
   if (activeProject.storageProvider === "local") {
-    if (localSpin) {
-      return {
-        text: "儲存中…",
-        toneClass: "is-syncing",
-        spinning: true,
-        tooltip: "正在保存本機專案至 IndexedDB",
-      };
+    switch (effectiveLocalState) {
+      case "saving":
+        return {
+          text: "儲存中…",
+          toneClass: "is-syncing",
+          spinning: true,
+          tooltip: "正在保存本機專案至 IndexedDB",
+        };
+      case "error":
+        return {
+          text: "儲存失敗",
+          toneClass: "is-error",
+          spinning: false,
+          tooltip: "寫入本機資料庫失敗，請稍後重試「儲存」",
+        };
+      case "dirty":
+        return {
+          text: "尚未儲存變更 · 僅存於本機",
+          toneClass: "is-dirty",
+          spinning: false,
+          tooltip: "有尚未寫入本機資料庫的修改（等待自動保存中），點擊「儲存」可立即寫入",
+        };
+      case "idle":
+        return {
+          text: "尚未確認保存 · 僅存於本機",
+          toneClass: "is-warn",
+          spinning: false,
+          tooltip: "尚未確認目前變更已寫入本機資料庫，點擊「儲存」可確認保存",
+        };
+      case "saved":
+        return {
+          text: "本機已儲存 · 僅存於本機",
+          toneClass: "is-local",
+          spinning: false,
+          tooltip: "專案設定已儲存於本機 IndexedDB；點擊「同步」可設定 Google Drive 同步",
+        };
     }
-    if (localTone === "is-error") {
-      return {
-        text: "儲存失敗",
-        toneClass: "is-error",
-        spinning: false,
-        tooltip: "寫入本機資料庫失敗，請稍後再試",
-      };
-    }
-    return {
-      text: "本機已儲存 · 僅存於本機",
-      toneClass: "is-local",
-      spinning: false,
-      tooltip: "專案設定已儲存於本機 IndexedDB；點擊「同步」可設定 Google Drive 同步",
-    };
   }
 
   let cloudText = "尚未同步";
@@ -212,11 +247,35 @@ export function resolveProjectToolbarStatus(
   }
 
   const text = `${localText} · ${cloudText}`;
+  let toneClass: ProjectToolbarStatusView["toneClass"];
+  if (localTone === "is-error" || cloudTone === "is-error") {
+    toneClass = "is-error";
+  } else if (localSpin || cloudSpin) {
+    toneClass = "is-syncing";
+  } else if (cloudTone === "is-conflict") {
+    toneClass = "is-conflict";
+  } else if (localTone === "is-dirty") {
+    toneClass = "is-dirty";
+  } else if (cloudTone === "is-warn" || localTone === "is-warn") {
+    toneClass = "is-warn";
+  } else if (cloudTone === "is-dirty") {
+    toneClass = "is-dirty";
+  } else if (cloudTone === "is-synced" && effectiveLocalState === "saved") {
+    toneClass = "is-synced";
+  } else {
+    toneClass = "is-local";
+  }
+
+  const tooltip =
+    effectiveLocalState === "error"
+      ? "寫入本機資料庫失敗，請重試「儲存」"
+      : activeProject.lastError || text;
+
   return {
     text,
-    toneClass: localTone ?? cloudTone,
+    toneClass,
     spinning: localSpin || cloudSpin,
-    tooltip: activeProject.lastError || text,
+    tooltip,
   };
 }
 

@@ -31,6 +31,7 @@ import {
   generateRevisionToken,
   validateProjectDocument,
 } from "./projectModel.ts";
+import type { LocalSaveState } from "./projectToolbarModel.ts";
 import type {
   BandProject,
   PendingProjectRevisionPublish,
@@ -82,6 +83,7 @@ export type ProjectDriveSyncOutcome =
       record: PersistedProjectRecord;
       retryable: boolean;
       errorMessage: string;
+      localSaveFailed?: boolean;
     };
 
 function buildSafeProjectDocumentForCloud(
@@ -1514,6 +1516,8 @@ export function buildProjectListSummary(
 
 export type ProjectAutoSyncStatusEvent =
   | ProjectDriveSyncOutcome
+  | { status: "local_dirty"; localRevision: number }
+  | { status: "local_saving"; localRevision: number }
   | { status: "local_saved"; record: PersistedProjectRecord }
   | { status: "local_save_error"; record: PersistedProjectRecord; errorMessage: string };
 
@@ -1550,6 +1554,7 @@ interface ProjectLocalWriteSlot {
   deleted: boolean;
   suppressUi: boolean;
   lastFlushFailedReason: string | null;
+  lastFailedRecord: PersistedProjectRecord | null;
 }
 
 interface ProjectCloudSyncSlot {
@@ -1576,6 +1581,7 @@ export class ProjectAutoSyncController {
   private readonly timer: AutoSyncTimerAdapter;
   private readonly localSlots = new Map<string, ProjectLocalWriteSlot>();
   private readonly cloudSlots = new Map<string, ProjectCloudSyncSlot>();
+  private readonly localSaveStates = new Map<string, LocalSaveState>();
   private readonly localDebounceMs: number;
   private readonly manualSyncReserved = new Set<string>();
   private operationSeq = 0;
@@ -1593,6 +1599,31 @@ export class ProjectAutoSyncController {
     };
   }
 
+  hasPendingLocalEdits(projectId: string): boolean {
+    const slot = this.localSlots.get(projectId);
+    if (!slot || slot.deleted) return false;
+    return (
+      slot.localTimer !== null ||
+      slot.pendingRecord !== null ||
+      slot.inFlightFlush !== null ||
+      slot.lastFailedRecord !== null
+    );
+  }
+
+  getLocalSaveState(projectId: string): LocalSaveState {
+    if (!projectId) return "idle";
+    return this.localSaveStates.get(projectId) ?? "idle";
+  }
+
+  setProjectLocalSaveState(projectId: string, state: LocalSaveState): void {
+    if (!projectId) return;
+    if (state === "idle") {
+      this.localSaveStates.delete(projectId);
+    } else {
+      this.localSaveStates.set(projectId, state);
+    }
+  }
+
   private getOrCreateLocalSlot(projectId: string, ownerAccountId: string): ProjectLocalWriteSlot {
     let slot = this.localSlots.get(projectId);
     if (!slot) {
@@ -1606,6 +1637,7 @@ export class ProjectAutoSyncController {
         deleted: false,
         suppressUi: false,
         lastFlushFailedReason: null,
+        lastFailedRecord: null,
       };
       this.localSlots.set(projectId, slot);
     } else if (ownerAccountId && slot.ownerAccountId !== ownerAccountId) {
@@ -1652,6 +1684,15 @@ export class ProjectAutoSyncController {
         const suppressUi = forceSuppressUi || slot.suppressUi || slot.pendingSuppressUi;
         slot.pendingRecord = null;
         slot.pendingSuppressUi = false;
+        slot.lastFailedRecord = null;
+
+        this.localSaveStates.set(slot.projectId, "saving");
+        if (!suppressUi && !slot.suppressUi) {
+          this.deps.onStatusChanged?.(slot.projectId, {
+            status: "local_saving",
+            localRevision: target.localRevision,
+          });
+        }
 
         let savedOk = false;
         let savedRecord = target;
@@ -1683,6 +1724,8 @@ export class ProjectAutoSyncController {
         if (slot.deleted || blockedReason === "project_deleted") {
           slot.deleted = true;
           slot.pendingRecord = null;
+          slot.lastFailedRecord = null;
+          this.localSaveStates.delete(slot.projectId);
           if (this.localSlots.get(slot.projectId) === slot) {
             this.localSlots.delete(slot.projectId);
           }
@@ -1691,6 +1734,10 @@ export class ProjectAutoSyncController {
 
         if (!savedOk && blockedReason !== "stale_revision") {
           slot.lastFlushFailedReason = errorMessage ?? "寫入本機資料庫失敗。";
+          if (!slot.pendingRecord) {
+            slot.lastFailedRecord = target;
+            this.localSaveStates.set(slot.projectId, "error");
+          }
           if (!suppressUi) {
             this.deps.onStatusChanged?.(slot.projectId, {
               status: "local_save_error",
@@ -1701,11 +1748,16 @@ export class ProjectAutoSyncController {
           return;
         }
 
-        if (savedOk && !suppressUi && !slot.suppressUi) {
-          this.deps.onStatusChanged?.(slot.projectId, {
-            status: "local_saved",
-            record: savedRecord,
-          });
+        slot.lastFailedRecord = null;
+        slot.lastFlushFailedReason = null;
+        if (!slot.pendingRecord && slot.localTimer === null) {
+          this.localSaveStates.set(slot.projectId, "saved");
+          if (savedOk && !suppressUi && !slot.suppressUi) {
+            this.deps.onStatusChanged?.(slot.projectId, {
+              status: "local_saved",
+              record: savedRecord,
+            });
+          }
         }
       }
     })().finally(() => {
@@ -1715,10 +1767,12 @@ export class ProjectAutoSyncController {
       if (
         !slot.deleted &&
         !slot.pendingRecord &&
+        !slot.lastFlushFailedReason &&
+        !slot.lastFailedRecord &&
         slot.localTimer === null &&
         this.localSlots.get(slot.projectId) === slot
       ) {
-        // 清理已完全寫畢之空插槽（保留 tombstone/帳號隔離標記不需要長期駐留）
+        // 清理已完全寫畢之空插槽（失敗狀態保留至重試或專案切換）
         this.localSlots.delete(slot.projectId);
       }
     });
@@ -1747,6 +1801,8 @@ export class ProjectAutoSyncController {
       localSlot.pendingSuppressUi = false;
       localSlot.suppressUi = false;
       localSlot.ownerAccountId = record.ownerAccountId;
+      localSlot.lastFlushFailedReason = null;
+      localSlot.lastFailedRecord = null;
     }
 
     if (localSlot.localTimer !== null) {
@@ -1755,8 +1811,14 @@ export class ProjectAutoSyncController {
     }
 
     if (options?.immediateLocal) {
+      this.localSaveStates.set(record.projectId, "saving");
       void this.runSerializedLocalFlush(localSlot);
     } else {
+      this.localSaveStates.set(record.projectId, "dirty");
+      this.deps.onStatusChanged?.(record.projectId, {
+        status: "local_dirty",
+        localRevision: record.localRevision,
+      });
       localSlot.localTimer = this.timer.setTimeout(() => {
         localSlot.localTimer = null;
         void this.runSerializedLocalFlush(localSlot);
@@ -1780,6 +1842,9 @@ export class ProjectAutoSyncController {
       if (slot.localTimer !== null) {
         this.timer.clearTimeout(slot.localTimer);
         slot.localTimer = null;
+      }
+      if (!slot.pendingRecord && slot.lastFailedRecord) {
+        slot.pendingRecord = slot.lastFailedRecord;
       }
       if (slot.pendingRecord || slot.inFlightFlush) {
         if (options?.suppressStatusCallback) {
@@ -1823,15 +1888,25 @@ export class ProjectAutoSyncController {
       if (!slot.pendingRecord || latest.localRevision >= slot.pendingRecord.localRevision) {
         slot.pendingRecord = latest;
         slot.ownerAccountId = latest.ownerAccountId;
+        slot.lastFlushFailedReason = null;
+        slot.lastFailedRecord = null;
       }
       slot.suppressUi = false;
     }
     const res = await this.flushLocalSaves({ projectId, suppressStatusCallback: true });
     const failure = res.failed.find((f) => f.projectId === projectId);
     if (failure) {
+      this.localSaveStates.set(projectId, "error");
       return { ok: false, errorMessage: failure.reason };
     }
     const record = await getProjectRecord(projectId).catch(() => null);
+    if (!record) {
+      this.localSaveStates.set(projectId, "error");
+      return { ok: false, errorMessage: "無法確認專案已保存於本機 IndexedDB。" };
+    }
+    if (!this.hasPendingLocalEdits(projectId)) {
+      this.localSaveStates.set(projectId, "saved");
+    }
     return { ok: true, record };
   }
 
@@ -1896,13 +1971,23 @@ export class ProjectAutoSyncController {
     const flushRes = await this.flushLocalSaves({ projectId, suppressStatusCallback: true });
     const flushFailure = flushRes.failed.find((f) => f.projectId === projectId);
     if (flushFailure) {
+      this.localSaveStates.set(projectId, "error");
       const failedRec = await getProjectRecord(projectId).catch(() => null);
       const msg = `本機保存失敗，未開始雲端同步：${flushFailure.reason}`;
       if (!failedRec) return { status: "cancelled", reason: msg };
-      return { status: "error", record: failedRec, retryable: false, errorMessage: msg };
+      return {
+        status: "error",
+        record: failedRec,
+        retryable: false,
+        localSaveFailed: true,
+        errorMessage: msg,
+      };
     }
 
     const latestFromDb = await getProjectRecord(projectId);
+    if (latestFromDb && !this.hasPendingLocalEdits(projectId)) {
+      this.localSaveStates.set(projectId, "saved");
+    }
     const localSlotPending = this.localSlots.get(projectId)?.pendingRecord ?? null;
     const current = latestFromDb ?? localSlotPending;
     if (!current || current.storageProvider !== "google_drive" || !current.ownerAccountId) {
@@ -2027,7 +2112,15 @@ export class ProjectAutoSyncController {
           isGenerationValid: (g, a) => !isInvalidated() && auth.isGenerationValid(g, a),
           forceReplaceRemote: options?.forceReplaceRemote,
           onBeforeCommit: async () => {
-            await this.flushLocalSaves({ projectId, suppressStatusCallback: true });
+            const beforeRes = await this.flushLocalSaves({
+              projectId,
+              suppressStatusCallback: true,
+            });
+            if (beforeRes.failed.some((f) => f.projectId === projectId)) {
+              this.localSaveStates.set(projectId, "error");
+            } else if (!this.hasPendingLocalEdits(projectId)) {
+              this.localSaveStates.set(projectId, "saved");
+            }
           },
           signal: controller.signal,
         });
@@ -2176,6 +2269,7 @@ export class ProjectAutoSyncController {
     projectId: string,
     options?: { discardPendingLocal?: boolean },
   ): Promise<void> {
+    this.localSaveStates.delete(projectId);
     const cloudSlot = this.cloudSlots.get(projectId);
     if (cloudSlot) {
       this.cancelCloudSlot(cloudSlot);
@@ -2191,6 +2285,7 @@ export class ProjectAutoSyncController {
       // 主動刪除專案情境：放棄尚未寫入之暫存並停止後續本機寫入，遵守 tombstone
       localSlot.deleted = true;
       localSlot.pendingRecord = null;
+      localSlot.lastFailedRecord = null;
       if (localSlot.localTimer !== null) {
         this.timer.clearTimeout(localSlot.localTimer);
         localSlot.localTimer = null;
@@ -2205,7 +2300,9 @@ export class ProjectAutoSyncController {
     return this.flushLocalSaves({
       projectId,
       suppressStatusCallback: true,
-    }).then(() => undefined);
+    }).then(() => {
+      this.localSaveStates.delete(projectId);
+    });
   }
 
   invalidateAccount(accountId: string | null | undefined): Promise<void> {
@@ -2221,6 +2318,7 @@ export class ProjectAutoSyncController {
       if (localSlot.ownerAccountId === accountId) {
         localSlot.suppressUi = true;
         localSlot.pendingSuppressUi = true;
+        this.localSaveStates.delete(localSlot.projectId);
       }
     }
 
@@ -2231,6 +2329,7 @@ export class ProjectAutoSyncController {
   }
 
   dispose(): Promise<void> {
+    this.localSaveStates.clear();
     for (const [projectId, cloudSlot] of this.cloudSlots.entries()) {
       this.cancelCloudSlot(cloudSlot);
       this.cloudSlots.delete(projectId);

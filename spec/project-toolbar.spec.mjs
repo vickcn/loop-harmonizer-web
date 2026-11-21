@@ -4,23 +4,28 @@ import fs from "node:fs";
 import path from "node:path";
 import { createBandSong } from "../lib/band/songModel.ts";
 import { DRIVE_FOLDER_MIME_TYPE } from "../lib/google/driveClient.ts";
+import { GoogleAccountManager } from "../lib/google/googleAccountManager.ts";
 import { clearCachedFolderLayoutForAccount } from "../lib/google/driveFolderManager.ts";
 import {
   ProjectAutoSyncController,
   saveProjectToDrive,
 } from "../lib/projects/projectDriveSync.ts";
 import {
+  SaveAsPersistenceError,
   createNewProject,
   deleteProjectSafely,
   migrateLegacyBandSessionToProject,
+  prepareAndSaveProjectAs,
   saveLocalProjectSnapshot,
   saveProjectAs,
+  verifySongsForProjectSaveAs,
 } from "../lib/projects/projectManager.ts";
 import {
   buildProjectFromBandSongs,
   createEmptyProject,
   createInitialPersistedProjectRecord,
 } from "../lib/projects/projectModel.ts";
+import { ProjectManualSyncCoordinator } from "../lib/projects/projectSyncCoordinator.ts";
 import {
   buildDeleteProjectConfirmConfig,
   resolveProjectManagerActionGroups,
@@ -32,11 +37,24 @@ import {
 import {
   configureInMemoryIdbForTests,
   idbGetAll,
+  idbPut,
   resetInMemoryIdbForTests,
+  setInMemoryIdbHooksForTests,
+  withIdbTransaction,
 } from "../lib/storage/indexedDb.ts";
-import { getProjectRecord, saveProjectRecord } from "../lib/storage/projectStore.ts";
+import {
+  getActiveProjectId,
+  getProjectRecord,
+  saveProjectRecord,
+} from "../lib/storage/projectStore.ts";
 import { hashSourceAudio } from "../lib/storage/separationCache.ts";
-import { saveSongWithAudioFile } from "../lib/storage/songSessionStore.ts";
+import {
+  flushPendingSongPersists,
+  resetPendingSongPersistsForTests,
+  saveSongStateRecord,
+  saveSongWithAudioFile,
+  scheduleSongPersist,
+} from "../lib/storage/songSessionStore.ts";
 
 function createDriveMockServer() {
   let nextId = 1;
@@ -695,6 +713,962 @@ test("7 & 8 & 9. Save without active project guides creation/preserves songs, le
     await saveLocalProjectSnapshot({ projectId: freshLocal.projectId, songs: [legacySong] });
     assert.equal((await getProjectRecord(freshLocal.projectId)).project.songs.length, 1);
   } finally {
+    resetPendingSongPersistsForTests();
     resetInMemoryIdbForTests();
   }
+});
+
+function createDeferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+test("P1 (Save-As Fail-Closed): song persist failures & missing local audio block save-as without wiping session/stems/checkpoints, while Drive-backed sources stay recoverable", async () => {
+  configureInMemoryIdbForTests();
+  resetPendingSongPersistsForTests();
+  clearCachedFolderLayoutForAccount();
+  try {
+    const audioBytes = new Uint8Array([9, 8, 7, 6, 5, 4]);
+    const audioBlob = new Blob([audioBytes], { type: "audio/wav" });
+    const localHash = await hashSourceAudio(audioBlob);
+
+    const localSong = {
+      ...createBandSong({
+        id: "song_saveas_local",
+        name: "Praise Song Local",
+        fileName: "praise.wav",
+        sourceAudioId: "song_saveas_local_original",
+        settingsKey: "k-praise-local",
+        originalBpm: 120,
+        sourceAudioHash: localHash,
+        durationSec: 120,
+        persistenceStatus: "saved",
+      }),
+      targetBpm: 126,
+      separationStatus: "completed",
+      separationMode: "four_stem",
+      separationTaskId: "task_keep_1",
+      cacheKey: `cache_${localHash}`,
+    };
+
+    const saveAudioRes = await saveSongWithAudioFile({
+      song: localSong,
+      file: audioBlob,
+      sourceAudioHash: localHash,
+    });
+    assert.equal(saveAudioRes.ok, true);
+    const syncedLocalSong = {
+      ...localSong,
+      revision: saveAudioRes.record.revision,
+    };
+
+    // 模擬原工作階段已經有完成的 Checkpoint 與作用中原始專案
+    await idbPut("separationCheckpoints", {
+      key: "task_keep_1",
+      taskId: "task_keep_1",
+      songId: localSong.id,
+      sourceAudioHash: localHash,
+      status: "completed",
+    });
+    const { record: originProject } = await createNewProject({
+      name: "原始基準專案",
+      storageProvider: "local",
+      setActive: true,
+    });
+    const projectsBeforeSaveAsFail = (await idbGetAll("projects")).length;
+
+    // 1. 歌曲保存成功後（含等待中的 pending persist 與 in-flight audio）可以另存新專案
+    let currentSongRef = { ...syncedLocalSong, targetBpm: 130 };
+    scheduleSongPersist(
+      currentSongRef.id,
+      () => currentSongRef,
+      (_id, res) => {
+        if (res.ok) {
+          currentSongRef = { ...currentSongRef, revision: res.record.revision };
+        }
+      },
+      500,
+    );
+    const { record: validClone, readiness: okReadiness } = await prepareAndSaveProjectAs({
+      sourceProject: originProject.project,
+      currentSongs: [currentSongRef],
+      name: "歌曲完成保存之副本",
+      storageProvider: "local",
+      setActive: false,
+    });
+    assert.equal(okReadiness.ok, true);
+    assert.equal(validClone.project.songs.length, 1);
+    assert.equal(validClone.project.songs[0].settings.targetBpm, 130);
+    assert.equal((await idbGetAll("songs")).find((s) => s.songId === currentSongRef.id)?.targetBpm, 130);
+
+    // 2a. 歌曲持久化失敗（flushPendingSongPersists 遇到 IDB QuotaExceededError）不得回報成功且停止另存
+    const editedFailSong = { ...currentSongRef, targetBpm: 140 };
+    let persistUiErrorObserved = "";
+    scheduleSongPersist(
+      editedFailSong.id,
+      () => editedFailSong,
+      (_id, res) => {
+        if (!res.ok && res.reason === "error") {
+          persistUiErrorObserved = res.message;
+        }
+      },
+      500,
+    );
+    setInMemoryIdbHooksForTests({
+      beforeWrite(store) {
+        if (store === "songs") {
+          throw new DOMException("quota exceeded", "QuotaExceededError");
+        }
+      },
+    });
+    await assert.rejects(
+      prepareAndSaveProjectAs({
+        sourceProject: originProject.project,
+        currentSongs: [editedFailSong],
+        name: "配額失敗不應建立專案",
+        storageProvider: "local",
+        setActive: true,
+      }),
+      (err) => {
+        assert.equal(err instanceof SaveAsPersistenceError, true);
+        assert.match(err.message, /Praise Song Local/);
+        assert.match(err.message, /儲存空間不足/);
+        return true;
+      },
+    );
+    assert.match(persistUiErrorObserved, /儲存空間不足/);
+
+    // 2b. 即便 debounce 計時器已觸發進入 in-flight、IDB 交易尚未 settle 時立即另存，仍須等待並 Fail Closed
+    const txHoldDef = createDeferred();
+    const holdingTx = withIdbTransaction(["songs"], "readonly", () => txHoldDef.promise);
+    scheduleSongPersist(
+      editedFailSong.id,
+      () => editedFailSong,
+      () => undefined,
+      0,
+    );
+    await new Promise((r) => setTimeout(r, 5)); // 讓 timer 觸發並卡在 inFlightSongPersists 等待 IDB 鎖定
+    setInMemoryIdbHooksForTests({
+      beforeWrite(store) {
+        if (store === "songs") {
+          throw new Error("Transient IDB IO Failure");
+        }
+      },
+    });
+    const inFlightFlushPromise = flushPendingSongPersists();
+    txHoldDef.resolve();
+    await holdingTx;
+    const inFlightFlushRes = await inFlightFlushPromise;
+    assert.equal(inFlightFlushRes.ok, false);
+    assert.equal(inFlightFlushRes.failed.length, 1);
+    assert.match(inFlightFlushRes.failed[0].message, /Transient IDB IO Failure/);
+
+    // 清除 IDB 寫入錯誤，改測歌曲與音檔各種失敗情境
+    setInMemoryIdbHooksForTests({});
+
+    // 2c. 歌曲狀態本身已是 persistenceStatus === "error" 或缺少本機 audioFiles
+    const missingAudioSong = createBandSong({
+      id: "song_missing_local_blob",
+      name: "Missing Blob Track",
+      fileName: "missing.wav",
+      sourceAudioId: "song_missing_local_blob_original",
+      originalBpm: 100,
+      sourceAudioHash: "deadbeef".repeat(8),
+      durationSec: 60,
+      persistenceStatus: "saved",
+    });
+    await assert.rejects(
+      prepareAndSaveProjectAs({
+        sourceProject: originProject.project,
+        currentSongs: [currentSongRef, missingAudioSong],
+        name: "缺音檔不應建立專案",
+        storageProvider: "local",
+        setActive: true,
+      }),
+      (err) => {
+        assert.equal(err instanceof SaveAsPersistenceError, true);
+        assert.equal(err.failedSongs.length, 1);
+        assert.equal(err.failedSongs[0].code, "audio_not_persisted");
+        assert.match(err.message, /Missing Blob Track/);
+        return true;
+      },
+    );
+
+    // 3. 保存失敗後，原本工作階段、歌曲、Checkpoint 與 active-project 均完整保留且不受影響
+    assert.equal(await getActiveProjectId(), originProject.projectId);
+    const allProjectsAfterFails = await idbGetAll("projects");
+    assert.equal(allProjectsAfterFails.length, projectsBeforeSaveAsFail + 1); // 僅有第 1 步成功建立的 validClone
+    assert.equal(allProjectsAfterFails.some((p) => p.project.name === "配額失敗不應建立專案"), false);
+    assert.equal(allProjectsAfterFails.some((p) => p.project.name === "缺音檔不應建立專案"), false);
+    assert.equal((await idbGetAll("audioFiles")).length, 1);
+    assert.equal((await idbGetAll("separationCheckpoints")).length, 1);
+    assert.equal((await idbGetAll("songs")).length, 1);
+
+    // 修正錯誤狀態後（移除破損歌曲或寫入對應編輯），允許使用者直接重試並成功另存
+    const retriedSaveAs = await prepareAndSaveProjectAs({
+      sourceProject: originProject.project,
+      currentSongs: [editedFailSong],
+      name: "排除錯誤後重試成功",
+      storageProvider: "local",
+      setActive: true,
+    });
+    assert.equal(retriedSaveAs.readiness.ok, true);
+    assert.equal(retriedSaveAs.record.project.name, "排除錯誤後重試成功");
+
+    // 4. Google Drive 來源音檔（無本機 audioFiles Blob，但可依授權從雲端按需下載）允許直接另存
+    const drivePickerSong = createBandSong({
+      id: "song_drive_picker",
+      name: "Cloud Worship Stem",
+      fileName: "cloud-worship.mp3",
+      sourceAudioId: "song_drive_picker_original",
+      originalBpm: 92,
+      sourceAudioHash: "c".repeat(64),
+      durationSec: 210,
+      persistenceStatus: "saved",
+      source: {
+        provider: "google_drive",
+        fileId: "drive_file_audio_01",
+        authorizedAccountId: "google:user-a",
+        fileName: "cloud-worship.mp3",
+        mimeType: "audio/mpeg",
+        sourceAudioHash: "c".repeat(64),
+      },
+      availabilityState: "cloud_not_downloaded",
+    });
+    const backupDrivenSong = createBandSong({
+      id: "song_drive_backup_only",
+      name: "Cloud Backup Song",
+      fileName: "backup.mp3",
+      sourceAudioId: "song_drive_backup_only_original",
+      originalBpm: 105,
+      sourceAudioHash: "d".repeat(64),
+      durationSec: 180,
+      persistenceStatus: "saved",
+      source: { provider: "local" },
+      originalBackup: {
+        driveFileId: "drive_backup_file_02",
+        ownerAccountId: "google:user-a",
+        fileName: "backup.mp3",
+        mimeType: "audio/mpeg",
+        sizeBytes: 123456,
+        sourceAudioHash: "d".repeat(64),
+        backedUpAt: new Date().toISOString(),
+      },
+      availabilityState: "cloud_not_downloaded",
+    });
+    const driveReadiness = await verifySongsForProjectSaveAs([
+      editedFailSong,
+      drivePickerSong,
+      backupDrivenSong,
+    ]);
+    assert.equal(driveReadiness.ok, true);
+    assert.equal(driveReadiness.verifiedCount, 3);
+    assert.equal(driveReadiness.cloudBackedCount, 2);
+
+    const saveWithCloudRes = await prepareAndSaveProjectAs({
+      sourceProject: originProject.project,
+      currentSongs: [editedFailSong, drivePickerSong, backupDrivenSong],
+      name: "混合本機與雲端來源專案",
+      storageProvider: "local",
+      setActive: false,
+    });
+    assert.equal(saveWithCloudRes.record.project.songs.length, 3);
+  } finally {
+    setInMemoryIdbHooksForTests({});
+    resetPendingSongPersistsForTests();
+    clearCachedFolderLayoutForAccount();
+    resetInMemoryIdbForTests();
+  }
+});
+
+test("P1 (Auth-First Sync Coordinator): handles unauth sign-in, expired reauth, cancel, project/account switch, rapid clicks & local-flush before Drive", async () => {
+  configureInMemoryIdbForTests();
+  clearCachedFolderLayoutForAccount();
+  try {
+    const server = createDriveMockServer();
+    let nowMs = 1_000_000;
+    const events = [];
+
+    let nextPopupBehavior = async () => ({
+      accessToken: "token-user-a-1",
+      expiresInSec: 3600,
+      grantedScopes: ["https://www.googleapis.com/auth/drive.file", "openid", "profile", "email"],
+    });
+    let currentUserSub = "user-a";
+    let currentUserEmail = "a@example.com";
+
+    const accountManager = new GoogleAccountManager({
+      now: () => nowMs,
+      getConfigStatus: () => ({
+        configured: true,
+        clientId: "test-client",
+        apiKey: "test-key",
+        appId: "test-app",
+        missingFields: [],
+        message: null,
+      }),
+      ensureSdkLoaded: async () => undefined,
+      getSdkReadiness: () => "ready",
+      requestAccessToken: async (_clientId, opts) => {
+        events.push(`popup:${opts?.prompt ?? "default"}`);
+        return nextPopupBehavior();
+      },
+      fetchImpl: async (url) => {
+        if (String(url).includes("oauth2/v3/userinfo")) {
+          return new Response(
+            JSON.stringify({ sub: currentUserSub, email: currentUserEmail, name: currentUserSub }),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify({ user: { permissionId: `perm-${currentUserSub}` } }), {
+          status: 200,
+        });
+      },
+    });
+
+    const song = createBandSong({
+      id: "sync_s1",
+      projectEntryId: "sync_s1",
+      name: "Coord Song",
+      fileName: "coord.mp3",
+      sourceAudioId: "sync_s1_original",
+      settingsKey: "k-coord-1",
+      originalBpm: 120,
+      sourceAudioHash: "e".repeat(64),
+      durationSec: 150,
+    });
+
+    let projA = createInitialPersistedProjectRecord(
+      createEmptyProject({
+        name: "Sync Proj A",
+        storageProvider: "google_drive",
+        ownerAccountId: "google:user-a",
+      }),
+      { dirty: true, syncStatus: "dirty" },
+    );
+    let projB = createInitialPersistedProjectRecord(
+      createEmptyProject({
+        name: "Sync Proj B",
+        storageProvider: "google_drive",
+        ownerAccountId: "google:user-a",
+      }),
+      { dirty: true, syncStatus: "dirty" },
+    );
+    await saveProjectRecord(projA);
+    await saveProjectRecord(projB);
+
+    let activeProject = projA;
+    let busyAction = null;
+    const localStatesByProject = new Map();
+    const localStateHistory = [];
+
+    let syncPatchGate = null;
+    const wrappedDriveFetch = async (url, init) => {
+      if ((init?.method ?? "GET").toUpperCase() !== "GET") {
+        events.push(`drive_write:${activeProject?.projectId ?? "none"}`);
+      }
+      if (syncPatchGate && String(init?.method ?? "").toUpperCase() === "POST" && String(url).includes("/upload/drive/v3/files")) {
+        const gate = syncPatchGate;
+        syncPatchGate = null;
+        await gate.promise;
+      }
+      return server.fetchImpl(url, init);
+    };
+
+    const ctrl = new ProjectAutoSyncController({
+      localDebounceMs: 40,
+      retryBackoffMs: [5],
+      maxRetries: 0,
+      getAuthContext: () => {
+        const snap = accountManager.getSnapshot();
+        const tok = snap.account
+          ? accountManager.getValidAccessToken(snap.account.accountId)
+          : null;
+        return {
+          accountId: snap.account?.accountId ?? null,
+          accessToken: tok,
+          generation: snap.generation,
+          isGenerationValid: (g, a) => accountManager.isGenerationValid(g, a),
+          onAuthExpired: () => accountManager.markTokenExpired(snap.generation),
+        };
+      },
+      syncDriveFn: async (p) => {
+        events.push(`drive_sync:${p.record.projectId}`);
+        return saveProjectToDrive({ ...p, fetchImpl: wrappedDriveFetch });
+      },
+      onStatusChanged: (pid, outcome) => {
+        if (outcome.status === "local_dirty") {
+          localStatesByProject.set(pid, "dirty");
+          localStateHistory.push(`${pid}:dirty`);
+        } else if (outcome.status === "local_saving") {
+          localStatesByProject.set(pid, "saving");
+          localStateHistory.push(`${pid}:saving`);
+        } else if (outcome.status === "local_saved") {
+          localStatesByProject.set(pid, "saved");
+          localStateHistory.push(`${pid}:saved`);
+        } else if (outcome.status === "local_save_error") {
+          localStatesByProject.set(pid, "error");
+          localStateHistory.push(`${pid}:error`);
+        }
+        if ("record" in outcome && outcome.record && activeProject?.projectId === pid) {
+          activeProject = outcome.record;
+        }
+      },
+    });
+
+    const coordinator = new ProjectManualSyncCoordinator({
+      getActiveProject: () => activeProject,
+      getSongCount: () => 1,
+      getHasLegacySongs: () => false,
+      isGoogleConfigured: () => true,
+      getExternalBusyAction: () => (busyAction && busyAction !== "sync" ? busyAction : null),
+      getAuthSnapshot: () => {
+        const snap = accountManager.getSnapshot();
+        const tok = snap.account
+          ? accountManager.getValidAccessToken(snap.account.accountId)
+          : null;
+        return {
+          accountId: snap.account?.accountId ?? null,
+          accessToken: tok,
+          generation: snap.generation,
+        };
+      },
+      getSyncController: () => ctrl,
+      signInGoogle: async () => {
+        events.push("call:signIn");
+        const after = await accountManager.signIn();
+        return {
+          accountId: after.account?.accountId ?? null,
+          accessToken: after.account
+            ? accountManager.getValidAccessToken(after.account.accountId)
+            : null,
+          generation: after.generation,
+        };
+      },
+      reauthorizeGoogle: async () => {
+        events.push("call:reauthorize");
+        const after = await accountManager.reauthorize();
+        return {
+          accountId: after.account?.accountId ?? null,
+          accessToken: after.account
+            ? accountManager.getValidAccessToken(after.account.accountId)
+            : null,
+          generation: after.generation,
+        };
+      },
+      captureLatestSnapshot: () => undefined,
+      onBusyChange: (b) => {
+        busyAction = b?.action ?? null;
+      },
+      onLocalSaveStateChange: (pid, state) => {
+        localStatesByProject.set(pid, state);
+        localStateHistory.push(`${pid}:${state}`);
+      },
+      onFreshRecordLoaded: (rec) => {
+        if (activeProject?.projectId === rec.projectId) {
+          activeProject = rec;
+        }
+      },
+    });
+
+    // 7. 使用者取消 Google 授權後：直接停在授權階段，絕不先呼叫 syncProjectManually
+    nextPopupBehavior = async () => {
+      throw new Error("使用者已取消 Google 授權視窗。");
+    };
+    const cancelRes = await coordinator.requestSync();
+    assert.equal(cancelRes.kind, "auth_cancelled");
+    assert.equal(events.some((e) => e.startsWith("drive_sync")), false);
+    assert.equal(server.writeRequests.length, 0);
+    assert.equal((await getProjectRecord(projA.projectId))?.syncStatus, "dirty");
+
+    // 5. Google 未登入時：點擊同步直接先啟動 signIn，登入成功通過檢查後再同步
+    events.length = 0;
+    nextPopupBehavior = async () => ({
+      accessToken: "token-user-a-1",
+      expiresInSec: 3600,
+      grantedScopes: ["https://www.googleapis.com/auth/drive.file", "openid", "profile", "email"],
+    });
+    const signInSyncRes = await coordinator.requestSync();
+    assert.equal(signInSyncRes.kind, "synced_outcome");
+    assert.equal(signInSyncRes.outcome?.status, "synced");
+    assert.equal(signInSyncRes.localSaveFailed, false);
+    assert.equal(events[0], "call:signIn");
+    assert.equal(events[2], `drive_sync:${projA.projectId}`);
+    projA = await getProjectRecord(projA.projectId);
+    activeProject = projA;
+
+    // 6. Token 過期時：點擊同步直接先啟動 reauthorize，成功續權後再同步
+    accountManager.markTokenExpired();
+    events.length = 0;
+    const dirtyRev2 = {
+      ...projA,
+      localRevision: projA.localRevision + 1,
+      dirty: true,
+      syncStatus: "dirty",
+      project: buildProjectFromBandSongs({
+        existingProject: projA.project,
+        songs: [{ ...song, targetBpm: 132 }],
+        incrementRevision: true,
+      }),
+    };
+    await saveProjectRecord(dirtyRev2);
+    projA = await getProjectRecord(projA.projectId);
+    activeProject = projA;
+    nextPopupBehavior = async () => ({
+      accessToken: "token-user-a-2",
+      expiresInSec: 3600,
+      grantedScopes: ["https://www.googleapis.com/auth/drive.file", "openid", "profile", "email"],
+    });
+    const reauthSyncRes = await coordinator.requestSync();
+    assert.equal(reauthSyncRes.kind, "synced_outcome");
+    assert.equal(reauthSyncRes.outcome?.status, "synced");
+    assert.equal(events[0], "call:reauthorize");
+    assert.equal(events[1], "popup:consent");
+    assert.equal(events[2], `drive_sync:${projA.projectId}`);
+
+    // 8. 授權期間切換專案（即使未主動 invalidate，Coordinator 也透過 live getter 攔截），絕不同步到錯誤專案
+    accountManager.markTokenExpired();
+    const switchPopupDef = createDeferred();
+    nextPopupBehavior = () => switchPopupDef.promise;
+    const writesBeforeSwitch = server.writeRequests.length;
+    const switchSyncPromise = coordinator.requestSync();
+    await new Promise((r) => setTimeout(r, 10));
+    // 模擬使用者在彈窗開啟期間切換到 Proj B
+    activeProject = projB;
+    switchPopupDef.resolve({
+      accessToken: "token-user-a-3",
+      expiresInSec: 3600,
+      grantedScopes: ["https://www.googleapis.com/auth/drive.file", "openid", "profile", "email"],
+    });
+    const switchRes = await switchSyncPromise;
+    assert.equal(switchRes.kind, "aborted");
+    assert.equal(switchRes.reason, "project_switched");
+    assert.equal(server.writeRequests.length, writesBeforeSwitch);
+
+    // 9a. 授權期間切換帳戶（專案 A owner 為 user-a，但彈窗登入 user-b），嚴阻跨帳戶上傳
+    activeProject = projA;
+    accountManager.signOut();
+    currentUserSub = "user-b";
+    currentUserEmail = "b@example.com";
+    nextPopupBehavior = async () => ({
+      accessToken: "token-user-b-1",
+      expiresInSec: 3600,
+      grantedScopes: ["https://www.googleapis.com/auth/drive.file", "openid", "profile", "email"],
+    });
+    const writesBeforeMismatch = server.writeRequests.length;
+    const mismatchRes = await coordinator.requestSync();
+    assert.equal(mismatchRes.kind, "account_mismatch");
+    assert.equal(mismatchRes.expectedAccountId, "google:user-a");
+    assert.equal(mismatchRes.actualAccountId, "google:user-b");
+    assert.equal(server.writeRequests.length, writesBeforeMismatch);
+
+    // 9b. 授權期間原專案被刪除或進入衝突狀態，也不得啟動同步寫入
+    currentUserSub = "user-a";
+    currentUserEmail = "a@example.com";
+    accountManager.signOut();
+    const conflictProj = createInitialPersistedProjectRecord(
+      createEmptyProject({
+        name: "Conflict Check Proj",
+        storageProvider: "google_drive",
+        ownerAccountId: "google:user-a",
+      }),
+      { dirty: true, syncStatus: "dirty" },
+    );
+    await saveProjectRecord(conflictProj);
+    activeProject = conflictProj;
+    const conflictPopupDef = createDeferred();
+    nextPopupBehavior = () => conflictPopupDef.promise;
+    const conflictAuthPromise = coordinator.requestSync();
+    await new Promise((r) => setTimeout(r, 10));
+    await saveProjectRecord({
+      ...conflictProj,
+      syncStatus: "conflict",
+      conflictInfo: {
+        detectedAt: Date.now(),
+        kind: "diverged",
+        localRevision: 1,
+        localRevisionToken: conflictProj.project.revisionToken,
+        localBaseRevision: 1,
+        remoteRevision: 2,
+        remoteRevisionToken: "r2-remote",
+        remoteProjectSnapshot: null,
+        reason: "其他裝置已有較新版本",
+      },
+    });
+    conflictPopupDef.resolve({
+      accessToken: "token-user-a-conflict",
+      expiresInSec: 3600,
+      grantedScopes: ["https://www.googleapis.com/auth/drive.file", "openid", "profile", "email"],
+    });
+    const conflictStopRes = await conflictAuthPromise;
+    assert.equal(conflictStopRes.kind, "open_conflict");
+    assert.equal(server.writeRequests.length, writesBeforeMismatch);
+
+    // 10a. 快速連點同步（授權階段連點 3 次），絕不產生重複授權或重複同步工作
+    activeProject = await getProjectRecord(projA.projectId);
+    accountManager.signOut();
+    const rapidAuthDef = createDeferred();
+    let popupInvokeCount = 0;
+    nextPopupBehavior = () => {
+      popupInvokeCount += 1;
+      return rapidAuthDef.promise;
+    };
+    const r1 = coordinator.requestSync();
+    const r2 = coordinator.requestSync();
+    const r3 = coordinator.requestSync();
+    assert.equal(coordinator.isBusy(), true);
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal(popupInvokeCount, 1);
+    const [res2, res3] = await Promise.all([r2, r3]);
+    assert.equal(res2.kind, "ignored");
+    assert.equal(res3.kind, "ignored");
+    rapidAuthDef.resolve({
+      accessToken: "token-user-a-rapid",
+      expiresInSec: 3600,
+      grantedScopes: ["https://www.googleapis.com/auth/drive.file", "openid", "profile", "email"],
+    });
+    const res1 = await r1;
+    assert.equal(res1.kind, "synced_outcome");
+
+    // 10b. 快速連點同步（雲端上傳進行中連點，及直接使用 syncProjectManually 併發），同一專案絕不產生兩個同步工作
+    const dirtyBeforeMidClick = {
+      ...(await getProjectRecord(projA.projectId)),
+      localRevision: (await getProjectRecord(projA.projectId)).localRevision + 1,
+      dirty: true,
+      syncStatus: "dirty",
+      project: buildProjectFromBandSongs({
+        existingProject: (await getProjectRecord(projA.projectId)).project,
+        songs: [{ ...song, targetBpm: 148 }],
+        incrementRevision: true,
+      }),
+    };
+    await saveProjectRecord(dirtyBeforeMidClick);
+    activeProject = await getProjectRecord(projA.projectId);
+    syncPatchGate = createDeferred();
+    const uploadGateRef = syncPatchGate;
+    const syncCallsBeforeMid = events.filter((e) => e === `drive_sync:${projA.projectId}`).length;
+    const mid1 = coordinator.requestSync();
+    await new Promise((r) => setTimeout(r, 15));
+    const mid2 = coordinator.requestSync();
+    const midDirectCtrl = ctrl.syncProjectManually(projA.projectId);
+    const [mid2Res, midDirectRes] = await Promise.all([mid2, midDirectCtrl]);
+    assert.equal(mid2Res.kind, "ignored");
+    assert.equal(midDirectRes?.status, "cancelled");
+    uploadGateRef.resolve();
+    const mid1Res = await mid1;
+    assert.equal(mid1Res.kind, "synced_outcome");
+    assert.equal(mid1Res.outcome?.status, "synced");
+    assert.equal(
+      events.filter((e) => e === `drive_sync:${projA.projectId}`).length,
+      syncCallsBeforeMid + 1,
+    );
+
+    // 9c. 授權期間原專案在背景被刪除 (tombstone)，授權回來立即中止且不復活/不上傳
+    accountManager.signOut();
+    const delProj = createInitialPersistedProjectRecord(
+      createEmptyProject({
+        name: "Deleted During Auth Proj",
+        storageProvider: "google_drive",
+        ownerAccountId: "google:user-a",
+      }),
+      { dirty: true, syncStatus: "dirty" },
+    );
+    await saveProjectRecord(delProj);
+    activeProject = delProj;
+    const delPopupDef = createDeferred();
+    nextPopupBehavior = () => delPopupDef.promise;
+    const writesBeforeDelAuth = server.writeRequests.length;
+    const delAuthPromise = coordinator.requestSync();
+    await new Promise((r) => setTimeout(r, 10));
+    await deleteProjectSafely({
+      projectId: delProj.projectId,
+      scope: "local_only",
+      autoSyncController: ctrl,
+    });
+    delPopupDef.resolve({
+      accessToken: "token-user-a-del",
+      expiresInSec: 3600,
+      grantedScopes: ["https://www.googleapis.com/auth/drive.file", "openid", "profile", "email"],
+    });
+    const delRes = await delAuthPromise;
+    assert.equal(delRes.kind, "aborted");
+    assert.equal(delRes.reason, "project_deleted");
+    assert.equal(server.writeRequests.length, writesBeforeDelAuth);
+    assert.equal(await getProjectRecord(delProj.projectId), null);
+
+    // 11. 防抖等待中編輯 -> 直接按同步 -> 同步前完成 flush 寫入 IDB 並上傳最新版，且 13. 防抖等待中狀態不誤報已儲存
+    activeProject = await getProjectRecord(projB.projectId);
+    const debouncedEditB = {
+      ...activeProject,
+      localRevision: activeProject.localRevision + 1,
+      dirty: true,
+      syncStatus: "dirty",
+      project: buildProjectFromBandSongs({
+        existingProject: activeProject.project,
+        songs: [{ ...song, targetBpm: 158 }],
+        incrementRevision: true,
+      }),
+    };
+    localStateHistory.length = 0;
+    ctrl.scheduleProjectEdit(debouncedEditB); // 40ms debounce waiting
+    assert.equal(ctrl.hasPendingLocalEdits(projB.projectId), true);
+    assert.equal(ctrl.getLocalSaveState(projB.projectId), "dirty");
+    assert.equal(
+      resolveProjectToolbarStatus({
+        activeProject: debouncedEditB,
+        songCount: 1,
+        hasLegacySongs: false,
+        isGoogleConfigured: true,
+        isGoogleSignedIn: true,
+        hasValidGoogleToken: true,
+        localSaveState: ctrl.getLocalSaveState(projB.projectId),
+      }).text,
+      "本機有未儲存變更 · 尚未同步",
+    );
+
+    const flushAndSyncRes = await coordinator.requestSync();
+    assert.equal(flushAndSyncRes.kind, "synced_outcome");
+    assert.equal(flushAndSyncRes.outcome?.status, "synced");
+    assert.equal(flushAndSyncRes.localSaveFailed, false);
+    const syncedB = await getProjectRecord(projB.projectId);
+    assert.equal(syncedB.project.songs[0].settings.targetBpm, 158);
+    assert.equal(ctrl.getLocalSaveState(projB.projectId), "saved");
+
+    // 12. 本機保存失敗時（包含先自動保存失敗後直接按同步），絕不執行 Drive 寫入
+    const writesBeforeLocalFail = server.writeRequests.length;
+    setInMemoryIdbHooksForTests({
+      beforeWrite(store) {
+        if (store === "projects") {
+          throw new DOMException("Disk full", "QuotaExceededError");
+        }
+      },
+    });
+    const failedEditB = {
+      ...syncedB,
+      localRevision: syncedB.localRevision + 1,
+      dirty: true,
+      syncStatus: "dirty",
+      project: buildProjectFromBandSongs({
+        existingProject: syncedB.project,
+        songs: [{ ...song, targetBpm: 166 }],
+        incrementRevision: true,
+      }),
+    };
+    ctrl.scheduleProjectEdit(failedEditB, { immediateLocal: true });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(ctrl.getLocalSaveState(projB.projectId), "error");
+    assert.equal(ctrl.hasPendingLocalEdits(projB.projectId), true);
+
+    const syncWhenLocalFailRes = await coordinator.requestSync();
+    assert.equal(syncWhenLocalFailRes.kind, "synced_outcome");
+    assert.equal(syncWhenLocalFailRes.localSaveFailed, true);
+    assert.equal(syncWhenLocalFailRes.outcome?.status, "error");
+    assert.equal(server.writeRequests.length, writesBeforeLocalFail);
+    assert.equal(ctrl.getLocalSaveState(projB.projectId), "error");
+
+    // 修復 IDB 後再同步：剛才卡住的 failedEditB 也會被補寫並同步成功
+    setInMemoryIdbHooksForTests({});
+    const recoveredBRes = await coordinator.requestSync();
+    assert.equal(recoveredBRes.kind, "synced_outcome");
+    assert.equal(recoveredBRes.outcome?.status, "synced");
+    assert.equal(ctrl.getLocalSaveState(projB.projectId), "saved");
+    assert.equal((await getProjectRecord(projB.projectId))?.project.songs[0].settings.targetBpm, 166);
+
+    // 14. 雲端同步失敗（HTTP 500）不覆蓋本機已保存成功狀態
+    const dirtyBefore500 = {
+      ...(await getProjectRecord(projB.projectId)),
+      localRevision: 10,
+      dirty: true,
+      syncStatus: "dirty",
+      project: buildProjectFromBandSongs({
+        existingProject: (await getProjectRecord(projB.projectId)).project,
+        songs: [{ ...song, targetBpm: 170 }],
+        incrementRevision: true,
+      }),
+    };
+    ctrl.scheduleProjectEdit(dirtyBefore500, { immediateLocal: true });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(ctrl.getLocalSaveState(projB.projectId), "saved");
+
+    server.setFailNextPatch(true);
+    activeProject = await getProjectRecord(projB.projectId);
+    const cloudFailRes = await coordinator.requestSync();
+    assert.equal(cloudFailRes.kind, "synced_outcome");
+    assert.equal(cloudFailRes.outcome?.status, "error");
+    assert.equal(cloudFailRes.localSaveFailed, false);
+    assert.equal(ctrl.getLocalSaveState(projB.projectId), "saved");
+
+    const uiStatusOnCloudFail = resolveProjectToolbarStatus({
+      activeProject: cloudFailRes.outcome.record,
+      songCount: 1,
+      hasLegacySongs: false,
+      isGoogleConfigured: true,
+      isGoogleSignedIn: true,
+      hasValidGoogleToken: true,
+      localSaveState: ctrl.getLocalSaveState(projB.projectId),
+    });
+    assert.equal(uiStatusOnCloudFail.text, "本機已儲存 · 同步失敗");
+    assert.equal(uiStatusOnCloudFail.toneClass, "is-error");
+
+    // 13b. 專案切換 (invalidateProject) 後清除舊專案 saved/error 狀態
+    await ctrl.invalidateProject(projB.projectId, { discardPendingLocal: false });
+    assert.equal(ctrl.getLocalSaveState(projB.projectId), "idle");
+
+    await ctrl.dispose();
+    accountManager.dispose();
+  } finally {
+    setInMemoryIdbHooksForTests({});
+    clearCachedFolderLayoutForAccount();
+    resetInMemoryIdbForTests();
+  }
+});
+
+test("P2 (LocalSaveState Status Resolution & 3-Button Toolbar Contract): accurately separates idle/dirty/saving/saved/error & keeps 3 primary actions", () => {
+  const localProj = createInitialPersistedProjectRecord(
+    createEmptyProject({ name: "Pure Local", storageProvider: "local" }),
+    { dirty: false, syncStatus: "local_only" },
+  );
+  const driveDirty = createInitialPersistedProjectRecord(
+    createEmptyProject({
+      name: "Cloud Drive Project",
+      storageProvider: "google_drive",
+      ownerAccountId: "google:acc-1",
+    }),
+    { dirty: true, syncStatus: "dirty" },
+  );
+  const driveSynced = { ...driveDirty, dirty: false, syncStatus: "synced" };
+  const driveError = { ...driveDirty, syncStatus: "error", lastError: "HTTP 503" };
+
+  // 13 & 14. 本機 5 態與雲端狀態組合驗證
+  assert.equal(
+    resolveProjectToolbarStatus({
+      activeProject: localProj,
+      songCount: 1,
+      hasLegacySongs: false,
+      isGoogleConfigured: true,
+      isGoogleSignedIn: false,
+      hasValidGoogleToken: false,
+      localSaveState: "idle",
+    }).text,
+    "尚未確認保存 · 僅存於本機",
+  );
+  assert.equal(
+    resolveProjectToolbarStatus({
+      activeProject: localProj,
+      songCount: 1,
+      hasLegacySongs: false,
+      isGoogleConfigured: true,
+      isGoogleSignedIn: false,
+      hasValidGoogleToken: false,
+      localSaveState: "dirty",
+    }).text,
+    "尚未儲存變更 · 僅存於本機",
+  );
+  assert.equal(
+    resolveProjectToolbarStatus({
+      activeProject: localProj,
+      songCount: 1,
+      hasLegacySongs: false,
+      isGoogleConfigured: true,
+      isGoogleSignedIn: false,
+      hasValidGoogleToken: false,
+      localSaveState: "saving",
+    }).spinning,
+    true,
+  );
+  assert.equal(
+    resolveProjectToolbarStatus({
+      activeProject: localProj,
+      songCount: 1,
+      hasLegacySongs: false,
+      isGoogleConfigured: true,
+      isGoogleSignedIn: false,
+      hasValidGoogleToken: false,
+      localSaveState: "saved",
+    }).text,
+    "本機已儲存 · 僅存於本機",
+  );
+  assert.equal(
+    resolveProjectToolbarStatus({
+      activeProject: driveSynced,
+      songCount: 1,
+      hasLegacySongs: false,
+      isGoogleConfigured: true,
+      isGoogleSignedIn: true,
+      hasValidGoogleToken: true,
+      localSaveState: "dirty",
+    }).text,
+    "本機有未儲存變更 · 雲端已同步",
+  );
+  assert.equal(
+    resolveProjectToolbarStatus({
+      activeProject: driveSynced,
+      songCount: 1,
+      hasLegacySongs: false,
+      isGoogleConfigured: true,
+      isGoogleSignedIn: true,
+      hasValidGoogleToken: true,
+      localSaveState: "dirty",
+    }).toneClass,
+    "is-dirty",
+  );
+  assert.equal(
+    resolveProjectToolbarStatus({
+      activeProject: driveError,
+      songCount: 1,
+      hasLegacySongs: false,
+      isGoogleConfigured: true,
+      isGoogleSignedIn: true,
+      hasValidGoogleToken: true,
+      localSaveState: "saved",
+    }).text,
+    "本機已儲存 · 同步失敗",
+  );
+  assert.equal(
+    resolveProjectToolbarStatus({
+      activeProject: driveError,
+      songCount: 1,
+      hasLegacySongs: false,
+      isGoogleConfigured: true,
+      isGoogleSignedIn: true,
+      hasValidGoogleToken: true,
+      localSaveState: "error",
+    }).text,
+    "本機儲存失敗 · 同步失敗",
+  );
+
+  // 15. 全狀態工具列永遠僅 3 顆按鈕，且 BandMixer 已接上 Fail-Closed 另存與 Auth-First 同步編排器
+  for (const state of ["idle", "dirty", "saving", "saved", "error"]) {
+    for (const proj of [null, localProj, driveDirty, driveSynced, driveError]) {
+      const actions = resolveProjectToolbarActions({
+        activeProject: proj,
+        songCount: 2,
+        hasLegacySongs: false,
+        isGoogleConfigured: true,
+        isGoogleSignedIn: true,
+        hasValidGoogleToken: true,
+        localSaveState: state,
+      });
+      assert.equal(actions.length, 3);
+      assert.deepEqual(
+        actions.map((a) => a.text),
+        ["專案", "儲存", "同步"],
+      );
+    }
+  }
+
+  const mixerSrc = fs.readFileSync(path.resolve("components/band/BandMixer.tsx"), "utf8");
+  assert.equal(mixerSrc.includes("prepareAndSaveProjectAs"), true);
+  assert.equal(mixerSrc.includes("ProjectManualSyncCoordinator"), true);
+  const saveAsStart = mixerSrc.indexOf("const handleSaveAsProjectSubmit");
+  const saveAsEnd = mixerSrc.indexOf("const handleRenameProjectSubmit");
+  assert.ok(saveAsStart !== -1 && saveAsEnd > saveAsStart);
+  const saveAsSlice = mixerSrc.slice(saveAsStart, saveAsEnd);
+  assert.equal(saveAsSlice.includes("prepareAndSaveProjectAs"), true);
+  assert.equal(saveAsSlice.includes(".catch(() => undefined)"), false);
 });

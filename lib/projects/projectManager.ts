@@ -14,8 +14,11 @@ import {
   setActiveProjectId,
 } from "../storage/projectStore.ts";
 import {
+  flushPendingSongPersists,
   getPersistedAudioBlobByKey,
   loadPersistedBandSession,
+  type FlushPendingSongPersistsResult,
+  type SongPersistFailure,
 } from "../storage/songSessionStore.ts";
 import {
   type ProjectAutoSyncController,
@@ -171,6 +174,265 @@ export async function saveLocalProjectSnapshot(params: {
   return saved.record;
 }
 
+export interface SaveAsSongFailure {
+  songId: string;
+  songName: string;
+  code:
+    | "flush_failed"
+    | "persistence_error"
+    | "persistence_conflict"
+    | "persistence_in_progress"
+    | "missing_audio"
+    | "missing_hash"
+    | "audio_not_persisted"
+    | "idb_read_error";
+  reason: string;
+  isQuotaError?: boolean;
+}
+
+export interface VerifySaveAsReadinessResult {
+  ok: boolean;
+  verifiedCount: number;
+  cloudBackedCount: number;
+  failedSongs: SaveAsSongFailure[];
+  summaryMessage: string | null;
+}
+
+export class SaveAsPersistenceError extends Error {
+  readonly failedSongs: SaveAsSongFailure[];
+
+  constructor(message: string, failedSongs: SaveAsSongFailure[]) {
+    super(message);
+    this.name = "SaveAsPersistenceError";
+    this.failedSongs = failedSongs;
+  }
+}
+
+/**
+ * 驗證另存專案前工作區所有歌曲是否皆已持久化且具備完整可恢復性：
+ * - 不將 Google Drive Picker 雲端來源音檔（具備 fileId / originalBackup / artifactRef）或已匯入雲端分軌誤判為必須本機完整複製。
+ * - 本機來源音檔必須具備 sourceAudioHash 且實際存在於 IndexedDB `audioFiles` store。
+ * - 若任何 pending/in-flight 保存失敗、衝突或本機音檔缺失，回傳 ok=false 與具體失敗歌曲清單（Fail Closed）。
+ */
+export async function verifySongsForProjectSaveAs(
+  songs: readonly BandSong[],
+  options?: {
+    flushFailures?: readonly SongPersistFailure[];
+    justFlushedOkSongIds?: ReadonlySet<string>;
+  },
+): Promise<VerifySaveAsReadinessResult> {
+  const flushFailureBySongId = new Map<string, SongPersistFailure>();
+  for (const f of options?.flushFailures ?? []) {
+    flushFailureBySongId.set(f.songId, f);
+  }
+
+  const failedSongs: SaveAsSongFailure[] = [];
+  let verifiedCount = 0;
+  let cloudBackedCount = 0;
+
+  for (const song of songs) {
+    const flushErr = flushFailureBySongId.get(song.id);
+    if (flushErr) {
+      failedSongs.push({
+        songId: song.id,
+        songName: song.name,
+        code: "flush_failed",
+        reason: flushErr.message,
+        isQuotaError: flushErr.isQuotaError,
+      });
+      continue;
+    }
+
+    const flushedOkThisPass = Boolean(options?.justFlushedOkSongIds?.has(song.id));
+    if (!flushedOkThisPass) {
+      if (song.persistenceStatus === "error") {
+        failedSongs.push({
+          songId: song.id,
+          songName: song.name,
+          code: "persistence_error",
+          reason: song.persistenceMessage || "本機保存失敗，請檢查瀏覽器儲存空間並重試。",
+        });
+        continue;
+      }
+      if (song.persistenceStatus === "conflict") {
+        failedSongs.push({
+          songId: song.id,
+          songName: song.name,
+          code: "persistence_conflict",
+          reason: song.persistenceMessage || "偵測到多分頁歌曲設定衝突，請先於歌曲卡片確認版本。",
+        });
+        continue;
+      }
+      if (song.persistenceStatus === "saving" || song.persistenceStatus === "restoring") {
+        failedSongs.push({
+          songId: song.id,
+          songName: song.name,
+          code: "persistence_in_progress",
+          reason: "歌曲仍在寫入或恢復本機資料中，請稍候完成後再另存。",
+        });
+        continue;
+      }
+    }
+
+    // 依現有可恢復性規則判斷：Drive Picker 雲端來源音檔、已備份原曲或雲端/匯入分軌不強求本機重複複製
+    const canRecoverOriginalFromDrive = Boolean(
+      song.originalBackup?.driveFileId ||
+        (song.source?.provider === "google_drive" && Boolean(song.source.fileId)),
+    );
+    const canRecoverStemsFromDrive = Boolean(
+      song.artifactRef?.manifestFileId || song.driveExport?.manifestFileId,
+    );
+    const hasImportedStems = Boolean(song.importedStemOrigin?.importId);
+
+    if (canRecoverOriginalFromDrive || canRecoverStemsFromDrive || hasImportedStems) {
+      cloudBackedCount += 1;
+      verifiedCount += 1;
+      continue;
+    }
+
+    if (song.persistenceStatus === "missing_audio") {
+      failedSongs.push({
+        songId: song.id,
+        songName: song.name,
+        code: "missing_audio",
+        reason: song.persistenceMessage || "此歌曲缺少本機原始音檔，無法完整恢復。",
+      });
+      continue;
+    }
+
+    if (!song.sourceAudioHash) {
+      failedSongs.push({
+        songId: song.id,
+        songName: song.name,
+        code: "missing_hash",
+        reason: "尚未建立音檔雜湊識別，請等待音檔準備完成或重新匯入。",
+      });
+      continue;
+    }
+
+    try {
+      const audioRec = await getPersistedAudioBlobByKey(song.sourceAudioHash);
+      if (!audioRec || !audioRec.blob) {
+        failedSongs.push({
+          songId: song.id,
+          songName: song.name,
+          code: "audio_not_persisted",
+          reason: "本機原始音檔尚未完成持久化保存（可能儲存空間不足或寫入失敗），無法保證另存後可完整恢復。",
+        });
+        continue;
+      }
+    } catch (err) {
+      failedSongs.push({
+        songId: song.id,
+        songName: song.name,
+        code: "idb_read_error",
+        reason: err instanceof Error ? `檢查本機音檔失敗：${err.message}` : "無法讀取本機音檔資料庫。",
+      });
+      continue;
+    }
+
+    verifiedCount += 1;
+  }
+
+  if (failedSongs.length === 0) {
+    return {
+      ok: true,
+      verifiedCount,
+      cloudBackedCount,
+      failedSongs: [],
+      summaryMessage: null,
+    };
+  }
+
+  const details = failedSongs
+    .slice(0, 3)
+    .map((item) => `「${item.songName}」：${item.reason}`)
+    .join("；");
+  const extra = failedSongs.length > 3 ? `（另有 ${failedSongs.length - 3} 首失敗）` : "";
+  const summaryMessage = `無法另存新專案（${failedSongs.length} 首歌曲尚未完成保存或無法恢復）：${details}${extra}。已停止另存並完整保留目前工作區與分軌資料，請排除問題後重試。`;
+
+  return {
+    ok: false,
+    verifiedCount,
+    cloudBackedCount,
+    failedSongs,
+    summaryMessage,
+  };
+}
+
+export async function prepareAndSaveProjectAs(params: {
+  sourceProject: BandProject;
+  currentSongs?: readonly BandSong[];
+  name: string;
+  description?: string;
+  storageProvider: ProjectStorageProvider;
+  auth?: ProjectAuthContext;
+  setActive?: boolean;
+  syncImmediatelyIfDrive?: boolean;
+  fetchImpl?: typeof fetch;
+  awaitInFlightAudioPersists?: () => Promise<{
+    okSongIds: string[];
+    failed: SongPersistFailure[];
+  }>;
+  flushPendingSongsFn?: () => Promise<FlushPendingSongPersistsResult>;
+}): Promise<{
+  record: PersistedProjectRecord;
+  syncOutcome?: ProjectDriveSyncOutcome;
+  readiness: VerifySaveAsReadinessResult;
+}> {
+  const audioPersistRes = params.awaitInFlightAudioPersists
+    ? await params.awaitInFlightAudioPersists()
+    : { okSongIds: [] as string[], failed: [] as SongPersistFailure[] };
+
+  const flushFn = params.flushPendingSongsFn ?? flushPendingSongPersists;
+  const flushRes = await flushFn();
+
+  const allFlushFailures = [...audioPersistRes.failed, ...flushRes.failed];
+  const failedIds = new Set(allFlushFailures.map((f) => f.songId));
+  const justFlushedOkSongIds = new Set(
+    [...audioPersistRes.okSongIds, ...flushRes.flushedSongIds].filter((id) => !failedIds.has(id)),
+  );
+
+  const readiness = params.currentSongs
+    ? await verifySongsForProjectSaveAs(params.currentSongs, {
+        flushFailures: allFlushFailures,
+        justFlushedOkSongIds,
+      })
+    : {
+        ok: allFlushFailures.length === 0,
+        verifiedCount: 0,
+        cloudBackedCount: 0,
+        failedSongs: allFlushFailures.map((f) => ({
+          songId: f.songId,
+          songName: f.songName || f.songId,
+          code: "flush_failed" as const,
+          reason: f.message,
+          isQuotaError: f.isQuotaError,
+        })),
+        summaryMessage:
+          allFlushFailures.length > 0
+            ? `無法另存新專案：${allFlushFailures.map((f) => f.message).join("；")}`
+            : null,
+      };
+
+  if (!readiness.ok) {
+    throw new SaveAsPersistenceError(
+      readiness.summaryMessage || "歌曲尚未完成本機保存，已停止另存新專案。",
+      readiness.failedSongs,
+    );
+  }
+
+  const saved = await saveProjectAs({
+    ...params,
+    skipSongVerification: true,
+  });
+
+  return {
+    ...saved,
+    readiness,
+  };
+}
+
 export async function saveProjectAs(params: {
   sourceProject: BandProject;
   currentSongs?: readonly BandSong[];
@@ -181,9 +443,20 @@ export async function saveProjectAs(params: {
   setActive?: boolean;
   syncImmediatelyIfDrive?: boolean;
   fetchImpl?: typeof fetch;
+  skipSongVerification?: boolean;
 }): Promise<{ record: PersistedProjectRecord; syncOutcome?: ProjectDriveSyncOutcome }> {
   if (params.storageProvider === "google_drive" && !params.auth?.accountId) {
     throw new Error("另存為 Google Drive 專案需要登入 Google 帳號。");
+  }
+
+  if (params.currentSongs && !params.skipSongVerification) {
+    const readiness = await verifySongsForProjectSaveAs(params.currentSongs);
+    if (!readiness.ok) {
+      throw new SaveAsPersistenceError(
+        readiness.summaryMessage || "歌曲尚未完成本機保存，已停止另存新專案。",
+        readiness.failedSongs,
+      );
+    }
   }
 
   const snapshotSource = params.currentSongs

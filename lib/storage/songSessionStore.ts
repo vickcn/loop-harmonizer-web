@@ -1155,24 +1155,150 @@ export async function clearUnusedSeparationCaches(
 
 // ── Debounced song settings/state queue ──
 
+export interface SongPersistFailure {
+  songId: string;
+  songName?: string;
+  reason: "error" | "conflict" | "missing_hash" | "missing_audio";
+  message: string;
+  isQuotaError?: boolean;
+}
+
+export interface FlushPendingSongPersistsResult {
+  ok: boolean;
+  flushedSongIds: string[];
+  failed: SongPersistFailure[];
+  total: number;
+  succeeded: number;
+}
+
 type PendingPersistEntry = {
-  timer: number;
+  timer: ReturnType<typeof setTimeout>;
   getSong: () => BandSong | null;
   onResult: (songId: string, result: SaveSongResult) => void;
 };
 
+type SingleSongPersistOutcome = {
+  songId: string;
+  songName?: string;
+  ok: boolean;
+  skipped?: boolean;
+  failure?: SongPersistFailure;
+};
+
 const pendingSongSaves = new Map<string, PendingPersistEntry>();
+const inFlightSongPersists = new Map<string, Promise<SingleSongPersistOutcome>>();
+
+function runTrackedSongPersist(
+  songId: string,
+  entry: Pick<PendingPersistEntry, "getSong" | "onResult">,
+): Promise<SingleSongPersistOutcome> {
+  const prevInFlight = inFlightSongPersists.get(songId);
+  const task: Promise<SingleSongPersistOutcome> = (async (): Promise<SingleSongPersistOutcome> => {
+    if (prevInFlight) {
+      await prevInFlight.catch(() => undefined);
+    }
+    const latest = entry.getSong();
+    if (!latest) {
+      return { songId, ok: true, skipped: true };
+    }
+    if (!latest.sourceAudioHash) {
+      const msg = "尚未建立音檔雜湊識別，請重試儲存或重新匯入音檔。";
+      entry.onResult(songId, {
+        ok: false,
+        reason: "error",
+        message: msg,
+        isQuotaError: false,
+      });
+      return {
+        songId,
+        songName: latest.name,
+        ok: false,
+        failure: {
+          songId,
+          songName: latest.name,
+          reason: "missing_hash",
+          message: msg,
+          isQuotaError: false,
+        },
+      };
+    }
+    if (latest.persistenceStatus === "missing_audio") {
+      const msg = latest.persistenceMessage || "此歌曲缺少本機原始音檔，無法完整保存。";
+      return {
+        songId,
+        songName: latest.name,
+        ok: false,
+        failure: {
+          songId,
+          songName: latest.name,
+          reason: "missing_audio",
+          message: msg,
+        },
+      };
+    }
+
+    const result = await saveSongStateRecord(latest);
+    entry.onResult(songId, result);
+    if (result.ok) {
+      return {
+        songId,
+        songName: latest.name,
+        ok: true,
+      };
+    }
+    if (result.reason === "conflict") {
+      return {
+        songId,
+        songName: latest.name,
+        ok: false,
+        failure: {
+          songId,
+          songName: latest.name,
+          reason: "conflict",
+          message: "偵測到其他分頁修改了此歌曲，請先確認版本衝突後再另存。",
+        },
+      };
+    }
+    return {
+      songId,
+      songName: latest.name,
+      ok: false,
+      failure: {
+        songId,
+        songName: latest.name,
+        reason: "error",
+        message: result.message,
+        isQuotaError: result.isQuotaError,
+      },
+    };
+  })().finally(() => {
+    if (inFlightSongPersists.get(songId) === task) {
+      inFlightSongPersists.delete(songId);
+    }
+  });
+
+  inFlightSongPersists.set(songId, task);
+  return task;
+}
 
 export function hasPendingSongPersist(songId: string): boolean {
-  return pendingSongSaves.has(songId);
+  return pendingSongSaves.has(songId) || inFlightSongPersists.has(songId);
 }
 
 export function cancelPendingSongPersist(songId: string): void {
   const existing = pendingSongSaves.get(songId);
   if (existing !== undefined) {
-    if (typeof window !== "undefined") window.clearTimeout(existing.timer);
+    globalThis.clearTimeout(existing.timer);
     pendingSongSaves.delete(songId);
   }
+}
+
+export function resetPendingSongPersistsForTests(): void {
+  for (const existing of pendingSongSaves.values()) {
+    globalThis.clearTimeout(existing.timer);
+  }
+  pendingSongSaves.clear();
+  inFlightSongPersists.clear();
 }
 
 export function scheduleSongPersist(
@@ -1181,30 +1307,65 @@ export function scheduleSongPersist(
   onResult: (songId: string, result: SaveSongResult) => void,
   delayMs = 300,
 ): void {
-  if (typeof window === "undefined") return;
+  if (typeof globalThis.setTimeout === "undefined") return;
   const existing = pendingSongSaves.get(songId);
-  if (existing !== undefined) window.clearTimeout(existing.timer);
+  if (existing !== undefined) globalThis.clearTimeout(existing.timer);
 
-  const timer = window.setTimeout(() => {
+  const timer = globalThis.setTimeout(() => {
     pendingSongSaves.delete(songId);
-    const latest = getSong();
-    if (!latest || !latest.sourceAudioHash || latest.persistenceStatus === "missing_audio") return;
-    void saveSongStateRecord(latest).then((result) => onResult(songId, result));
+    void runTrackedSongPersist(songId, { getSong, onResult });
   }, delayMs);
 
   pendingSongSaves.set(songId, { timer, getSong, onResult });
 }
 
-export async function flushPendingSongPersists(): Promise<void> {
-  const entries = [...pendingSongSaves.entries()];
+export async function flushPendingSongPersists(): Promise<FlushPendingSongPersistsResult> {
+  const existingInFlightEntries = [...inFlightSongPersists.entries()];
+  const pendingEntries = [...pendingSongSaves.entries()];
   pendingSongSaves.clear();
-  await Promise.all(
-    entries.map(async ([songId, entry]) => {
-      if (typeof window !== "undefined") window.clearTimeout(entry.timer);
-      const latest = entry.getSong();
-      if (!latest || !latest.sourceAudioHash || latest.persistenceStatus === "missing_audio") return;
-      const result = await saveSongStateRecord(latest);
-      entry.onResult(songId, result);
+
+  for (const [, entry] of pendingEntries) {
+    globalThis.clearTimeout(entry.timer);
+  }
+
+  const triggeredMap = new Map<string, Promise<SingleSongPersistOutcome>>();
+  for (const [songId, entry] of pendingEntries) {
+    triggeredMap.set(songId, runTrackedSongPersist(songId, entry));
+  }
+
+  const outcomesBySongId = new Map<string, SingleSongPersistOutcome>();
+  await Promise.all([
+    ...existingInFlightEntries.map(async ([songId, p]) => {
+      const outcome = await p;
+      if (!triggeredMap.has(songId)) {
+        outcomesBySongId.set(songId, outcome);
+      }
     }),
-  );
+    ...[...triggeredMap.entries()].map(async ([songId, p]) => {
+      const outcome = await p;
+      outcomesBySongId.set(songId, outcome);
+    }),
+  ]);
+
+  const flushedSongIds: string[] = [];
+  const failed: SongPersistFailure[] = [];
+  let total = 0;
+
+  for (const outcome of outcomesBySongId.values()) {
+    if (outcome.skipped) continue;
+    total += 1;
+    if (outcome.ok) {
+      flushedSongIds.push(outcome.songId);
+    } else if (outcome.failure) {
+      failed.push(outcome.failure);
+    }
+  }
+
+  return {
+    ok: failed.length === 0,
+    flushedSongIds,
+    failed,
+    total,
+    succeeded: flushedSongIds.length,
+  };
 }

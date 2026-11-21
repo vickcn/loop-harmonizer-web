@@ -25,6 +25,7 @@ type Props = {
   projectBusyState: ProjectBusyState | null;
   otherProjectJobs: readonly SeparationJobState[];
   localSaveState?: LocalSaveState;
+  isSyncRunning?: boolean;
   onOpenProjectManager: () => void;
   onSaveProject: () => void;
   onSyncProject: () => void;
@@ -72,6 +73,7 @@ export function ProjectToolbar(props: Props) {
     localSaveState: props.localSaveState,
     busyAction: projectBusyState?.action ?? null,
     busyMessage: projectBusyState?.message ?? null,
+    isSyncRunning: props.isSyncRunning,
   };
 
   const statusView = resolveProjectToolbarStatus(toolbarInput);

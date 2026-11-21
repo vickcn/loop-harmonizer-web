@@ -69,6 +69,9 @@ function cloneStoreValue<T>(value: T): T {
   if (value == null || typeof value !== "object") {
     return value;
   }
+  if (typeof Blob !== "undefined" && value instanceof Blob) {
+    return value;
+  }
   if (value instanceof ArrayBuffer) {
     return value.slice(0) as unknown as T;
   }
