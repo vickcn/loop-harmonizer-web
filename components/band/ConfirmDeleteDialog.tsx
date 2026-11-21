@@ -151,7 +151,7 @@ export function ConfirmDeleteDialog({
       role="dialog"
       aria-modal="true"
       aria-labelledby="confirm-delete-dialog-title"
-      className="mixer-modal-backdrop"
+      className="mixer-modal-backdrop is-confirm-layer"
       onClick={(event) => {
         if (!submitting && event.target === event.currentTarget) {
           onCancel();

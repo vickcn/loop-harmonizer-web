@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 
 
 type IconActionButtonProps = {
   icon: ReactNode;
+  text?: string;
   label: string;
   shortcut?: string;
   disabledReason?: string;
@@ -13,6 +14,7 @@ type IconActionButtonProps = {
   primary?: boolean;
   danger?: boolean;
   expanded?: boolean;
+  wrapClassName?: string;
   className?: string;
   style?: CSSProperties;
   onClick: () => void;
@@ -20,6 +22,7 @@ type IconActionButtonProps = {
 
 export function IconActionButton({
   icon,
+  text,
   label,
   shortcut,
   disabledReason,
@@ -29,6 +32,7 @@ export function IconActionButton({
   primary,
   danger,
   expanded,
+  wrapClassName = "",
   className = "",
   style,
   onClick,
@@ -87,7 +91,7 @@ export function IconActionButton({
   };
 
   return (
-    <span className={`icon-btn-wrap${showTouchTooltip ? " is-tooltip-visible" : ""}`}>
+    <span className={`icon-btn-wrap${showTouchTooltip ? " is-tooltip-visible" : ""}${wrapClassName ? ` ${wrapClassName}` : ""}`}>
       <button
         type="button"
         aria-label={label}
@@ -96,7 +100,7 @@ export function IconActionButton({
         aria-busy={busy}
         aria-expanded={expanded}
         disabled={disabled}
-        className={`btn mixer-button icon-btn${primary ? " primary" : ""}${busy ? " is-loading" : ""}${danger ? " is-danger" : ""}${className ? ` ${className}` : ""}`}
+        className={`btn mixer-button icon-btn${text ? " has-text" : ""}${primary ? " primary" : ""}${busy ? " is-loading" : ""}${danger ? " is-danger" : ""}${className ? ` ${className}` : ""}`}
         style={style}
         onClick={handleClick}
         onTouchStart={handleTouchStart}
@@ -105,6 +109,7 @@ export function IconActionButton({
         onTouchMove={handleTouchEndOrMove}
       >
         {icon}
+        {text && <span className="icon-btn-text">{text}</span>}
       </button>
       <span role="tooltip" className="action-tooltip">
         {tooltipText}

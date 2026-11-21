@@ -159,6 +159,10 @@ import {
   computeEntryBackupStatus,
 } from "@/lib/projects/projectModel";
 import {
+  buildDeleteProjectConfirmConfig,
+  resolveSyncActionIntent,
+} from "@/lib/projects/projectToolbarModel";
+import {
   ProjectAutoSyncController,
   type ProjectDriveSyncOutcome,
 } from "@/lib/projects/projectDriveSync";
@@ -6446,6 +6450,7 @@ export function BandMixer() {
     activeProjectRecordRef.current = record;
     activeProjectIdRef.current = record.projectId;
     setActiveProjectRecord(record);
+    setLocalSaveState("saved");
     sessionRef.current = { ...sessionRef.current, songs };
     setSession((prev) => ({ ...prev, songs }));
     setSelection(songs.length > 0 ? { songId: songs[0].id, stemId: null } : EMPTY_MIXER_SELECTION);
@@ -6583,6 +6588,7 @@ export function BandMixer() {
       message: `正在另存為新專案「${params.name}」…`,
     });
     try {
+      await flushPendingSongPersists().catch(() => undefined);
       const currentProj = activeProjectRecordRef.current?.project;
       const sourceProj =
         currentProj ??
@@ -6676,12 +6682,14 @@ export function BandMixer() {
     }
   };
 
-  /** 儲存本機：只寫入 IndexedDB，不呼叫任何 Google Drive API。 */
+  /** 儲存本機：只寫入 IndexedDB，不呼叫任何 Google Drive API；尚無正式專案時引導建立或另存新專案。 */
   const handleManualSaveProject = async () => {
     const active = activeProjectRecordRef.current;
     if (!active) {
-      if (hasLegacyWorkspaceSongs) {
-        await handleMigrateLegacyWorkspace();
+      if (sessionRef.current.songs.length > 0) {
+        openProjectModal("save_as");
+      } else {
+        showShortcutHint("尚未建立專案且目前無歌曲，請先載入歌曲或從「專案」建立專案。");
       }
       return;
     }
@@ -6693,7 +6701,7 @@ export function BandMixer() {
       const res = await autoSyncControllerRef.current?.saveProjectLocallyNow(active.projectId);
       if (!res || !res.ok) {
         setLocalSaveState("error");
-        showShortcutHint(res && !res.ok ? `本機儲存失敗：${res.errorMessage}` : "本機儲存失敗。");
+        showShortcutHint(res && !res.ok ? `儲存失敗：${res.errorMessage}` : "儲存失敗。");
         return;
       }
       setLocalSaveState("saved");
@@ -6703,11 +6711,11 @@ export function BandMixer() {
         applyActiveProjectRecordMonotonically(saved);
       }
       if (saved?.storageProvider === "google_drive" && saved.dirty) {
-        showShortcutHint("本機已儲存 · 尚未同步至 Google Drive。");
+        showShortcutHint("本機已儲存 · 尚未同步（不自動寫入 Google Drive）。");
       } else if (saved?.storageProvider === "google_drive") {
-        showShortcutHint("本機已儲存 · 本機與雲端已同步。");
+        showShortcutHint("本機已儲存 · 雲端已同步。");
       } else {
-        showShortcutHint(`已保存本機專案「${saved?.project.name ?? active.project.name}」。`);
+        showShortcutHint(`本機已儲存（${saved?.project.name ?? active.project.name}）。`);
       }
     } finally {
       if (gen === projectOpGenerationRef.current && mountedRef.current) {
@@ -6716,28 +6724,79 @@ export function BandMixer() {
     }
   };
 
-  /** 同步至 Google Drive：唯一的使用者明確同步入口（純本機專案改走 Promote 流程）。 */
-  const handleSyncProjectToDrive = async (expectedProjectId?: string) => {
+  /** 使用者點擊「同步」或「重新授權並同步」後，引導 Google 登入/續權並僅於同一專案與帳戶續行該次同步。 */
+  const handleReauthorizeAndSync = async () => {
     const active = activeProjectRecordRef.current;
     if (!active) return;
-    if (expectedProjectId && active.projectId !== expectedProjectId) return;
-    if (active.storageProvider !== "google_drive") {
-      if (!sharedGoogleAccountManager.getSnapshot().account) {
-        showShortcutHint("請先登入 Google 帳號，再將專案儲存到 Google Drive。");
+    const reauthProjectId = active.projectId;
+    const expectedOwner = active.ownerAccountId;
+    try {
+      const snap = sharedGoogleAccountManager.getSnapshot();
+      const afterSnap = snap.account
+        ? await sharedGoogleAccountManager.reauthorize()
+        : await sharedGoogleAccountManager.signIn();
+      const signedInAccountId = afterSnap.account?.accountId ?? null;
+      if (expectedOwner && signedInAccountId && signedInAccountId !== expectedOwner) {
+        showShortcutHint("登入的 Google 帳號與此專案擁有者不符，已阻止跨帳號上傳。");
         return;
+      }
+      if (activeProjectIdRef.current === reauthProjectId) {
+        await handleSyncProjectToDrive(reauthProjectId);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Google 登入或重新授權失敗。";
+      if (!/已取消/.test(msg)) showShortcutHint(msg);
+    }
+  };
+
+  /** 同步至 Google Drive：唯一的使用者明確雲端同步入口（純本機專案改走 Promote 引導流程）。 */
+  const handleSyncProjectToDrive = async (expectedProjectId?: string) => {
+    const active = activeProjectRecordRef.current;
+    if (!active) {
+      showShortcutHint("請先建立或開啟專案後，再同步至 Google Drive。");
+      return;
+    }
+    if (expectedProjectId && active.projectId !== expectedProjectId) return;
+    const controller = autoSyncControllerRef.current;
+    const auth = getProjectAuthContext();
+    const intent = resolveSyncActionIntent({
+      activeProject: active,
+      songCount: sessionRef.current.songs.length,
+      hasLegacySongs: hasLegacyWorkspaceSongs,
+      isGoogleConfigured: isGoogleDrivePickerConfigured(),
+      isGoogleSignedIn: Boolean(auth.accountId),
+      hasValidGoogleToken: Boolean(auth.accountId && auth.accessToken),
+      busyAction: projectBusyState?.action ?? null,
+      isSyncRunning: controller?.isManualSyncRunning(active.projectId) ?? false,
+    });
+    if (intent === "disabled_busy" || intent === "disabled_no_project") return;
+    if (intent === "disabled_unconfigured") {
+      showShortcutHint("尚未設定 Google OAuth 環境變數，無法使用雲端同步。");
+      return;
+    }
+    if (intent === "guide_promote_to_drive" || intent === "guide_promote_sign_in") {
+      if (intent === "guide_promote_sign_in") {
+        showShortcutHint("請先登入 Google 帳號，再將此本機專案儲存到 Google Drive。");
       }
       openProjectModal("promote");
       return;
     }
-    const controller = autoSyncControllerRef.current;
-    if (!controller || controller.isManualSyncRunning(active.projectId)) return;
+    if (intent === "open_conflict") {
+      showShortcutHint("此專案有跨裝置版本衝突，請先選擇衝突處理方式。");
+      openProjectModal("conflict");
+      return;
+    }
+    if (!controller) return;
     const gen = ++projectOpGenerationRef.current;
     setProjectBusyState({ action: "sync", message: "正在同步專案至 Google Drive…" });
     try {
       captureLatestProjectSnapshot();
       const outcome: ProjectDriveSyncOutcome | null = await controller.syncProjectManually(active.projectId);
       if (!mountedRef.current) return;
-      setLocalSaveState("saved");
+      const localSaveFailed = Boolean(
+        outcome?.status === "error" && outcome.errorMessage.startsWith("本機保存失敗"),
+      );
+      setLocalSaveState(localSaveFailed ? "error" : "saved");
       if (!outcome) return;
       if ("record" in outcome && outcome.record && activeProjectIdRef.current === outcome.record.projectId) {
         applyActiveProjectRecordMonotonically(outcome.record);
@@ -6763,10 +6822,10 @@ export function BandMixer() {
             expectedLocalRevisionToken: outcome.record.project.revisionToken,
           });
           await clearWorkspaceForProjectSwitch();
-          const auth = getProjectAuthContext();
+          const nextAuth = getProjectAuthContext();
           const nextSongs = await projectToBandSongsMetadataOnly(loaded.project, {
-            currentAccountId: auth.accountId,
-            hasValidGoogleToken: Boolean(auth.accountId && auth.accessToken),
+            currentAccountId: nextAuth.accountId,
+            hasValidGoogleToken: Boolean(nextAuth.accountId && nextAuth.accessToken),
           });
           applyProjectWorkspaceState(loaded, nextSongs);
           showShortcutHint(`已載入雲端版本（v${loaded.localRevision}）。`);
@@ -6777,7 +6836,11 @@ export function BandMixer() {
         showShortcutHint("偵測到跨裝置版本衝突，請選擇衝突處理方式。");
         openProjectModal("conflict");
       } else if (outcome.status === "waiting_auth") {
-        showShortcutHint("本機已儲存 · 需要重新授權 Google 後再手動同步。");
+        showShortcutHint("本機已儲存 · 請登入 Google 帳號或重新授權後完成雲端同步。");
+        if (intent === "guide_google_sign_in") {
+          setProjectBusyState(null);
+          await handleReauthorizeAndSync();
+        }
       } else if (outcome.status === "error") {
         showShortcutHint(`本機已儲存 · 同步失敗：${outcome.errorMessage}`);
       } else if (outcome.status === "cancelled") {
@@ -7055,29 +7118,19 @@ export function BandMixer() {
     if (!resolvedTarget) return;
 
     const isCloud = resolvedTarget.storageProvider === "google_drive";
+    const confirmConfig = buildDeleteProjectConfirmConfig(resolvedTarget);
     openDeleteConfirmDialog(
       {
-        title: "刪除專案",
-        subtitle: resolvedTarget.name,
-        deleteItems: [
-          "將移除此專案及其混音設定，歌曲原始音檔及共用分軌成果仍會保留。",
-          "此專案的本機 IndexedDB Metadata、排序與專案同步佇列",
-          ...(isCloud ? ["若勾選下方選項：將同時將 Google Drive 上此專案的專案資料夾移至垃圾桶（不刪除 songs/ 分軌與原曲）"] : []),
-        ],
-        preserveItems: [
-          "所有歌曲原始音檔（本機 audioFiles 與 Drive Picker 原曲）",
-          "所有共用 Demucs Checkpoint、Imported Stem 與 Google Drive .loopHarmonizer/songs/ 成果庫",
-          "其他專案以及舊版預設 Band Mixer 工作階段",
-        ],
-        recoverability: isCloud
-          ? "僅刪除本機不會影響雲端複本；若同時刪除雲端專案，需至 Google Drive 垃圾桶復原。"
-          : "本機專案結構移除後不可恢復，但歌曲原曲與分軌成果完整保留，隨時可於新專案重新加入。",
-        checkboxLabel: isCloud ? "同時刪除 Google Drive 上的雲端專案資料夾" : undefined,
-        checkboxDescription: isCloud
-          ? "只刪除目前帳號對此 Project ID 管理的專案資料夾；絕不刪除共用歌曲成果庫與他人共享原曲。"
-          : undefined,
-        confirmLabel: "確認刪除專案",
-        danger: true,
+        title: confirmConfig.title,
+        subtitle: confirmConfig.subtitle,
+        deleteItems: confirmConfig.deleteItems,
+        preserveItems: confirmConfig.preserveItems,
+        safetyNote: confirmConfig.safetyNote,
+        recoverability: confirmConfig.recoverability,
+        checkboxLabel: confirmConfig.checkboxLabel,
+        checkboxDescription: confirmConfig.checkboxDescription,
+        confirmLabel: confirmConfig.confirmLabel,
+        danger: confirmConfig.danger,
         onExecute: async (alsoDeleteCloud) => {
           const auth = getProjectAuthContext();
           const scope = isCloud && alsoDeleteCloud ? "cloud_and_local" : "local_only";
@@ -7092,6 +7145,7 @@ export function BandMixer() {
             activeProjectRecordRef.current = null;
             activeProjectIdRef.current = null;
             setActiveProjectRecord(null);
+            setLocalSaveState("idle");
             setSession((prev) => ({ ...prev, songs: [] }));
             setRestoreAttempt((n) => n + 1);
           }
@@ -7110,6 +7164,8 @@ export function BandMixer() {
     activeProjectRecordRef.current = null;
     activeProjectIdRef.current = null;
     setActiveProjectRecord(null);
+    setLocalSaveState("idle");
+    setProjectDialogMode(null);
     setSession((prev) => ({ ...prev, songs: [] }));
     setRestoreAttempt((n) => n + 1);
   };
@@ -7138,45 +7194,16 @@ export function BandMixer() {
         songCount={session.songs.length}
         hasLegacySongs={hasLegacyWorkspaceSongs}
         isGoogleConfigured={isGoogleDrivePickerConfigured()}
+        isGoogleSignedIn={Boolean(googleAuth.account)}
+        hasValidGoogleToken={Boolean(googleAuth.account && sharedGoogleAccountManager.getValidAccessToken())}
         projectBusyState={projectBusyState}
-        focusLocked={focusLocked}
         otherProjectJobs={otherProjectJobs}
-        onNewProject={() => openProjectModal("create")}
-        onOpenProjectList={() => openProjectModal("list")}
         localSaveState={localSaveState}
+        onOpenProjectManager={() => openProjectModal("list")}
         onSaveProject={() => void handleManualSaveProject()}
         onSyncProject={() => void handleSyncProjectToDrive()}
-        onSaveAsProject={() => openProjectModal("save_as")}
-        onPromoteToDrive={() => openProjectModal("promote")}
-        onOpenOfflineDownload={() => void handleOpenOfflineDialog()}
-        onMigrateLegacy={() => void handleMigrateLegacyWorkspace()}
-        onRenameProject={() => {
-          const active = activeProjectRecordRef.current;
-          if (active) {
-            openProjectModal("rename", {
-              projectId: active.projectId,
-              name: active.project.name,
-            });
-          }
-        }}
-        onDeleteProject={() => requestDeleteProject()}
         onOpenConflict={() => openProjectModal("conflict")}
-        onReauthorizeSync={() => {
-          const reauthProjectId = activeProjectRecordRef.current?.projectId ?? null;
-          void sharedGoogleAccountManager
-            .reauthorize()
-            .then(() => {
-              // 僅在使用者按下「重新授權並同步」的同一專案上，續行該次明確發起的同步
-              if (reauthProjectId && activeProjectIdRef.current === reauthProjectId) {
-                void handleSyncProjectToDrive(reauthProjectId);
-              }
-            })
-            .catch((err) => {
-              const msg = err instanceof Error ? err.message : "重新授權失敗。";
-              if (!/已取消/.test(msg)) showShortcutHint(msg);
-            });
-        }}
-        onReturnToLegacyWorkspace={activeProjectRecord ? () => void exitProjectToLegacyWorkspace() : undefined}
+        onReauthorizeSync={() => void handleReauthorizeAndSync()}
       />
       <div className="card row mixer-upload" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
         <button
@@ -7784,6 +7811,131 @@ export function BandMixer() {
           }}
         />
       )}
+      {(() => {
+        const exportTargetSong = driveExportModalSongId
+          ? session.songs.find((item) => item.id === driveExportModalSongId) ?? null
+          : null;
+        return (
+          <DriveExportDialog
+            open={Boolean(exportTargetSong)}
+            song={exportTargetSong}
+            account={googleAuth.account}
+            totalSamples={exportTargetSong ? Math.round(exportTargetSong.durationSec * 44100) : 0}
+            activeProgress={exportTargetSong ? driveExportProgressBySongId[exportTargetSong.id] ?? null : null}
+            submitting={driveExportSubmitting}
+            errorMessage={driveExportError}
+            needsReauth={driveExportNeedsReauth}
+            onStartExport={(sel) => void startDriveExport(sel)}
+            onPauseExport={pauseDriveExport}
+            onCancelExport={cancelDriveExport}
+            onReauthorizeAndResume={() => void reauthorizeAndResumeDriveExport()}
+            onClose={() => {
+              if (!driveExportSubmitting) {
+                setDriveExportModalSongId(null);
+                setDriveExportError(null);
+                setDriveExportNeedsReauth(false);
+              }
+            }}
+          />
+        );
+      })()}
+      <DriveLibraryDialog
+        open={driveLibraryOpen}
+        account={googleAuth.account}
+        loading={driveLibraryLoading}
+        entries={driveLibraryEntries}
+        invalidEntries={driveLibraryInvalidEntries}
+        restoreProgress={driveRestoreProgress}
+        restoringManifestId={restoringManifestId}
+        errorMessage={driveLibraryError}
+        onRefresh={() => void refreshDriveLibrary()}
+        onRestoreEntry={(entry, opts) => void handleRestoreDriveEntry(entry, opts)}
+        onDeleteEntry={(entry) => requestDeleteDriveEntry(entry)}
+        onCancelRestore={() => driveRestoreAbortRef.current?.abort()}
+        onClose={() => {
+          if (!restoringManifestId) {
+            setDriveLibraryOpen(false);
+          }
+        }}
+      />
+      <ProjectManagerDialog
+        open={Boolean(projectDialogMode)}
+        mode={projectDialogMode}
+        activeProject={activeProjectRecord}
+        songCount={session.songs.length}
+        focusLocked={focusLocked}
+        renameTarget={projectRenameTarget}
+        projects={projectListEntries}
+        projectsLoading={projectListLoading}
+        cloudError={projectListError}
+        cloudIncompleteReason={projectListIncompleteReason}
+        account={googleAuth.account}
+        isGoogleConfigured={isGoogleDrivePickerConfigured()}
+        hasLegacyWorkspaceSongs={hasLegacyWorkspaceSongs}
+        busyMessage={projectBusyState?.message ?? null}
+        errorMessage={projectDialogError}
+        promoteProgress={promoteProgress}
+        promoteBackupFailures={promoteBackupFailures}
+        offlineAssessment={offlineAssessment}
+        offlineAssessmentLoading={offlineAssessmentLoading}
+        offlineDownloadProgress={offlineDownloadProgress}
+        offlineDownloadResult={offlineDownloadResult}
+        onClose={() => {
+          if (!projectBusyState && !promoteProgress && !offlineDownloadProgress) {
+            setProjectDialogMode(null);
+            setProjectDialogError(null);
+          }
+        }}
+        onChangeMode={(m) => {
+          setProjectDialogError(null);
+          setProjectDialogMode(m);
+        }}
+        onRefreshProjects={() => void refreshProjectListEntries()}
+        onOpenProject={(entry) => void handleOpenProjectEntry(entry)}
+        onCreateProject={(p) => void handleCreateProjectSubmit(p)}
+        onSaveAsProject={(p) => void handleSaveAsProjectSubmit(p)}
+        onRenameProject={(p) => void handleRenameProjectSubmit(p)}
+        onStartRenameActiveProject={() => {
+          const active = activeProjectRecordRef.current;
+          if (active) {
+            openProjectModal("rename", {
+              projectId: active.projectId,
+              name: active.project.name,
+            });
+          }
+        }}
+        onStartRenameFromList={(entry) => {
+          openProjectModal("rename", {
+            projectId: entry.projectId,
+            name: entry.name,
+          });
+        }}
+        onDeleteActiveProject={() => requestDeleteProject()}
+        onDeleteProjectEntry={(entry) =>
+          requestDeleteProject({
+            projectId: entry.projectId,
+            name: entry.name,
+            storageProvider: entry.storageProvider,
+          })
+        }
+        onOpenOfflineDownload={() => void handleOpenOfflineDialog()}
+        onPromoteToDrive={(p) => void handlePromoteToDrive(p)}
+        onCancelPromote={() => promoteAbortRef.current?.abort()}
+        onStartOfflineDownload={() => void handleStartOfflineDownload()}
+        onCancelOfflineDownload={() => offlineDownloadAbortRef.current?.abort()}
+        onResolveConflict={(p) => handleResolveProjectConflict(p)}
+        onMigrateLegacyWorkspace={() => void handleMigrateLegacyWorkspace()}
+        onReturnToLegacyWorkspace={activeProjectRecord ? () => void exitProjectToLegacyWorkspace() : undefined}
+        onSignInGoogle={async () => {
+          try {
+            await sharedGoogleAccountManager.signIn();
+            void refreshProjectListEntries();
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : "Google 登入失敗。";
+            if (!/已取消/.test(msg)) setProjectDialogError(msg);
+          }
+        }}
+      />
       {deleteDialog && (
         <ConfirmDeleteDialog
           open
@@ -7842,112 +7994,6 @@ export function BandMixer() {
           }}
         />
       )}
-      {(() => {
-        const exportTargetSong = driveExportModalSongId
-          ? session.songs.find((item) => item.id === driveExportModalSongId) ?? null
-          : null;
-        return (
-          <DriveExportDialog
-            open={Boolean(exportTargetSong)}
-            song={exportTargetSong}
-            account={googleAuth.account}
-            totalSamples={exportTargetSong ? Math.round(exportTargetSong.durationSec * 44100) : 0}
-            activeProgress={exportTargetSong ? driveExportProgressBySongId[exportTargetSong.id] ?? null : null}
-            submitting={driveExportSubmitting}
-            errorMessage={driveExportError}
-            needsReauth={driveExportNeedsReauth}
-            onStartExport={(sel) => void startDriveExport(sel)}
-            onPauseExport={pauseDriveExport}
-            onCancelExport={cancelDriveExport}
-            onReauthorizeAndResume={() => void reauthorizeAndResumeDriveExport()}
-            onClose={() => {
-              if (!driveExportSubmitting) {
-                setDriveExportModalSongId(null);
-                setDriveExportError(null);
-                setDriveExportNeedsReauth(false);
-              }
-            }}
-          />
-        );
-      })()}
-      <DriveLibraryDialog
-        open={driveLibraryOpen}
-        account={googleAuth.account}
-        loading={driveLibraryLoading}
-        entries={driveLibraryEntries}
-        invalidEntries={driveLibraryInvalidEntries}
-        restoreProgress={driveRestoreProgress}
-        restoringManifestId={restoringManifestId}
-        errorMessage={driveLibraryError}
-        onRefresh={() => void refreshDriveLibrary()}
-        onRestoreEntry={(entry, opts) => void handleRestoreDriveEntry(entry, opts)}
-        onDeleteEntry={(entry) => requestDeleteDriveEntry(entry)}
-        onCancelRestore={() => driveRestoreAbortRef.current?.abort()}
-        onClose={() => {
-          if (!restoringManifestId) {
-            setDriveLibraryOpen(false);
-          }
-        }}
-      />
-      <ProjectManagerDialog
-        open={Boolean(projectDialogMode)}
-        mode={projectDialogMode}
-        activeProject={activeProjectRecord}
-        renameTarget={projectRenameTarget}
-        projects={projectListEntries}
-        projectsLoading={projectListLoading}
-        cloudError={projectListError}
-        cloudIncompleteReason={projectListIncompleteReason}
-        account={googleAuth.account}
-        isGoogleConfigured={isGoogleDrivePickerConfigured()}
-        hasLegacyWorkspaceSongs={hasLegacyWorkspaceSongs}
-        busyMessage={projectBusyState?.message ?? null}
-        errorMessage={projectDialogError}
-        promoteProgress={promoteProgress}
-        promoteBackupFailures={promoteBackupFailures}
-        offlineAssessment={offlineAssessment}
-        offlineAssessmentLoading={offlineAssessmentLoading}
-        offlineDownloadProgress={offlineDownloadProgress}
-        offlineDownloadResult={offlineDownloadResult}
-        onClose={() => {
-          if (!projectBusyState && !promoteProgress && !offlineDownloadProgress) {
-            setProjectDialogMode(null);
-            setProjectDialogError(null);
-          }
-        }}
-        onChangeMode={(m) => {
-          setProjectDialogError(null);
-          setProjectDialogMode(m);
-        }}
-        onRefreshProjects={() => void refreshProjectListEntries()}
-        onOpenProject={(entry) => void handleOpenProjectEntry(entry)}
-        onCreateProject={(p) => void handleCreateProjectSubmit(p)}
-        onSaveAsProject={(p) => void handleSaveAsProjectSubmit(p)}
-        onRenameProject={(p) => void handleRenameProjectSubmit(p)}
-        onStartRenameFromList={(entry) => {
-          openProjectModal("rename", {
-            projectId: entry.projectId,
-            name: entry.name,
-          });
-        }}
-        onDeleteProjectEntry={(entry) =>
-          requestDeleteProject({
-            projectId: entry.projectId,
-            name: entry.name,
-            storageProvider: entry.storageProvider,
-          })
-        }
-        onPromoteToDrive={(p) => void handlePromoteToDrive(p)}
-        onCancelPromote={() => promoteAbortRef.current?.abort()}
-        onStartOfflineDownload={() => void handleStartOfflineDownload()}
-        onCancelOfflineDownload={() => offlineDownloadAbortRef.current?.abort()}
-        onResolveConflict={(p) => handleResolveProjectConflict(p)}
-        onMigrateLegacyWorkspace={() => void handleMigrateLegacyWorkspace()}
-        onSignInGoogle={async () => {
-          await sharedGoogleAccountManager.signIn();
-          void refreshProjectListEntries();
-        }}
-      />
     </div>
   );
 }

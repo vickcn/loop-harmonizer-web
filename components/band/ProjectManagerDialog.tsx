@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type { GoogleAccount } from "@/lib/google/googleAuthTypes";
 import { computeEntryBackupStatus } from "@/lib/projects/projectModel";
+import { resolveProjectManagerActionGroups } from "@/lib/projects/projectToolbarModel";
 import { DRIVE_CAS_LIMITATION_NOTE } from "@/lib/projects/projectDriveSync";
 import type { PromoteLocalToDriveProgress } from "@/lib/projects/projectManager";
 import type {
@@ -33,6 +34,8 @@ type Props = {
   open: boolean;
   mode: ProjectDialogMode;
   activeProject: PersistedProjectRecord | null;
+  songCount: number;
+  focusLocked: boolean;
   renameTarget: { projectId: string; name: string } | null;
   projects: ProjectListEntrySummary[];
   projectsLoading: boolean;
@@ -69,8 +72,11 @@ type Props = {
     storageProvider: ProjectStorageProvider;
   }) => void | Promise<void>;
   onRenameProject: (params: { projectId: string; name: string }) => void | Promise<void>;
+  onStartRenameActiveProject: () => void;
   onStartRenameFromList: (entry: ProjectListEntrySummary) => void;
+  onDeleteActiveProject: () => void;
   onDeleteProjectEntry: (entry: ProjectListEntrySummary) => void;
+  onOpenOfflineDownload: () => void;
   onPromoteToDrive: (params: { backupLocalOriginals: boolean }) => void | Promise<void>;
   onCancelPromote: () => void;
   onStartOfflineDownload: () => void | Promise<void>;
@@ -80,6 +86,7 @@ type Props = {
     newProjectNameForSaveAs?: string;
   }) => void | Promise<void>;
   onMigrateLegacyWorkspace: () => void | Promise<void>;
+  onReturnToLegacyWorkspace?: () => void;
   onSignInGoogle: () => void | Promise<void>;
 };
 
@@ -134,7 +141,7 @@ export function ProjectManagerDialog(props: Props) {
       setFormDesc("");
       setFormProvider(props.isGoogleConfigured && props.account ? "google_drive" : "local");
     } else if (mode === "save_as") {
-      setFormName(activeProject ? `${activeProject.project.name}（副本）` : "目前工作空間副本");
+      setFormName(activeProject ? `${activeProject.project.name}（副本）` : "我的樂團專案");
       setFormDesc(activeProject?.project.description ?? "");
       setFormProvider(
         activeProject?.storageProvider === "google_drive" && props.account ? "google_drive" : "local",
@@ -149,6 +156,7 @@ export function ProjectManagerDialog(props: Props) {
   useEffect(() => {
     if (!open) return;
     const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
       if (event.key === "Escape" && !isBusy) {
         event.preventDefault();
         props.onClose();
@@ -181,12 +189,29 @@ export function ProjectManagerDialog(props: Props) {
   const titleByMode: Record<Exclude<ProjectDialogMode, null>, string> = {
     list: "專案管理與開啟",
     create: "新增專案",
-    save_as: "另存新專案",
+    save_as: activeProject ? "另存新專案" : "建立並儲存為新專案",
     rename: "重新命名專案",
     promote: "將本機專案儲存到 Google Drive",
     offline: "下載整個專案供離線使用",
     conflict: "處理跨裝置專案版本衝突",
   };
+
+  const actionGroups = resolveProjectManagerActionGroups({
+    activeProject,
+    songCount: props.songCount,
+    hasLegacyWorkspaceSongs: props.hasLegacyWorkspaceSongs,
+    isGoogleConfigured: props.isGoogleConfigured,
+    focusLocked: props.focusLocked,
+    isBusy,
+  });
+  const secondaryByKey = new Map(actionGroups.secondary.map((a) => [a.key, a]));
+  const saveAsMeta = secondaryByKey.get("save_as");
+  const renameMeta = secondaryByKey.get("rename_active");
+  const offlineMeta = secondaryByKey.get("offline_download");
+  const promoteMeta = secondaryByKey.get("promote_drive");
+  const migrateMeta = secondaryByKey.get("migrate_legacy");
+  const returnMeta = secondaryByKey.get("return_legacy");
+  const deleteActiveMeta = actionGroups.danger.find((a) => a.key === "delete_active");
 
   return (
     <div
@@ -288,25 +313,6 @@ export function ProjectManagerDialog(props: Props) {
               </button>
             </div>
 
-            {props.hasLegacyWorkspaceSongs && (
-              <div className="row mixer-modal-section" style={{ justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
-                <div className="grid" style={{ gap: 2 }}>
-                  <strong style={{ fontSize: 13 }}>既有預設工作空間遷移</strong>
-                  <span className="small" style={{ opacity: 0.78 }}>
-                    保留原本資料不動，另外建立正式本機專案並沿用已完成分軌。
-                  </span>
-                </div>
-                <button
-                  type="button"
-                  className="btn mixer-button"
-                  disabled={isBusy}
-                  onClick={() => void props.onMigrateLegacyWorkspace()}
-                >
-                  將目前工作空間另存為專案
-                </button>
-              </div>
-            )}
-
             {props.cloudIncompleteReason && (
               <div role="status" className="card-warning-banner grid" style={{ gap: 2 }}>
                 <strong style={{ fontSize: 12 }}>Google Drive 雲端專案清單可能不完整</strong>
@@ -392,6 +398,101 @@ export function ProjectManagerDialog(props: Props) {
                 })}
               </div>
             )}
+
+            <div className="mixer-modal-section project-manager-secondary-section">
+              <strong style={{ fontSize: 13 }}>目前專案與工作區操作（次要操作）</strong>
+              <div className="project-manager-action-row">
+                {saveAsMeta?.visible && (
+                  <button
+                    type="button"
+                    className="btn mixer-button"
+                    disabled={saveAsMeta.disabled}
+                    title={saveAsMeta.disabledReason}
+                    onClick={() => props.onChangeMode("save_as")}
+                  >
+                    另存新專案
+                  </button>
+                )}
+                {renameMeta?.visible && (
+                  <button
+                    type="button"
+                    className="btn mixer-button"
+                    disabled={renameMeta.disabled}
+                    onClick={props.onStartRenameActiveProject}
+                  >
+                    重新命名目前專案
+                  </button>
+                )}
+                {promoteMeta?.visible && (
+                  <button
+                    type="button"
+                    className="btn mixer-button"
+                    disabled={promoteMeta.disabled}
+                    onClick={() => props.onChangeMode("promote")}
+                  >
+                    連結 Google Drive
+                  </button>
+                )}
+                {offlineMeta?.visible && (
+                  <button
+                    type="button"
+                    className="btn mixer-button"
+                    disabled={offlineMeta.disabled}
+                    title={offlineMeta.disabledReason}
+                    onClick={props.onOpenOfflineDownload}
+                  >
+                    離線下載
+                  </button>
+                )}
+                {migrateMeta?.visible && (
+                  <button
+                    type="button"
+                    className="btn mixer-button"
+                    disabled={migrateMeta.disabled}
+                    title="保留原本資料不動，另外建立正式本機專案並沿用已完成分軌"
+                    onClick={() => void props.onMigrateLegacyWorkspace()}
+                  >
+                    遷移舊工作區
+                  </button>
+                )}
+                {returnMeta?.visible && props.onReturnToLegacyWorkspace && (
+                  <button
+                    type="button"
+                    className="btn mixer-button"
+                    disabled={returnMeta.disabled}
+                    title={returnMeta.disabledReason}
+                    onClick={props.onReturnToLegacyWorkspace}
+                  >
+                    返回預設工作空間
+                  </button>
+                )}
+              </div>
+              {migrateMeta?.visible && (
+                <span className="small" style={{ opacity: 0.72 }}>
+                  遷移舊工作區會保留原有 IndexedDB 歌曲與工作階段不動，另外複製建立正式本機專案。
+                </span>
+              )}
+            </div>
+
+            {deleteActiveMeta?.visible && activeProject && (
+              <div className="project-danger-section">
+                <div className="grid" style={{ gap: 2, minWidth: 0 }}>
+                  <strong style={{ fontSize: 13, color: "#fca5a5" }}>危險操作</strong>
+                  <span className="small" style={{ opacity: 0.8 }}>
+                    刪除「{activeProject.project.name}」將先開啟確認視窗，保留所有歌曲原曲與共用分軌成果。
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="btn mixer-button"
+                  disabled={deleteActiveMeta.disabled}
+                  style={{ color: "#fca5a5", borderColor: "rgba(248, 113, 113, 0.45)" }}
+                  onClick={props.onDeleteActiveProject}
+                >
+                  刪除目前專案
+                </button>
+              </div>
+            )}
           </div>
         )}
 
@@ -467,7 +568,7 @@ export function ProjectManagerDialog(props: Props) {
                 <div className="grid" style={{ gap: 2, flex: 1 }}>
                   <strong style={{ fontSize: 13 }}>Google Drive 雲端專案</strong>
                   <span className="small" style={{ opacity: 0.78 }}>
-                    直接寫入您帳戶的 .loopHarmonizer/projects/（不經後端伺服器），支援跨裝置清單、自動同步與衝突防護。
+                    直接寫入您帳戶的 .loopHarmonizer/projects/（不經後端伺服器），支援跨裝置清單、手動同步與衝突防護。
                   </span>
                   {(!props.isGoogleConfigured || !props.account) && (
                     <div className="row" style={{ gap: 8, marginTop: 4 }}>
@@ -491,7 +592,9 @@ export function ProjectManagerDialog(props: Props) {
             </div>
             {mode === "save_as" && (
               <div className="small" style={{ opacity: 0.78 }}>
-                提示：另存新專案只複製專案混音設定與版本引用，不會複製 WAV 音檔與 Demucs 分軌快取。
+                {activeProject
+                  ? "提示：另存新專案只複製專案混音設定與版本引用，不會複製 WAV 音檔與 Demucs 分軌快取。"
+                  : "將保留目前工作空間的歌曲、混音設定與分軌快取，不會清除或覆蓋原有舊工作區資料。"}
               </div>
             )}
             <div className="row mixer-modal-actions">
@@ -499,7 +602,7 @@ export function ProjectManagerDialog(props: Props) {
                 取消
               </button>
               <button type="submit" className="btn mixer-button primary" disabled={isBusy || !formName.trim()}>
-                {isBusy ? "處理中…" : mode === "create" ? "建立專案" : "確認另存"}
+                {isBusy ? "處理中…" : mode === "create" ? "建立專案" : activeProject ? "確認另存" : "建立並儲存專案"}
               </button>
             </div>
           </form>
@@ -541,6 +644,24 @@ export function ProjectManagerDialog(props: Props) {
 
         {mode === "promote" && activeProject && (
           <div className="grid" style={{ gap: 12 }}>
+            {!props.account && (
+              <div role="status" className="card-warning-banner row" style={{ justifyContent: "space-between", gap: 8 }}>
+                <span className="small">
+                  尚未登入 Google 帳號。登入後即可將此本機專案連結並儲存至 Google Drive（不會自動上傳其他本機專案）。
+                </span>
+                {props.isGoogleConfigured && (
+                  <button
+                    type="button"
+                    className="btn mixer-button primary"
+                    style={{ padding: "4px 12px", fontSize: 12, flexShrink: 0 }}
+                    disabled={isBusy}
+                    onClick={() => void props.onSignInGoogle()}
+                  >
+                    登入 Google 帳號
+                  </button>
+                )}
+              </div>
+            )}
             <div className="mixer-modal-section grid" style={{ gap: 6 }}>
               <strong style={{ fontSize: 13 }}>專案歌曲跨裝置備份狀態盤點（{activeProject.project.name}）</strong>
               <span className="small" style={{ opacity: 0.8 }}>
@@ -613,6 +734,7 @@ export function ProjectManagerDialog(props: Props) {
                 type="button"
                 className="btn mixer-button primary"
                 disabled={isBusy || !props.account}
+                title={!props.account ? "請先登入 Google 帳號" : undefined}
                 onClick={() => void props.onPromoteToDrive({ backupLocalOriginals: backupOriginals })}
               >
                 {isBusy ? "上傳與同步中…" : "確認儲存到 Google Drive"}
