@@ -50,6 +50,14 @@ export default function IndexPage() {
           )
         ))}
       </div>
+      <footer className="col-full row" style={{ justifyContent: "center", gap: 16, marginTop: 12 }}>
+        <Link href="/privacy" className="small" style={{ color: "var(--muted)" }}>
+          隱私權與資料處理說明
+        </Link>
+        <Link href="/terms" className="small" style={{ color: "var(--muted)" }}>
+          服務條款
+        </Link>
+      </footer>
     </main>
   );
 }

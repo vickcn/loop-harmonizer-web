@@ -2,7 +2,9 @@
 
 import { memo, useEffect, useRef, useState, type CSSProperties } from "react";
 import type { BandSong, StemChannel } from "@/lib/band/bandTypes";
+import type { ProjectSongAvailabilityState, ProjectSongBackupStatus } from "@/lib/projects/projectTypes";
 import type { StemSeparationMode } from "@/lib/separation/stemTypes";
+import type { DriveExportProgress } from "@/lib/google/driveExportManager";
 import { getEffectivePlaybackRate } from "@/lib/band/songModel";
 import { TrackPlayhead } from "./TrackPlayhead";
 import { StemMixer } from "./StemMixer";
@@ -34,11 +36,19 @@ type Props = {
   onRetryPersist?: () => void;
   onReloadFromDb?: () => void;
   onOverwriteDb?: () => void;
+  onExportToDrive?: () => void;
+  onRestoreOriginalFromDrive?: () => void;
+  isGoogleConfigured?: boolean;
+  isDriveExportBusy?: boolean;
+  restoringOriginalFromDrive?: boolean;
+  driveExportProgress?: DriveExportProgress | null;
   isDragging?: boolean;
   isActive?: boolean;
   separationFocusLocked?: boolean;
   isStartingSeparation?: boolean;
   isStartingPlayback?: boolean;
+  isRestoringOnDemand?: boolean;
+  onDemandRestoreMessage?: string | null;
   playbackError?: string | null;
   actionFeedback?: string | null;
   selectedStemId?: string | null;
@@ -172,6 +182,16 @@ function ResumePlayIcon() {
   );
 }
 
+function DriveCloudUploadIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M12 13v8" />
+      <path d="m8 17 4-4 4 4" />
+      <path d="M4 14.9A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242" />
+    </svg>
+  );
+}
+
 const STATUS_COLOR = { stopped: "var(--muted)", playing: "#22c55e", paused: "#f59e0b" };
 const STATUS_LABEL = { stopped: "停止", playing: "播放中", paused: "暫停" };
 const PERSISTENCE_BADGE = {
@@ -183,6 +203,22 @@ const PERSISTENCE_BADGE = {
   conflict: { label: "分頁設定衝突", tone: "is-warn" },
   unsaved: { label: "僅此工作階段", tone: "is-warn" },
 } as const;
+const PROJECT_AVAILABILITY_BADGE: Record<ProjectSongAvailabilityState, { label: string; tone: string }> = {
+  local_playable: { label: "本機可播放", tone: "is-saved" },
+  cloud_not_downloaded: { label: "已備份但尚未下載", tone: "is-drive" },
+  downloading: { label: "下載中", tone: "is-saving" },
+  stems_loaded: { label: "已載入分軌", tone: "is-drive-stem" },
+  needs_reauth: { label: "需要重新授權", tone: "is-warn" },
+  original_missing: { label: "來源音訊遺失", tone: "is-error" },
+  stems_missing: { label: "分軌成果缺失", tone: "is-error" },
+};
+const PROJECT_BACKUP_BADGE: Record<ProjectSongBackupStatus, { label: string; tone: string }> = {
+  local_only: { label: "僅本機可用", tone: "is-warn" },
+  original_backed_up: { label: "原曲已備份", tone: "is-drive" },
+  stems_backed_up: { label: "分軌已備份", tone: "is-drive-stem" },
+  cross_device_ready: { label: "可跨裝置恢復", tone: "is-saved" },
+  pending_sync: { label: "尚待同步", tone: "is-saving" },
+};
 const MANUAL_RATE_MIN = 0.25;
 const MANUAL_RATE_MAX = 4;
 const MANUAL_RATE_STEP = 0.05;
@@ -251,10 +287,20 @@ export const SongCard = memo(function SongCard(props: Props) {
                 ? "AI 音軌分離運算中"
                 : "處理中";
   const isDecodingAudio = song.audioLoadState === "decoding";
+  const hasPlayableStemsWithoutOriginal = Boolean(song.sourceAudioMissing && song.stemIds.length > 0 && song.playbackSource === "stems");
+  const canOnDemandRestore = song.availabilityState === "cloud_not_downloaded";
+  const isDownloadingOnDemand = Boolean(props.isRestoringOnDemand) || song.availabilityState === "downloading";
+  const originalAudioUnavailable =
+    Boolean(song.sourceAudioMissing) || song.persistenceStatus === "missing_audio";
   const audioUnavailable =
     song.persistenceStatus === "restoring"
-    || song.persistenceStatus === "missing_audio"
-    || isDecodingAudio;
+    || isDecodingAudio
+    || (song.persistenceStatus === "missing_audio" && !hasPlayableStemsWithoutOriginal)
+    || (Boolean(song.sourceAudioMissing) && song.playbackSource !== "stems" && !canOnDemandRestore);
+  const playBlockedForAudio = audioUnavailable && !canOnDemandRestore;
+  const playBusy = Boolean(props.isStartingPlayback) || isDownloadingOnDemand;
+  const availabilityInfo = song.availabilityState ? PROJECT_AVAILABILITY_BADGE[song.availabilityState] : null;
+  const backupInfo = song.backupStatus ? PROJECT_BACKUP_BADGE[song.backupStatus] : null;
   const separateActionLabel =
     song.separationStatus === "cancelling"
       ? "正在停…"
@@ -334,7 +380,47 @@ export const SongCard = memo(function SongCard(props: Props) {
           <div className="row" style={{ gap: 6, flexWrap: "wrap", alignItems: "center" }}>
             {props.isActive && <span className="song-focus-pill">焦點中</span>}
             {song.muted && <span className="song-muted-pill">已靜音</span>}
-            {song.audioLoadState === "unloaded" && (
+            {availabilityInfo && (
+              <span
+                className={`song-storage-pill ${availabilityInfo.tone}`}
+                title={song.persistenceMessage || availabilityInfo.label}
+              >
+                {availabilityInfo.label}
+              </span>
+            )}
+            {backupInfo && (
+              <span
+                className={`song-storage-pill ${backupInfo.tone}`}
+                title={`雲端備份狀態：${backupInfo.label}`}
+              >
+                {backupInfo.label}
+              </span>
+            )}
+            {song.source?.provider === "google_drive" && (
+              <span
+                className="song-storage-pill is-drive"
+                title={`Google Drive 來源（File ID: ${song.source.fileId}）`}
+              >
+                Google Drive
+              </span>
+            )}
+            {song.importedStemOrigin && (
+              <span
+                className="song-storage-pill is-drive-stem"
+                title={`已自 Google Drive 匯入分軌（${song.importedStemOrigin.pcmFormat}）`}
+              >
+                雲端分軌
+              </span>
+            )}
+            {song.driveExport && (
+              <span
+                className="song-storage-pill is-saved"
+                title={`已備份至 Google Drive（Revision: ${song.driveExport.revisionId}）`}
+              >
+                已存 Drive
+              </span>
+            )}
+            {song.audioLoadState === "unloaded" && !song.sourceAudioMissing && (
               <span className="song-storage-pill is-warn" title="為節省記憶體採延遲解碼，按播放或載入時才解碼">
                 待按需解碼
               </span>
@@ -370,19 +456,54 @@ export const SongCard = memo(function SongCard(props: Props) {
         </div>
       </div>
 
-      {song.persistenceStatus === "missing_audio" && (
-        <div role="alert" className="card-error-banner">
-          <span>{song.persistenceMessage || "找不到本機原始音檔或檔案已損壞，請重新匯入。"}</span>
-          {props.onRelinkAudio && (
-            <button
-              type="button"
-              className="btn mixer-button"
-              style={{ padding: "4px 10px", fontSize: 12 }}
-              onClick={props.onRelinkAudio}
-            >
-              重新選取音檔
-            </button>
-          )}
+      {isDownloadingOnDemand && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="card-warning-banner"
+          style={{ borderColor: "rgba(56, 189, 248, 0.45)", background: "rgba(56, 189, 248, 0.08)", color: "#bae6fd" }}
+        >
+          <div className="row" style={{ gap: 8, alignItems: "center" }}>
+            <span className="mixer-spinner" aria-hidden="true" />
+            <span>{props.onDemandRestoreMessage || "正在按需恢復雲端音訊與指定分軌…"}</span>
+          </div>
+        </div>
+      )}
+
+      {!isDownloadingOnDemand && !canOnDemandRestore && (song.persistenceStatus === "missing_audio" || song.sourceAudioMissing || song.availabilityState === "needs_reauth" || song.availabilityState === "stems_missing" || song.availabilityState === "original_missing") && (
+        <div role="alert" className={hasPlayableStemsWithoutOriginal ? "card-warning-banner" : "card-error-banner"}>
+          <span>
+            {song.availabilityState === "needs_reauth"
+              ? "此曲資源需登入或重新授權 Google 帳號後才可從雲端恢復。"
+              : song.availabilityState === "stems_missing"
+                ? (song.persistenceMessage || "找不到本機對應版本的分軌成果。")
+                : hasPlayableStemsWithoutOriginal
+                  ? "目前僅已恢復雲端分軌（可直接播放與混音）；缺少原始音檔，原曲切換與重新分離已停用。"
+                  : (song.persistenceMessage || "找不到本機原始音檔或檔案已損壞，請重新匯入。")}
+          </span>
+          <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
+            {(song.source?.provider === "google_drive" || Boolean(song.originalBackup?.driveFileId)) && props.onRestoreOriginalFromDrive && (
+              <button
+                type="button"
+                className="btn mixer-button primary"
+                disabled={Boolean(props.restoringOriginalFromDrive) || focusLocked}
+                style={{ padding: "4px 10px", fontSize: 12 }}
+                onClick={props.onRestoreOriginalFromDrive}
+              >
+                {props.restoringOriginalFromDrive ? "恢復原曲中…" : "☁ 從 Drive 恢復原曲"}
+              </button>
+            )}
+            {props.onRelinkAudio && (
+              <button
+                type="button"
+                className="btn mixer-button"
+                style={{ padding: "4px 10px", fontSize: 12 }}
+                onClick={props.onRelinkAudio}
+              >
+                重新選取音檔
+              </button>
+            )}
+          </div>
         </div>
       )}
 
@@ -441,28 +562,28 @@ export const SongCard = memo(function SongCard(props: Props) {
                 label: song.status === "playing" ? "暫停" : "播放",
                 shortcut: "Space",
                 pressed: song.status === "playing",
-                disabled: focusLocked || props.isStartingPlayback || audioUnavailable,
+                disabled: focusLocked || playBusy || playBlockedForAudio,
                 disabledReason: focusLocked
                   ? focusLockReason
-                  : audioUnavailable
+                  : playBlockedForAudio
                     ? (song.persistenceStatus === "restoring" ? "正在恢復音檔，請稍候" : "缺少本機原始音檔，請先重新選取音檔")
-                    : (props.isStartingPlayback ? "音訊引擎啟動中，請稍候" : undefined),
+                    : (playBusy ? "正在準備音訊資源或啟動播放，請稍候" : undefined),
                 onSelect: props.onPlayPause,
                 renderInline: () => (
                   <IconActionButton
-                    icon={props.isStartingPlayback ? <span className="mixer-spinner" aria-hidden="true" /> : song.status === "playing" ? "⏸" : "▶"}
-                    label={song.status === "playing" ? "暫停" : "播放"}
+                    icon={playBusy ? <span className="mixer-spinner" aria-hidden="true" /> : song.status === "playing" ? "⏸" : "▶"}
+                    label={canOnDemandRestore ? "下載並播放" : song.status === "playing" ? "暫停" : "播放"}
                     shortcut="Space"
                     pressed={song.status === "playing"}
                     primary={song.status === "playing"}
-                    busy={props.isStartingPlayback}
-                    disabled={focusLocked || props.isStartingPlayback || audioUnavailable}
+                    busy={playBusy}
+                    disabled={focusLocked || playBusy || playBlockedForAudio}
                     disabledReason={
                       focusLocked
                         ? focusLockReason
-                        : audioUnavailable
+                        : playBlockedForAudio
                           ? (song.persistenceStatus === "restoring" ? "正在恢復音檔，請稍候" : "缺少本機原始音檔，請先重新選取音檔")
-                          : (props.isStartingPlayback ? "音訊引擎啟動中，請稍候" : undefined)
+                          : (playBusy ? "正在準備音訊資源或啟動播放，請稍候" : undefined)
                     }
                     onClick={props.onPlayPause}
                   />
@@ -716,14 +837,16 @@ export const SongCard = memo(function SongCard(props: Props) {
                 {
                   key: "separate",
                   label: separateActionLabel,
-                  disabled: focusLocked || isSeparationBusy || audioUnavailable,
+                  disabled: focusLocked || isSeparationBusy || audioUnavailable || originalAudioUnavailable,
                   disabledReason: focusLocked
                     ? focusLockReason
                     : isSeparationBusy
                       ? "正在準備或進行音軌分離，請稍候"
-                      : audioUnavailable
-                        ? "請先等待恢復、解碼或重新選取原始音檔"
-                        : undefined,
+                      : originalAudioUnavailable
+                        ? "缺少原始音檔，無法執行或重跑 Demucs 音軌分離"
+                        : audioUnavailable
+                          ? "請先等待恢復、解碼或重新選取原始音檔"
+                          : undefined,
                   onSelect: () =>
                     props.onSeparate(
                       mode,
@@ -741,15 +864,17 @@ export const SongCard = memo(function SongCard(props: Props) {
                       label={separateActionLabel}
                       primary
                       busy={showSeparationRolling}
-                      disabled={focusLocked || isSeparationBusy || audioUnavailable}
+                      disabled={focusLocked || isSeparationBusy || audioUnavailable || originalAudioUnavailable}
                       disabledReason={
                         focusLocked
                           ? focusLockReason
                           : isSeparationBusy
                             ? "正在準備或進行音軌分離，請稍候"
-                            : audioUnavailable
-                              ? "請先等待恢復、解碼或重新選取原始音檔"
-                              : undefined
+                            : originalAudioUnavailable
+                              ? "缺少原始音檔，無法執行或重跑 Demucs 音軌分離"
+                              : audioUnavailable
+                                ? "請先等待恢復、解碼或重新選取原始音檔"
+                                : undefined
                       }
                       className="is-compact"
                       onClick={() =>
@@ -790,8 +915,12 @@ export const SongCard = memo(function SongCard(props: Props) {
                         key: "source-toggle",
                         label: song.playbackSource === "stems" ? "切換為原始混音" : "切換為分軌混音",
                         pressed: song.playbackSource === "stems",
-                        disabled: focusLocked || isSeparating,
-                        disabledReason: focusLocked ? focusLockReason : undefined,
+                        disabled: focusLocked || isSeparating || (song.playbackSource === "stems" && originalAudioUnavailable),
+                        disabledReason: focusLocked
+                          ? focusLockReason
+                          : (song.playbackSource === "stems" && originalAudioUnavailable)
+                            ? "缺少原始音檔，請先恢復或重新選取原曲後再切回原始混音"
+                            : undefined,
                         onSelect: () => props.onSwitchSource(song.playbackSource === "stems" ? "original" : "stems"),
                         renderInline: () => (
                           <IconActionButton
@@ -799,10 +928,54 @@ export const SongCard = memo(function SongCard(props: Props) {
                             label={song.playbackSource === "stems" ? "目前：分軌混音（點擊切換原始混音）" : "目前：原始混音（點擊切換分軌混音）"}
                             pressed={song.playbackSource === "stems"}
                             primary={song.playbackSource === "stems"}
-                            disabled={focusLocked || isSeparating}
-                            disabledReason={focusLocked ? focusLockReason : undefined}
+                            disabled={focusLocked || isSeparating || (song.playbackSource === "stems" && originalAudioUnavailable)}
+                            disabledReason={
+                              focusLocked
+                                ? focusLockReason
+                                : (song.playbackSource === "stems" && originalAudioUnavailable)
+                                  ? "缺少原始音檔，請先恢復或重新選取原曲後再切回原始混音"
+                                  : undefined
+                            }
                             className="is-compact"
                             onClick={() => props.onSwitchSource(song.playbackSource === "stems" ? "original" : "stems")}
+                          />
+                        ),
+                      },
+                    ] satisfies AdaptiveActionItem[])
+                  : []),
+                ...(song.separationStatus === "completed" &&
+                props.isGoogleConfigured &&
+                props.onExportToDrive
+                  ? ([
+                      {
+                        key: "export-to-drive",
+                        label: "儲存成果到 Google Drive",
+                        disabled: focusLocked || Boolean(props.isDriveExportBusy),
+                        disabledReason: focusLocked
+                          ? focusLockReason
+                          : props.isDriveExportBusy
+                            ? "此歌曲正在上傳成果至 Google Drive"
+                            : undefined,
+                        onSelect: () => props.onExportToDrive?.(),
+                        renderInline: () => (
+                          <IconActionButton
+                            icon={
+                              props.isDriveExportBusy
+                                ? <span className="mixer-spinner" aria-hidden="true" />
+                                : <DriveCloudUploadIcon />
+                            }
+                            label="儲存成果到 Google Drive"
+                            busy={Boolean(props.isDriveExportBusy)}
+                            disabled={focusLocked || Boolean(props.isDriveExportBusy)}
+                            disabledReason={
+                              focusLocked
+                                ? focusLockReason
+                                : props.isDriveExportBusy
+                                  ? "此歌曲正在上傳成果至 Google Drive"
+                                  : undefined
+                            }
+                            className="is-compact"
+                            onClick={() => props.onExportToDrive?.()}
                           />
                         ),
                       },
@@ -1119,6 +1292,31 @@ export const SongCard = memo(function SongCard(props: Props) {
               </span>
             </div>
           )}
+          {props.driveExportProgress && (
+            <div role="status" aria-live="polite" className="grid mixer-modal-section" style={{ gap: 6 }}>
+              <div className="row" style={{ justifyContent: "space-between", gap: 8 }}>
+                <div className="row" style={{ gap: 8, alignItems: "center" }}>
+                  <span className="mixer-spinner" aria-hidden="true" />
+                  <span className="small" style={{ color: "#bae6fd" }}>{props.driveExportProgress.message}</span>
+                </div>
+                {props.driveExportProgress.totalBytes > 0 && (
+                  <span className="small" style={{ fontVariantNumeric: "tabular-nums" }}>
+                    {Math.min(100, Math.round((props.driveExportProgress.uploadedBytes / props.driveExportProgress.totalBytes) * 100))}%
+                  </span>
+                )}
+              </div>
+              <div className={`mixer-progress-track${props.driveExportProgress.totalBytes > 0 ? "" : " is-indeterminate"}`}>
+                <div
+                  className="mixer-progress-fill"
+                  style={
+                    props.driveExportProgress.totalBytes > 0
+                      ? { width: `${Math.min(100, Math.round((props.driveExportProgress.uploadedBytes / props.driveExportProgress.totalBytes) * 100))}%` }
+                      : undefined
+                  }
+                />
+              </div>
+            </div>
+          )}
           {song.separationStatus === "failed" && (
             <div role="alert" className="card-error-banner" style={{ alignItems: "flex-start" }}>
               <div className="grid" style={{ gap: 4, flex: "1 1 220px", minWidth: 0 }}>
@@ -1193,7 +1391,13 @@ export const SongCard = memo(function SongCard(props: Props) {
   && prev.separationFocusLocked === next.separationFocusLocked
   && prev.isStartingSeparation === next.isStartingSeparation
   && prev.isStartingPlayback === next.isStartingPlayback
+  && prev.isRestoringOnDemand === next.isRestoringOnDemand
+  && prev.onDemandRestoreMessage === next.onDemandRestoreMessage
   && prev.playbackError === next.playbackError
   && prev.actionFeedback === next.actionFeedback
   && prev.selectedStemId === next.selectedStemId
+  && prev.isGoogleConfigured === next.isGoogleConfigured
+  && prev.isDriveExportBusy === next.isDriveExportBusy
+  && prev.restoringOriginalFromDrive === next.restoringOriginalFromDrive
+  && prev.driveExportProgress === next.driveExportProgress
 ));

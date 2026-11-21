@@ -24,6 +24,7 @@ wheels/
 MANIFEST
 *.*workspace
 **.env**
+!.env.example
 **.patch
 
 # PyInstaller
@@ -164,7 +165,12 @@ logs/
 # 暫存檔案
 memo*
 *.tmp*
-*old*
+*.old
+*.old.*
+*-old.*
+*-old-*
+!lib/google/driveFolderManager.ts
+!spec/google-drive-folder.spec.mjs
 lib/audioEngine.ts.old.bak.ts
 lib/audioEngine.ts.old.bak
 env*

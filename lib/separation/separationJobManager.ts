@@ -12,6 +12,7 @@ import {
   updateCheckpointStatus,
 } from "../storage/separationCheckpointStore.ts";
 import { getPersistedSongRecord } from "../storage/songSessionStore.ts";
+import { getProjectRecord } from "../storage/projectStore.ts";
 import {
   runSeparationJob,
   type SeparationJobRunnerDeps,
@@ -55,6 +56,8 @@ export const AUTO_RESUME_RETRY_STORAGE_KEY = "loop-harmonizer:auto-resume-retry:
 export type SeparationJobState = {
   taskId: string;
   songId: string;
+  projectId?: string | null;
+  entryId?: string | null;
   songName?: string;
   requestedMode?: "two_stem" | "four_stem";
   generation: number;
@@ -108,6 +111,8 @@ type CoordinatorLike = Pick<
 type StartJobOptions = {
   taskId?: string;
   songId: string;
+  projectId?: string | null;
+  entryId?: string | null;
   songName?: string;
   throttleMs?: number;
   cooldownMs?: number;
@@ -483,6 +488,16 @@ export class SeparationJobManager implements SeparationJobSinkPort {
     return this.globalFocusOwnerSongId;
   }
 
+  getActiveJobsForOtherProjects(currentProjectId: string | null): SeparationJobState[] {
+    return this.snapshot.filter(
+      (job) =>
+        Boolean(job.projectId) &&
+        job.projectId !== currentProjectId &&
+        !isTerminalJobStage(job.stage) &&
+        job.stage !== "interrupted",
+    );
+  }
+
   setGlobalFocusActive(active: boolean, ownerSongId: string | null = null): void {
     this.globalFocusActive = active;
     this.globalFocusOwnerSongId = active ? ownerSongId : null;
@@ -563,6 +578,8 @@ export class SeparationJobManager implements SeparationJobSinkPort {
       {
         taskId,
         songId: options.songId,
+        projectId: options.projectId ?? prevJob?.projectId ?? null,
+        entryId: options.entryId ?? prevJob?.entryId ?? options.songId,
         songName: options.songName ?? prevJob?.songName,
         generation: controller.generation,
         ownerTabId: getOrCreateTabId(),
@@ -772,6 +789,8 @@ export class SeparationJobManager implements SeparationJobSinkPort {
     const next: SeparationJobState = {
       taskId,
       songId: patch.songId ?? current?.songId ?? "",
+      projectId: patch.projectId !== undefined ? patch.projectId : current?.projectId,
+      entryId: patch.entryId !== undefined ? patch.entryId : current?.entryId,
       songName: patch.songName ?? current?.songName,
       requestedMode: patch.requestedMode ?? current?.requestedMode,
       generation: resolvedGeneration,
@@ -998,6 +1017,8 @@ export class SeparationJobManager implements SeparationJobSinkPort {
       const outcome = await this.runSongSeparation({
         taskId,
         songId: job.songId,
+        projectId: job.projectId,
+        entryId: job.entryId,
         songName: job.songName,
         mode: job.requestedMode,
         isAutoResume: true,
@@ -1198,6 +1219,8 @@ export class SeparationJobManager implements SeparationJobSinkPort {
     return this.runSongSeparation({
       taskId,
       songId: job.songId,
+      projectId: job.projectId,
+      entryId: job.entryId,
       songName: job.songName,
       isAutoResume: false,
       ...overrides,
@@ -1556,6 +1579,8 @@ export class SeparationJobManager implements SeparationJobSinkPort {
       const outcome = await this.runSongSeparation({
         taskId,
         songId: job.songId,
+        projectId: job.projectId,
+        entryId: job.entryId,
         songName: job.songName,
         mode: job.requestedMode,
         isAutoResume: true,
@@ -2015,7 +2040,23 @@ export class SeparationJobManager implements SeparationJobSinkPort {
         isCheckpointLeaseActive(checkpoint, nowTs),
     );
     const persistedSong = await getPersistedSongRecord(checkpoint.songId).catch(() => null);
-    const isFinalized = isPersistedSongAuthoritativelyFinalized(persistedSong, checkpoint);
+    let isFinalized = isPersistedSongAuthoritativelyFinalized(persistedSong, checkpoint);
+    let resolvedProjectEntryName: string | undefined;
+    if (!persistedSong && checkpoint.projectId) {
+      const projRec = await getProjectRecord(checkpoint.projectId).catch(() => null);
+      const targetEntryId = checkpoint.entryId || checkpoint.songId;
+      const projEntry = projRec?.project.songs.find((e) => e.entryId === targetEntryId);
+      if (projEntry) {
+        resolvedProjectEntryName = projEntry.displayName;
+        if (
+          checkpoint.status === "completed" &&
+          Boolean(checkpoint.finalizedAt) &&
+          projEntry.artifactRef?.localTaskId === checkpoint.taskId
+        ) {
+          isFinalized = true;
+        }
+      }
+    }
 
     const needsLockProbe =
       !hasActiveLocal &&
@@ -2032,7 +2073,7 @@ export class SeparationJobManager implements SeparationJobSinkPort {
       isFinalized,
     });
 
-    const resolvedSongName = existing?.songName ?? persistedSong?.name;
+    const resolvedSongName = existing?.songName ?? persistedSong?.name ?? resolvedProjectEntryName;
     const cpGeneration = Math.max(
       checkpoint.lease?.generation ?? 0,
       checkpoint.finalizationFence?.generation ?? 0,
@@ -2143,6 +2184,8 @@ export class SeparationJobManager implements SeparationJobSinkPort {
       {
         taskId,
         songId: checkpoint.songId,
+        projectId: checkpoint.projectId ?? existing?.projectId ?? null,
+        entryId: checkpoint.entryId ?? existing?.entryId ?? checkpoint.songId,
         songName: resolvedSongName,
         generation: cpGeneration,
         ownerJobToken:

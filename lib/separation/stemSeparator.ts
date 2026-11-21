@@ -154,6 +154,8 @@ export type StemSeparationOptions = {
   mode: StemSeparationMode;
   controller?: SeparationTaskController;
   songId?: string;
+  projectId?: string | null;
+  entryId?: string | null;
   sourceAudioHash?: string;
   checkpointTaskId?: string;
   userAuthorized?: boolean;
@@ -1270,6 +1272,8 @@ export async function separateAudio(
           sampleRate: DEMUCS_SAMPLE_RATE,
           userAuthorized: options.userAuthorized ?? true,
           status: "queued",
+          projectId: options.projectId ?? null,
+          entryId: options.entryId ?? null,
         });
         await saveCheckpoint(initCp);
         recordSeparationDiagnostic({

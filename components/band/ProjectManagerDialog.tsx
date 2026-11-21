@@ -1,0 +1,802 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import type { GoogleAccount } from "@/lib/google/googleAuthTypes";
+import { computeEntryBackupStatus } from "@/lib/projects/projectModel";
+import { DRIVE_CAS_LIMITATION_NOTE } from "@/lib/projects/projectDriveSync";
+import type { PromoteLocalToDriveProgress } from "@/lib/projects/projectManager";
+import type {
+  ProjectOfflineAssessment,
+  ProjectOfflineDownloadProgress,
+} from "@/lib/projects/projectRestoreManager";
+import type {
+  PersistedProjectRecord,
+  ProjectListEntrySummary,
+  ProjectSongBackupStatus,
+  ProjectStorageProvider,
+} from "@/lib/projects/projectTypes";
+
+export type ProjectDialogMode =
+  | null
+  | "list"
+  | "create"
+  | "save_as"
+  | "rename"
+  | "promote"
+  | "offline"
+  | "conflict";
+
+type SortMode = "updated_desc" | "updated_asc" | "name_asc";
+type ProviderFilter = "all" | "local" | "google_drive";
+
+type Props = {
+  open: boolean;
+  mode: ProjectDialogMode;
+  activeProject: PersistedProjectRecord | null;
+  renameTarget: { projectId: string; name: string } | null;
+  projects: ProjectListEntrySummary[];
+  projectsLoading: boolean;
+  cloudError: string | null;
+  cloudIncompleteReason?: string | null;
+  account: GoogleAccount | null;
+  isGoogleConfigured: boolean;
+  hasLegacyWorkspaceSongs: boolean;
+  busyMessage: string | null;
+  errorMessage: string | null;
+  promoteProgress: PromoteLocalToDriveProgress | null;
+  promoteBackupFailures: Array<{ entryId: string; displayName: string; reason: string }>;
+  offlineAssessment: ProjectOfflineAssessment | null;
+  offlineAssessmentLoading: boolean;
+  offlineDownloadProgress: ProjectOfflineDownloadProgress | null;
+  offlineDownloadResult: {
+    completedCount: number;
+    reusedCount: number;
+    failedSongs: Array<{ entryId: string; displayName: string; reason: string }>;
+    cancelled: boolean;
+  } | null;
+  onClose: () => void;
+  onChangeMode: (mode: Exclude<ProjectDialogMode, null>) => void;
+  onRefreshProjects: () => void;
+  onOpenProject: (entry: ProjectListEntrySummary) => void | Promise<void>;
+  onCreateProject: (params: {
+    name: string;
+    description?: string;
+    storageProvider: ProjectStorageProvider;
+  }) => void | Promise<void>;
+  onSaveAsProject: (params: {
+    name: string;
+    description?: string;
+    storageProvider: ProjectStorageProvider;
+  }) => void | Promise<void>;
+  onRenameProject: (params: { projectId: string; name: string }) => void | Promise<void>;
+  onStartRenameFromList: (entry: ProjectListEntrySummary) => void;
+  onDeleteProjectEntry: (entry: ProjectListEntrySummary) => void;
+  onPromoteToDrive: (params: { backupLocalOriginals: boolean }) => void | Promise<void>;
+  onCancelPromote: () => void;
+  onStartOfflineDownload: () => void | Promise<void>;
+  onCancelOfflineDownload: () => void;
+  onResolveConflict: (params: {
+    strategy: "load_remote" | "save_local_as_new" | "overwrite_remote";
+    newProjectNameForSaveAs?: string;
+  }) => void | Promise<void>;
+  onMigrateLegacyWorkspace: () => void | Promise<void>;
+  onSignInGoogle: () => void | Promise<void>;
+};
+
+const BACKUP_LABELS: Record<ProjectSongBackupStatus, { label: string; toneClass: string }> = {
+  local_only: { label: "僅本機可用", toneClass: "is-warn" },
+  original_backed_up: { label: "原曲已備份", toneClass: "is-drive" },
+  stems_backed_up: { label: "分軌已備份", toneClass: "is-drive-stem" },
+  cross_device_ready: { label: "可跨裝置恢復", toneClass: "is-saved" },
+  pending_sync: { label: "尚待同步", toneClass: "is-saving" },
+};
+
+function formatTime(isoOrMs: string | number): string {
+  const ts = typeof isoOrMs === "number" ? isoOrMs : Date.parse(isoOrMs);
+  if (!Number.isFinite(ts) || ts <= 0) return "未知時間";
+  try {
+    return new Date(ts).toLocaleString("zh-TW", {
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return String(isoOrMs);
+  }
+}
+
+function formatMiB(bytes: number | null): string {
+  if (bytes === null) return "瀏覽器未提供";
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+export function ProjectManagerDialog(props: Props) {
+  const { open, mode, activeProject, busyMessage } = props;
+  const isBusy = Boolean(busyMessage) || Boolean(props.promoteProgress) || Boolean(props.offlineDownloadProgress);
+
+  const [searchText, setSearchText] = useState("");
+  const [sortMode, setSortMode] = useState<SortMode>("updated_desc");
+  const [providerFilter, setProviderFilter] = useState<ProviderFilter>("all");
+
+  const [formName, setFormName] = useState("");
+  const [formDesc, setFormDesc] = useState("");
+  const [formProvider, setFormProvider] = useState<ProjectStorageProvider>("local");
+
+  const [backupOriginals, setBackupOriginals] = useState(true);
+  const [conflictSaveAsName, setConflictSaveAsName] = useState("");
+
+  useEffect(() => {
+    if (!open) return;
+    if (mode === "create") {
+      setFormName("");
+      setFormDesc("");
+      setFormProvider(props.isGoogleConfigured && props.account ? "google_drive" : "local");
+    } else if (mode === "save_as") {
+      setFormName(activeProject ? `${activeProject.project.name}（副本）` : "目前工作空間副本");
+      setFormDesc(activeProject?.project.description ?? "");
+      setFormProvider(
+        activeProject?.storageProvider === "google_drive" && props.account ? "google_drive" : "local",
+      );
+    } else if (mode === "rename") {
+      setFormName(props.renameTarget?.name ?? activeProject?.project.name ?? "");
+    } else if (mode === "conflict") {
+      setConflictSaveAsName(activeProject ? `${activeProject.project.name}（衝突本機副本）` : "衝突副本");
+    }
+  }, [open, mode, activeProject, props.renameTarget, props.isGoogleConfigured, props.account]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !isBusy) {
+        event.preventDefault();
+        props.onClose();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [open, isBusy, props]);
+
+  const filteredProjects = useMemo(() => {
+    const q = searchText.trim().toLowerCase();
+    const list = props.projects.filter((item) => {
+      if (providerFilter !== "all" && item.storageProvider !== providerFilter) return false;
+      if (!q) return true;
+      return (
+        item.name.toLowerCase().includes(q) ||
+        (item.description ?? "").toLowerCase().includes(q)
+      );
+    });
+    return list.slice().sort((a, b) => {
+      if (sortMode === "name_asc") return a.name.localeCompare(b.name, "zh-Hant");
+      const ta = Date.parse(a.updatedAt) || a.localUpdatedAt || 0;
+      const tb = Date.parse(b.updatedAt) || b.localUpdatedAt || 0;
+      return sortMode === "updated_asc" ? ta - tb : tb - ta;
+    });
+  }, [props.projects, searchText, sortMode, providerFilter]);
+
+  if (!open || !mode) return null;
+
+  const titleByMode: Record<Exclude<ProjectDialogMode, null>, string> = {
+    list: "專案管理與開啟",
+    create: "新增專案",
+    save_as: "另存新專案",
+    rename: "重新命名專案",
+    promote: "將本機專案儲存到 Google Drive",
+    offline: "下載整個專案供離線使用",
+    conflict: "處理跨裝置專案版本衝突",
+  };
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="project-manager-dialog-title"
+      className="mixer-modal-backdrop"
+      onClick={(event) => {
+        if (!isBusy && event.target === event.currentTarget) {
+          props.onClose();
+        }
+      }}
+    >
+      <div className="card mixer-modal-panel" style={{ width: "min(700px, 100%)" }}>
+        <div className="row" style={{ justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+          <div className="grid" style={{ gap: 4 }}>
+            <strong id="project-manager-dialog-title" style={{ fontSize: 16 }}>
+              {titleByMode[mode]}
+            </strong>
+            <span className="small" style={{ opacity: 0.78 }}>
+              {props.account
+                ? `Google 帳戶：${props.account.displayName || props.account.email || props.account.accountId}`
+                : "目前為本機匿名模式（完全可用，無須登入 Google）"}
+            </span>
+          </div>
+          {!isBusy && (
+            <button type="button" className="btn mixer-button" style={{ minHeight: 36, padding: "4px 10px", fontSize: 12 }} onClick={props.onClose}>
+              關閉
+            </button>
+          )}
+        </div>
+
+        {busyMessage && (
+          <div role="status" aria-live="polite" className="row mixer-modal-section" style={{ gap: 8, alignItems: "center" }}>
+            <span className="mixer-spinner" aria-hidden="true" />
+            <span className="small" style={{ color: "#bae6fd", fontWeight: 600 }}>{busyMessage}</span>
+          </div>
+        )}
+
+        {props.errorMessage && (
+          <div role="alert" className="card-error-banner">
+            <span>{props.errorMessage}</span>
+          </div>
+        )}
+
+        {mode === "list" && (
+          <div className="grid" style={{ gap: 12 }}>
+            <div className="row" style={{ gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <input
+                type="search"
+                className="project-search-input"
+                placeholder="搜尋專案名稱或備註…"
+                value={searchText}
+                onChange={(e) => setSearchText(e.target.value)}
+                aria-label="搜尋專案"
+              />
+              <select
+                className="project-select-input"
+                value={providerFilter}
+                onChange={(e) => setProviderFilter(e.target.value as ProviderFilter)}
+                aria-label="篩選儲存來源"
+              >
+                <option value="all">全部來源</option>
+                <option value="local">僅本機</option>
+                <option value="google_drive">Google Drive</option>
+              </select>
+              <select
+                className="project-select-input"
+                value={sortMode}
+                onChange={(e) => setSortMode(e.target.value as SortMode)}
+                aria-label="專案排序方式"
+              >
+                <option value="updated_desc">最近修改優先</option>
+                <option value="updated_asc">最舊修改優先</option>
+                <option value="name_asc">依名稱排序</option>
+              </select>
+              <button
+                type="button"
+                className="btn mixer-button"
+                disabled={props.projectsLoading || isBusy}
+                onClick={props.onRefreshProjects}
+              >
+                {props.projectsLoading ? (
+                  <>
+                    <span className="mixer-spinner" aria-hidden="true" />
+                    讀取清單…
+                  </>
+                ) : (
+                  "↻ 重新整理"
+                )}
+              </button>
+              <button
+                type="button"
+                className="btn mixer-button primary"
+                disabled={isBusy}
+                onClick={() => props.onChangeMode("create")}
+              >
+                ＋ 新增專案
+              </button>
+            </div>
+
+            {props.hasLegacyWorkspaceSongs && (
+              <div className="row mixer-modal-section" style={{ justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+                <div className="grid" style={{ gap: 2 }}>
+                  <strong style={{ fontSize: 13 }}>既有預設工作空間遷移</strong>
+                  <span className="small" style={{ opacity: 0.78 }}>
+                    保留原本資料不動，另外建立正式本機專案並沿用已完成分軌。
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="btn mixer-button"
+                  disabled={isBusy}
+                  onClick={() => void props.onMigrateLegacyWorkspace()}
+                >
+                  將目前工作空間另存為專案
+                </button>
+              </div>
+            )}
+
+            {props.cloudIncompleteReason && (
+              <div role="status" className="card-warning-banner grid" style={{ gap: 2 }}>
+                <strong style={{ fontSize: 12 }}>Google Drive 雲端專案清單可能不完整</strong>
+                <span className="small">
+                  僅顯示已讀取的部分專案（尚未列出全部，或部分項目讀取異常）：{props.cloudIncompleteReason}
+                </span>
+              </div>
+            )}
+
+            {props.cloudError && props.cloudError !== props.cloudIncompleteReason && (
+              <div role="status" className="card-warning-banner">
+                <span>Google Drive 雲端清單讀取異常（仍可正常開啟本機專案與快取）：{props.cloudError}</span>
+              </div>
+            )}
+
+            {filteredProjects.length === 0 ? (
+              <div className="mixer-modal-section" style={{ textAlign: "center", padding: "24px 12px" }}>
+                <p className="small" style={{ margin: 0, opacity: 0.75 }}>
+                  {props.projectsLoading ? "正在讀取專案清單（僅讀取 Metadata）…" : "找不到符合條件的專案"}
+                </p>
+              </div>
+            ) : (
+              <div className="grid" style={{ gap: 8, maxHeight: "48dvh", overflowY: "auto" }}>
+                {filteredProjects.map((entry) => {
+                  const isCurrent = activeProject?.projectId === entry.projectId;
+                  return (
+                    <div key={entry.projectId} className={`project-list-item${isCurrent ? " is-current" : ""}`}>
+                      <div className="grid" style={{ gap: 4, flex: "1 1 240px", minWidth: 0 }}>
+                        <div className="row" style={{ gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                          <strong style={{ fontSize: 14 }}>{entry.name}</strong>
+                          {isCurrent && <span className="song-focus-pill">目前開啟</span>}
+                          <span className={`project-provider-badge ${entry.storageProvider === "google_drive" ? "is-drive" : "is-local"}`}>
+                            {entry.storageProvider === "google_drive" ? "Google Drive" : "本機"}
+                          </span>
+                          {entry.sourceLocation === "cloud_only" && (
+                            <span className="song-storage-pill is-drive">尚未下載本機</span>
+                          )}
+                          {entry.hasConflict && (
+                            <span className="song-storage-pill is-warn">版本衝突</span>
+                          )}
+                        </div>
+                        <span className="small" style={{ opacity: 0.78 }}>
+                          {entry.songCount} 首歌曲 · v{entry.revision} · 修改於 {formatTime(entry.updatedAt || entry.localUpdatedAt)}
+                          {entry.storageProvider === "google_drive" && entry.songCount > 0
+                            ? ` · 跨裝置就緒 ${entry.backupSummary.crossDeviceReadyCount}/${entry.songCount} 首`
+                            : ""}
+                        </span>
+                        {entry.description && (
+                          <span className="small" style={{ opacity: 0.65 }}>{entry.description}</span>
+                        )}
+                      </div>
+                      <div className="row" style={{ gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                        <button
+                          type="button"
+                          className="btn mixer-button primary"
+                          disabled={isBusy}
+                          style={{ padding: "6px 12px", fontSize: 12 }}
+                          onClick={() => void props.onOpenProject(entry)}
+                        >
+                          {isCurrent ? "重新載入" : "開啟"}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn mixer-button"
+                          disabled={isBusy}
+                          style={{ padding: "6px 10px", fontSize: 12 }}
+                          onClick={() => props.onStartRenameFromList(entry)}
+                        >
+                          重新命名
+                        </button>
+                        <button
+                          type="button"
+                          className="btn mixer-button"
+                          disabled={isBusy}
+                          style={{ padding: "6px 10px", fontSize: 12, color: "#fca5a5" }}
+                          onClick={() => props.onDeleteProjectEntry(entry)}
+                        >
+                          刪除
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {(mode === "create" || mode === "save_as") && (
+          <form
+            className="grid"
+            style={{ gap: 12 }}
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (!formName.trim() || isBusy) return;
+              const payload = {
+                name: formName.trim(),
+                description: formDesc.trim() || undefined,
+                storageProvider: formProvider,
+              };
+              if (mode === "create") {
+                void props.onCreateProject(payload);
+              } else {
+                void props.onSaveAsProject(payload);
+              }
+            }}
+          >
+            <label className="grid" style={{ gap: 4 }}>
+              <span className="small" style={{ fontWeight: 600 }}>專案名稱 *</span>
+              <input
+                type="text"
+                required
+                maxLength={80}
+                className="project-text-input"
+                placeholder="例如：主日敬拜、巡演歌單"
+                value={formName}
+                onChange={(e) => setFormName(e.target.value)}
+                disabled={isBusy}
+              />
+            </label>
+            <label className="grid" style={{ gap: 4 }}>
+              <span className="small" style={{ fontWeight: 600 }}>備註說明（選填）</span>
+              <input
+                type="text"
+                maxLength={160}
+                className="project-text-input"
+                placeholder="例如：2026 春季場專用調性與節拍設定"
+                value={formDesc}
+                onChange={(e) => setFormDesc(e.target.value)}
+                disabled={isBusy}
+              />
+            </label>
+            <div className="grid" style={{ gap: 6 }}>
+              <span className="small" style={{ fontWeight: 600 }}>儲存位置</span>
+              <label className="row mixer-modal-option">
+                <input
+                  type="radio"
+                  name="project-storage-provider"
+                  checked={formProvider === "local"}
+                  onChange={() => setFormProvider("local")}
+                  disabled={isBusy}
+                />
+                <div className="grid" style={{ gap: 2 }}>
+                  <strong style={{ fontSize: 13 }}>本機專案（IndexedDB）</strong>
+                  <span className="small" style={{ opacity: 0.78 }}>
+                    完全無須登入 Google，即時離線使用；後續也可隨時儲存到 Google Drive。
+                  </span>
+                </div>
+              </label>
+              <label className="row mixer-modal-option" style={{ opacity: props.isGoogleConfigured && props.account ? 1 : 0.7 }}>
+                <input
+                  type="radio"
+                  name="project-storage-provider"
+                  checked={formProvider === "google_drive"}
+                  onChange={() => setFormProvider("google_drive")}
+                  disabled={isBusy || !props.isGoogleConfigured || !props.account}
+                />
+                <div className="grid" style={{ gap: 2, flex: 1 }}>
+                  <strong style={{ fontSize: 13 }}>Google Drive 雲端專案</strong>
+                  <span className="small" style={{ opacity: 0.78 }}>
+                    直接寫入您帳戶的 .loopHarmonizer/projects/（不經後端伺服器），支援跨裝置清單、自動同步與衝突防護。
+                  </span>
+                  {(!props.isGoogleConfigured || !props.account) && (
+                    <div className="row" style={{ gap: 8, marginTop: 4 }}>
+                      <span className="small" style={{ color: "#fde68a" }}>
+                        {!props.isGoogleConfigured ? "未設定 Google OAuth 環境變數" : "尚未登入 Google 帳號"}
+                      </span>
+                      {props.isGoogleConfigured && !props.account && (
+                        <button
+                          type="button"
+                          className="btn mixer-button"
+                          style={{ padding: "3px 10px", fontSize: 12 }}
+                          onClick={() => void props.onSignInGoogle()}
+                        >
+                          先登入 Google
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </label>
+            </div>
+            {mode === "save_as" && (
+              <div className="small" style={{ opacity: 0.78 }}>
+                提示：另存新專案只複製專案混音設定與版本引用，不會複製 WAV 音檔與 Demucs 分軌快取。
+              </div>
+            )}
+            <div className="row mixer-modal-actions">
+              <button type="button" className="btn mixer-button" disabled={isBusy} onClick={props.onClose}>
+                取消
+              </button>
+              <button type="submit" className="btn mixer-button primary" disabled={isBusy || !formName.trim()}>
+                {isBusy ? "處理中…" : mode === "create" ? "建立專案" : "確認另存"}
+              </button>
+            </div>
+          </form>
+        )}
+
+        {mode === "rename" && (
+          <form
+            className="grid"
+            style={{ gap: 12 }}
+            onSubmit={(e) => {
+              e.preventDefault();
+              const targetId = props.renameTarget?.projectId ?? activeProject?.projectId;
+              if (!targetId || !formName.trim() || isBusy) return;
+              void props.onRenameProject({ projectId: targetId, name: formName.trim() });
+            }}
+          >
+            <label className="grid" style={{ gap: 4 }}>
+              <span className="small" style={{ fontWeight: 600 }}>新專案名稱 *</span>
+              <input
+                type="text"
+                required
+                maxLength={80}
+                className="project-text-input"
+                value={formName}
+                onChange={(e) => setFormName(e.target.value)}
+                disabled={isBusy}
+              />
+            </label>
+            <div className="row mixer-modal-actions">
+              <button type="button" className="btn mixer-button" disabled={isBusy} onClick={props.onClose}>
+                取消
+              </button>
+              <button type="submit" className="btn mixer-button primary" disabled={isBusy || !formName.trim()}>
+                {isBusy ? "儲存中…" : "確認重新命名"}
+              </button>
+            </div>
+          </form>
+        )}
+
+        {mode === "promote" && activeProject && (
+          <div className="grid" style={{ gap: 12 }}>
+            <div className="mixer-modal-section grid" style={{ gap: 6 }}>
+              <strong style={{ fontSize: 13 }}>專案歌曲跨裝置備份狀態盤點（{activeProject.project.name}）</strong>
+              <span className="small" style={{ opacity: 0.8 }}>
+                僅有同時具備 Drive 原曲（或原曲備份）且已上傳指定分軌（或未分離）的歌曲，才會標記為「可跨裝置恢復」。
+              </span>
+              <div className="grid" style={{ gap: 6, maxHeight: 200, overflowY: "auto" }}>
+                {activeProject.project.songs.length === 0 ? (
+                  <span className="small" style={{ opacity: 0.7 }}>此專案目前沒有歌曲，將只上傳專案結構至 Google Drive。</span>
+                ) : (
+                  activeProject.project.songs.map((entry) => {
+                    const st = computeEntryBackupStatus(entry, props.account?.accountId);
+                    const badge = BACKUP_LABELS[st];
+                    return (
+                      <div key={entry.entryId} className="row" style={{ justifyContent: "space-between", gap: 8 }}>
+                        <span className="small">{entry.displayName}</span>
+                        <span className={`song-storage-pill ${badge.toneClass}`}>{badge.label}</span>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+
+            <label className="row mixer-modal-option">
+              <input
+                type="checkbox"
+                checked={backupOriginals}
+                onChange={(e) => setBackupOriginals(e.target.checked)}
+                disabled={isBusy}
+              />
+              <div className="grid" style={{ gap: 2 }}>
+                <strong style={{ fontSize: 13 }}>一併備份本機原始音檔到 Google Drive</strong>
+                <span className="small" style={{ opacity: 0.78 }}>
+                  上傳至 .loopHarmonizer/songs/song_&lt;hash&gt;/originals/；相同內容雜湊的檔案已存在時自動重用，不改變原 hash。
+                </span>
+              </div>
+            </label>
+
+            {props.promoteProgress && (
+              <div className="grid mixer-modal-section" style={{ gap: 6 }}>
+                <div className="row" style={{ justifyContent: "space-between", gap: 8 }}>
+                  <div className="row" style={{ gap: 8, alignItems: "center" }}>
+                    <span className="mixer-spinner" aria-hidden="true" />
+                    <span className="small" style={{ color: "#bae6fd" }}>{props.promoteProgress.message}</span>
+                  </div>
+                  <button type="button" className="btn mixer-abort-button" style={{ minHeight: 32, padding: "4px 10px", fontSize: 12 }} onClick={props.onCancelPromote}>
+                    取消
+                  </button>
+                </div>
+                <div className="mixer-progress-track is-indeterminate">
+                  <div className="mixer-progress-fill" />
+                </div>
+              </div>
+            )}
+
+            {props.promoteBackupFailures.length > 0 && (
+              <div role="alert" className="card-warning-banner grid" style={{ gap: 4 }}>
+                <strong>部分原曲未能備份（專案已保存，這些歌曲標記為僅本機可用）：</strong>
+                {props.promoteBackupFailures.map((f) => (
+                  <span key={f.entryId} className="small">• {f.displayName}：{f.reason}</span>
+                ))}
+              </div>
+            )}
+
+            <div className="row mixer-modal-actions">
+              <button type="button" className="btn mixer-button" disabled={isBusy} onClick={props.onClose}>
+                取消
+              </button>
+              <button
+                type="button"
+                className="btn mixer-button primary"
+                disabled={isBusy || !props.account}
+                onClick={() => void props.onPromoteToDrive({ backupLocalOriginals: backupOriginals })}
+              >
+                {isBusy ? "上傳與同步中…" : "確認儲存到 Google Drive"}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {mode === "offline" && activeProject && (
+          <div className="grid" style={{ gap: 12 }}>
+            {props.offlineAssessmentLoading ? (
+              <div className="row mixer-modal-section" style={{ gap: 8, alignItems: "center" }}>
+                <span className="mixer-spinner" aria-hidden="true" />
+                <span className="small">正在檢查各首歌曲本機快取與估算所需容量…</span>
+              </div>
+            ) : props.offlineAssessment ? (
+              <div className="mixer-modal-section grid" style={{ gap: 8 }}>
+                <strong style={{ fontSize: 13 }}>離線下載容量評估</strong>
+                <div className="small" style={{ opacity: 0.9 }}>
+                  待下載歌曲：{props.offlineAssessment.songsToDownloadCount} 首 ｜ 本機已就緒：{props.offlineAssessment.alreadyLocalCount} 首 ｜ 僅舊裝置本機（無法下載）：{props.offlineAssessment.unavailableCount} 首
+                </div>
+                <div className="small" style={{ opacity: 0.9 }}>
+                  預估網路下載：{formatMiB(props.offlineAssessment.estimatedDownloadBytes)} ｜ 預估寫入本機空間：{formatMiB(props.offlineAssessment.estimatedStorageBytes)} ｜ 瀏覽器剩餘空間：{formatMiB(props.offlineAssessment.storageRemainingBytes)}
+                </div>
+                {props.offlineAssessment.warnings.map((w, idx) => (
+                  <div key={idx} className="card-warning-banner">{w}</div>
+                ))}
+                {props.offlineAssessment.perSongDetails.length > 0 && (
+                  <div className="grid" style={{ gap: 4, maxHeight: 160, overflowY: "auto" }}>
+                    {props.offlineAssessment.perSongDetails.map((d) => (
+                      <div key={d.entryId} className="row" style={{ justifyContent: "space-between", gap: 8 }}>
+                        <span className="small">{d.displayName}</span>
+                        <span className="small" style={{ opacity: 0.78 }}>
+                          {d.unavailableReason || `${d.needsOriginal ? "原曲+" : ""}${d.needsStems ? "分軌 " : ""}${formatMiB(d.estimatedBytes)}`}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ) : null}
+
+            {props.offlineDownloadProgress && (
+              <div className="grid mixer-modal-section" style={{ gap: 6 }}>
+                <div className="row" style={{ justifyContent: "space-between", gap: 8 }}>
+                  <div className="row" style={{ gap: 8, alignItems: "center" }}>
+                    <span className="mixer-spinner" aria-hidden="true" />
+                    <span className="small" style={{ color: "#bae6fd" }}>
+                      ({props.offlineDownloadProgress.completedSongs}/{props.offlineDownloadProgress.totalSongs}) {props.offlineDownloadProgress.stageMessage}
+                    </span>
+                  </div>
+                  <button type="button" className="btn mixer-abort-button" style={{ minHeight: 32, padding: "4px 10px", fontSize: 12 }} onClick={props.onCancelOfflineDownload}>
+                    取消下載
+                  </button>
+                </div>
+                <div className="mixer-progress-track">
+                  <div
+                    className="mixer-progress-fill"
+                    style={{
+                      width: `${props.offlineDownloadProgress.totalSongs > 0 ? Math.round((props.offlineDownloadProgress.completedSongs / props.offlineDownloadProgress.totalSongs) * 100) : 0}%`,
+                    }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {props.offlineDownloadResult && (
+              <div role="status" className={props.offlineDownloadResult.failedSongs.length > 0 ? "card-warning-banner grid" : "mixer-modal-section grid"} style={{ gap: 4 }}>
+                <strong style={{ fontSize: 13 }}>
+                  {props.offlineDownloadResult.cancelled
+                    ? `已取消剩餘下載（已完成 ${props.offlineDownloadResult.completedCount} 首）`
+                    : `離線下載完成（完成 ${props.offlineDownloadResult.completedCount} 首，其中重用本機 ${props.offlineDownloadResult.reusedCount} 首）`}
+                </strong>
+                {props.offlineDownloadResult.failedSongs.map((f) => (
+                  <span key={f.entryId} className="small">• {f.displayName}：{f.reason}</span>
+                ))}
+              </div>
+            )}
+
+            <div className="row mixer-modal-actions">
+              <button type="button" className="btn mixer-button" disabled={Boolean(props.offlineDownloadProgress)} onClick={props.onClose}>
+                關閉
+              </button>
+              <button
+                type="button"
+                className="btn mixer-button primary"
+                disabled={
+                  Boolean(props.offlineDownloadProgress) ||
+                  props.offlineAssessmentLoading ||
+                  !props.offlineAssessment ||
+                  props.offlineAssessment.songsToDownloadCount === 0 ||
+                  !props.account
+                }
+                onClick={() => void props.onStartOfflineDownload()}
+              >
+                {props.offlineDownloadProgress ? "逐首下載中…" : "確認逐首下載並保存至本機"}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {mode === "conflict" && activeProject?.conflictInfo && (
+          <div className="grid" style={{ gap: 12 }}>
+            <div className="card-warning-banner grid" style={{ gap: 4 }}>
+              <span>{activeProject.conflictInfo.reason}</span>
+              {activeProject.conflictInfo.conflictSubType === "sibling_branch" &&
+                activeProject.conflictInfo.siblingRevisions && (
+                  <span className="small">
+                    分支詳情：同父版本共發現 {activeProject.conflictInfo.siblingRevisions.length} 個保留中的不可變 Revision 快照，系統未進行任何自動合併或刪除。
+                  </span>
+                )}
+              <span className="small" style={{ opacity: 0.8 }}>
+                {DRIVE_CAS_LIMITATION_NOTE}
+              </span>
+            </div>
+            <div className="project-conflict-grid">
+              <div className="mixer-modal-section grid" style={{ gap: 4 }}>
+                <strong style={{ fontSize: 13 }}>此裝置（本機版本）</strong>
+                <span className="small">基底版本：v{activeProject.conflictInfo.localBaseRevision}</span>
+                <span className="small">目前版本：v{activeProject.conflictInfo.localRevision}</span>
+                <span className="small">歌曲數：{activeProject.project.songs.length} 首</span>
+              </div>
+              <div className="mixer-modal-section grid" style={{ gap: 4 }}>
+                <strong style={{ fontSize: 13 }}>Google Drive（雲端版本）</strong>
+                {activeProject.conflictInfo.kind === "remote_deleted" || !activeProject.conflictInfo.remoteProjectSnapshot ? (
+                  <span className="small" style={{ color: "#fca5a5" }}>遠端專案檔案已刪除或移至垃圾桶（不會自動重建）。</span>
+                ) : (
+                  <>
+                    <span className="small">雲端版本：v{activeProject.conflictInfo.remoteRevision}</span>
+                    <span className="small">更新於：{formatTime(activeProject.conflictInfo.remoteUpdatedAt || "")}</span>
+                    <span className="small">歌曲數：{activeProject.conflictInfo.remoteProjectSnapshot.songs.length} 首</span>
+                  </>
+                )}
+              </div>
+            </div>
+
+            <label className="grid" style={{ gap: 4 }}>
+              <span className="small" style={{ fontWeight: 600 }}>若選擇「保留本機另存新專案」的副本名稱</span>
+              <input
+                type="text"
+                className="project-text-input"
+                value={conflictSaveAsName}
+                onChange={(e) => setConflictSaveAsName(e.target.value)}
+                disabled={isBusy}
+              />
+            </label>
+
+            <div className="row mixer-modal-actions">
+              {activeProject.conflictInfo.remoteProjectSnapshot && (
+                <button
+                  type="button"
+                  className="btn mixer-button"
+                  disabled={isBusy}
+                  onClick={() => void props.onResolveConflict({ strategy: "load_remote" })}
+                >
+                  載入雲端版本
+                </button>
+              )}
+              <button
+                type="button"
+                className="btn mixer-button"
+                disabled={isBusy}
+                onClick={() =>
+                  void props.onResolveConflict({
+                    strategy: "save_local_as_new",
+                    newProjectNameForSaveAs: conflictSaveAsName.trim() || undefined,
+                  })
+                }
+              >
+                保留本機另存新專案
+              </button>
+              <button
+                type="button"
+                className="btn mixer-abort-button"
+                style={{ minHeight: 40, padding: "6px 14px", fontSize: 13 }}
+                disabled={isBusy}
+                onClick={() => void props.onResolveConflict({ strategy: "overwrite_remote" })}
+              >
+                以本機版本取代雲端
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

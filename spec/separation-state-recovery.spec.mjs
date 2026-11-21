@@ -990,8 +990,9 @@ test("13. Cold-start refresh validates local IDB & restores chunked playback wit
   configureInMemoryIdbForTests();
   clearSeparationDiagnosticLogs();
 
-  // 驗證 v3 -> v4 非破壞性 IndexedDB schema 升級：不刪除既有 store，僅補建索引
+  // 驗證 v4 -> v5 非破壞性 IndexedDB schema 升級：不刪除既有 store，僅補建新表與索引
   const existingStores = new Map();
+  const createdStores = [];
   const createdIndexes = [];
   for (const name of [
     "separations",
@@ -1008,7 +1009,18 @@ test("13. Cold-start refresh validates local IDB & restores chunked playback wit
   const fakeUpgradeDb = {
     objectStoreNames: { contains: (n) => existingStores.has(n) },
     createObjectStore: (n) => {
-      throw new Error(`不應重建既有資料表：${n}`);
+      if (existingStores.has(n)) {
+        throw new Error(`不應重建既有資料表：${n}`);
+      }
+      createdStores.push(n);
+      existingStores.set(n, new Set());
+      return {
+        indexNames: { contains: (idx) => existingStores.get(n).has(idx) },
+        createIndex: (idx, keyPath) => {
+          existingStores.get(n).add(idx);
+          createdIndexes.push({ store: n, idx, keyPath });
+        },
+      };
     },
   };
   const fakeUpgradeTx = {
@@ -1021,7 +1033,26 @@ test("13. Cold-start refresh validates local IDB & restores chunked playback wit
     }),
   };
   applyIndexedDbSchemaUpgrade(fakeUpgradeDb, fakeUpgradeTx);
-  assert.equal(INDEXEDDB_VERSION, 4);
+  assert.equal(INDEXEDDB_VERSION, 6);
+  assert.deepEqual(
+    createdStores.sort(),
+    ["driveAccounts", "driveTransfers", "importedStems", "projectPreferences", "projectSyncJobs", "projects"],
+  );
+  assert.ok(
+    createdIndexes.some(
+      (x) => x.store === "projects" && x.idx === "by_ownerAccountId",
+    ),
+  );
+  assert.ok(
+    createdIndexes.some(
+      (x) => x.store === "projects" && x.idx === "by_storageProvider",
+    ),
+  );
+  assert.ok(
+    createdIndexes.some(
+      (x) => x.store === "projectSyncJobs" && x.idx === "by_ownerAccountId",
+    ),
+  );
   assert.ok(
     createdIndexes.some(
       (x) => x.store === "separationCheckpoints" && x.idx === SEPARATION_CHECKPOINT_HASH_INDEX,
@@ -1030,6 +1061,16 @@ test("13. Cold-start refresh validates local IDB & restores chunked playback wit
   assert.ok(
     createdIndexes.some(
       (x) => x.store === "separationChunks" && x.idx === SEPARATION_CHUNK_TASK_INDEX,
+    ),
+  );
+  assert.ok(
+    createdIndexes.some(
+      (x) => x.store === "driveTransfers" && x.idx === "by_ownerAccountId",
+    ),
+  );
+  assert.ok(
+    createdIndexes.some(
+      (x) => x.store === "importedStems" && x.idx === "by_sourceAudioHash",
     ),
   );
 

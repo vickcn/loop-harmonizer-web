@@ -1,4 +1,10 @@
 import type { StemMetadata } from "@/lib/separation/stemTypes";
+import type {
+  ProjectSongArtifactRef,
+  ProjectSongAvailabilityState,
+  ProjectSongBackupStatus,
+  ProjectSongOriginalBackupRef,
+} from "../projects/projectTypes.ts";
 
 export type TrackStatus = "stopped" | "playing" | "paused";
 export type TrackSyncMode = "free" | "global-bpm" | "manual-rate";
@@ -11,6 +17,46 @@ export type TrackPlaybackMode = "fast-rate" | "pitch-preserve" | "soundtouch";
 
 export type SongTempoMode = "target-bpm" | "manual-rate";
 export type SongPlaybackSource = "original" | "stems";
+export type LocalSongSource = {
+  provider: "local";
+};
+
+export type GoogleDriveSongSource = {
+  provider: "google_drive";
+  fileId: string;
+  authorizedAccountId: string;
+  fileName: string;
+  mimeType: string;
+  sizeBytes?: number;
+  modifiedTime?: string;
+  resourceKey?: string;
+  targetResourceKey?: string;
+  driveId?: string;
+  webViewLink?: string;
+  sourceAudioHash?: string;
+};
+
+export type SongSource = LocalSongSource | GoogleDriveSongSource;
+
+export type DriveExportStatusSummary = {
+  ownerAccountId: string;
+  revisionId: string;
+  manifestFileId: string;
+  sessionFileId?: string;
+  folderId: string;
+  format: "wav-float32" | "wav-pcm16";
+  exportedAt: number;
+};
+
+export type ImportedStemOrigin = {
+  importId: string;
+  ownerAccountId: string;
+  revisionId: string;
+  manifestFileId: string;
+  pcmFormat: "wav-float32" | "wav-pcm16";
+  stemLayout: "four_stem" | "two_stem_direct";
+  importedAt: number;
+};
 export type SeparationStatus =
   | "not_started"
   | "processing"
@@ -113,6 +159,15 @@ export type BandSong = {
   audioLoadState?: SongAudioLoadState;
   separationStage?: string;
   activeSnapshot?: SongOperationSnapshot | null;
+  source?: SongSource;
+  driveExport?: DriveExportStatusSummary | null;
+  importedStemOrigin?: ImportedStemOrigin | null;
+  sourceAudioMissing?: boolean;
+  projectEntryId?: string;
+  availabilityState?: ProjectSongAvailabilityState;
+  backupStatus?: ProjectSongBackupStatus;
+  artifactRef?: ProjectSongArtifactRef | null;
+  originalBackup?: ProjectSongOriginalBackupRef | null;
 };
 
 export type BandTrack = {

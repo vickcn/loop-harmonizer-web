@@ -1,5 +1,7 @@
 import type {
   BandSong,
+  DriveExportStatusSummary,
+  ImportedStemOrigin,
   SeparationFocusSessionSnapshot,
   SeparationFocusSongEntry,
   SeparationStatus,
@@ -7,9 +9,16 @@ import type {
   SongOperationSnapshot,
   SongPlaybackSource,
   SongPersistenceStatus,
+  SongSource,
   SongTempoMode,
   StemChannel,
 } from "./bandTypes";
+import type {
+  ProjectSongArtifactRef,
+  ProjectSongAvailabilityState,
+  ProjectSongBackupStatus,
+  ProjectSongOriginalBackupRef,
+} from "../projects/projectTypes";
 
 export type PersistedStemChannelState = {
   stemType: string;
@@ -57,6 +66,10 @@ export type PersistedSongRecord = {
   modelVersion: string;
   processingVersion: string;
   stemChannels: PersistedStemChannelState[];
+  source?: SongSource;
+  driveExport?: DriveExportStatusSummary | null;
+  importedStemOrigin?: ImportedStemOrigin | null;
+  sourceAudioMissing?: boolean;
   revision: number;
   updatedAt: number;
   updatedByTabId: string;
@@ -86,6 +99,15 @@ type CreateBandSongInput = {
   persistenceMessage?: string;
   revision?: number;
   audioLoadState?: SongAudioLoadState;
+  source?: SongSource;
+  driveExport?: DriveExportStatusSummary | null;
+  importedStemOrigin?: ImportedStemOrigin | null;
+  sourceAudioMissing?: boolean;
+  projectEntryId?: string;
+  availabilityState?: ProjectSongAvailabilityState;
+  backupStatus?: ProjectSongBackupStatus;
+  artifactRef?: ProjectSongArtifactRef | null;
+  originalBackup?: ProjectSongOriginalBackupRef | null;
 };
 
 export function createBandSong(input: CreateBandSongInput): BandSong {
@@ -127,6 +149,15 @@ export function createBandSong(input: CreateBandSongInput): BandSong {
     hasConflict: false,
     audioLoadState: input.audioLoadState ?? "ready",
     activeSnapshot: null,
+    source: input.source ?? { provider: "local" },
+    driveExport: input.driveExport ?? null,
+    importedStemOrigin: input.importedStemOrigin ?? null,
+    sourceAudioMissing: input.sourceAudioMissing ?? false,
+    projectEntryId: input.projectEntryId,
+    availabilityState: input.availabilityState,
+    backupStatus: input.backupStatus,
+    artifactRef: input.artifactRef ?? null,
+    originalBackup: input.originalBackup ?? null,
   };
 }
 
@@ -251,6 +282,10 @@ export function serializePersistedSong(
       muted: Boolean(channel.muted),
       solo: Boolean(channel.solo),
     })),
+    source: song.source ? { ...song.source } : { provider: "local" },
+    driveExport: song.driveExport ? { ...song.driveExport } : null,
+    importedStemOrigin: song.importedStemOrigin ? { ...song.importedStemOrigin } : null,
+    sourceAudioMissing: Boolean(song.sourceAudioMissing),
     revision: meta.revision,
     updatedAt: meta.updatedAt,
     updatedByTabId: meta.updatedByTabId,
@@ -265,6 +300,7 @@ export function restoreBandSongFromRecord(
     persistenceStatus?: SongPersistenceStatus;
     persistenceMessage?: string;
     audioLoadState?: SongAudioLoadState;
+    sourceAudioMissing?: boolean;
   },
 ): BandSong {
   const duration = options?.durationSec ?? record.durationSec ?? 0;
@@ -286,6 +322,10 @@ export function restoreBandSongFromRecord(
     persistenceMessage: options?.persistenceMessage ?? "",
     revision: record.revision,
     audioLoadState: options?.audioLoadState ?? "ready",
+    source: record.source ?? { provider: "local" },
+    driveExport: record.driveExport ?? null,
+    importedStemOrigin: record.importedStemOrigin ?? null,
+    sourceAudioMissing: options?.sourceAudioMissing ?? Boolean(record.sourceAudioMissing),
   });
 
   const restoredChannels: StemChannel[] = Array.isArray(record.stemChannels)

@@ -275,6 +275,7 @@ export class MultiTrackEngine {
     taskId: string;
     totalSamples: number;
     sampleRate: number;
+    stemLayout?: "four_stem" | "two_stem_direct";
     tracks: Array<{
       trackId: string;
       role: ChunkMixStemRole;
@@ -334,6 +335,7 @@ export class MultiTrackEngine {
       taskId: params.taskId,
       totalSamples: params.totalSamples,
       sampleRate: params.sampleRate,
+      stemLayout: params.stemLayout,
       entries,
       loop: params.loop,
     });
