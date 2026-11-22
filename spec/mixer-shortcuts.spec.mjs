@@ -3,11 +3,23 @@ import test from "node:test";
 
 import { createBandSong, getEffectivePlaybackRate } from "../lib/band/songModel.ts";
 import {
+  buildSongStatusIndicators,
+  shouldCondenseStatusIndicators,
+} from "../lib/band/songStatusIndicators.ts";
+import {
+  clampAndStepSliderValue,
+  computeAbsoluteSliderValue,
+  computeKeyboardSliderValue,
+  computeRelativeSliderValue,
+  shouldCancelSliderLongPress,
+} from "../lib/band/touchGuardedSlider.ts";
+import {
   EMPTY_MIXER_SELECTION,
   applyResetKey,
   applyResetMix,
   applyResetSpeed,
   describePlaybackError,
+  formatBatchPlaySummary,
   getResetKeyPatch,
   getResetMixPatch,
   getResetSpeedPatch,
@@ -234,4 +246,108 @@ test("describePlaybackError formats readable messages for autoplay, network, gen
   assert.ok(describePlaybackError(new Error("Failed to fetch soundtouch.js")).includes("音訊處理模組載入失敗"));
   assert.equal(describePlaybackError(new Error("AudioBuffer missing")), "無法啟動播放：AudioBuffer missing");
   assert.equal(describePlaybackError(""), "音訊引擎啟動失敗，請重試。");
+});
+
+test("formatBatchPlaySummary summarizes empty, full-success, partial-fail, and all-fail batch playback", () => {
+  assert.equal(formatBatchPlaySummary([]), "尚未勾選任何歌曲。");
+  assert.equal(
+    formatBatchPlaySummary([
+      { songName: "Song A", started: true },
+      { songName: "Song B", started: true },
+    ]),
+    "已啟動批次播放：共 2 首歌曲。",
+  );
+  assert.equal(
+    formatBatchPlaySummary([
+      { songName: "Song A", started: true },
+      { songName: "Song B", started: false, reason: "缺少本機原始音檔" },
+      { songName: "Song C", started: false, reason: "正在恢復音檔" },
+      { songName: "Song D", started: false, reason: "負載過高" },
+    ]),
+    "批次播放已啟動 1 / 4 首；略過 3 首：Song B（缺少本機原始音檔）；Song C（正在恢復音檔） 等 3 首",
+  );
+  assert.equal(
+    formatBatchPlaySummary([
+      { songName: "Song A", started: false, reason: "無法啟動" },
+    ]),
+    "批次播放未啟動（0 / 1 首）：Song A（無法啟動）",
+  );
+});
+
+test("shouldCondenseStatusIndicators triggers dot cluster when status count meets threshold", () => {
+  assert.equal(shouldCondenseStatusIndicators(0), false);
+  assert.equal(shouldCondenseStatusIndicators(1), false);
+  assert.equal(shouldCondenseStatusIndicators(2), false);
+  assert.equal(shouldCondenseStatusIndicators(3), true);
+  assert.equal(shouldCondenseStatusIndicators(4), true);
+  assert.equal(shouldCondenseStatusIndicators(5), true);
+});
+
+test("buildSongStatusIndicators builds semantic tones without duplicated detail text", () => {
+  const fourBadgeSong = createSongWithStems("s-4", "Four Badge Song");
+  fourBadgeSong.availabilityState = "stems_loaded";
+  fourBadgeSong.backupStatus = "local_only";
+  fourBadgeSong.persistenceStatus = "saved";
+  fourBadgeSong.persistenceMessage = "已保存在此裝置";
+
+  const fourItems = buildSongStatusIndicators(fourBadgeSong, { isActive: true });
+  assert.equal(fourItems.length, 4);
+  assert.deepEqual(
+    fourItems.map((item) => ({ key: item.key, label: item.label, tone: item.tone })),
+    [
+      { key: "focus", label: "焦點中", tone: "is-focus" },
+      { key: "availability", label: "已載入分軌", tone: "is-drive-stem" },
+      { key: "backup", label: "僅本機可用", tone: "is-warn" },
+      { key: "persistence", label: "已保存在此裝置", tone: "is-saved" },
+    ],
+  );
+  assert.equal(fourItems[0].detail, undefined);
+  assert.equal(fourItems[1].detail, undefined);
+  assert.equal(fourItems[3].detail, undefined);
+
+  const detailedSong = createBandSong({
+    id: "s-detail",
+    name: "Detailed Song",
+    sourceAudioId: "s-detail_orig",
+    persistenceStatus: "error",
+    persistenceMessage: "IndexedDB 寫入失敗，空間不足",
+    audioLoadState: "unloaded",
+  });
+  detailedSong.muted = true;
+
+  const detailItems = buildSongStatusIndicators(detailedSong, { isActive: false });
+  assert.deepEqual(
+    detailItems.map((item) => ({ key: item.key, label: item.label, tone: item.tone })),
+    [
+      { key: "muted", label: "已靜音", tone: "is-muted" },
+      { key: "deferred-decode", label: "待按需解碼", tone: "is-warn" },
+      { key: "persistence", label: "儲存失敗", tone: "is-error" },
+    ],
+  );
+  assert.equal(detailItems[1].detail, "按播放或載入時才解碼，節省記憶體");
+  assert.equal(detailItems[2].detail, "IndexedDB 寫入失敗，空間不足");
+});
+
+test("touchGuardedSlider enforces long-press cancel threshold, relative/absolute math, and keyboard steps", () => {
+  assert.equal(clampAndStepSliderValue(1.5, 0, 1, 0.001), 1);
+  assert.equal(clampAndStepSliderValue(-0.1, -0.05, 0.05, 0.001), -0.05);
+  assert.equal(clampAndStepSliderValue(0.0123, -0.05, 0.05, 0.001), 0.012);
+
+  assert.equal(computeAbsoluteSliderValue(150, 100, 200, 0, 1, 0.001), 0.25);
+  assert.equal(computeAbsoluteSliderValue(50, 100, 200, 0, 1, 0.001), 0);
+  assert.equal(computeAbsoluteSliderValue(400, 100, 200, 0, 1, 0.001), 1);
+
+  assert.equal(computeRelativeSliderValue(0.5, 40, 200, 0, 1, 0.001), 0.7);
+  assert.equal(computeRelativeSliderValue(0.01, 50, 200, -0.05, 0.05, 0.001), 0.035);
+  assert.equal(computeRelativeSliderValue(0.04, 100, 200, -0.05, 0.05, 0.001), 0.05);
+
+  assert.equal(shouldCancelSliderLongPress(6, 8), false);
+  assert.equal(shouldCancelSliderLongPress(7, 8), true);
+
+  assert.equal(computeKeyboardSliderValue(0, "ArrowRight", false, -0.05, 0.05, 0.001), 0.001);
+  assert.equal(computeKeyboardSliderValue(0, "ArrowLeft", true, -0.05, 0.05, 0.001), -0.01);
+  assert.equal(computeKeyboardSliderValue(0.5, "PageUp", false, 0, 1, 0.001), 0.51);
+  assert.equal(computeKeyboardSliderValue(0.5, "Home", false, 0, 1, 0.001), 0);
+  assert.equal(computeKeyboardSliderValue(0.5, "End", false, 0, 1, 0.001), 1);
+  assert.equal(computeKeyboardSliderValue(0.5, "Enter", false, 0, 1, 0.001), null);
 });

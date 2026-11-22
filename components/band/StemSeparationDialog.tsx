@@ -57,6 +57,21 @@ export function StemSeparationDialog({ open, onClose, onAddStems }: Props) {
     }).catch(() => setRuntimeHint("WebGPU 不可用，將使用 WASM（CPU）執行。"));
   }, [open]);
 
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !running && !adding) {
+        event.preventDefault();
+        resultRef.current = null;
+        setResultSummary(null);
+        setError("");
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [open, running, adding, onClose]);
+
   const close = () => {
     if (running || adding) return;
     resultRef.current = null;
@@ -148,7 +163,7 @@ export function StemSeparationDialog({ open, onClose, onAddStems }: Props) {
               模型與推論完全在您的瀏覽器中執行，不會上傳到伺服器。
             </p>
           </div>
-          <button className="btn" onClick={close} disabled={running || adding}>關閉</button>
+          <button type="button" className="btn" onClick={close} disabled={running || adding}>關閉</button>
         </div>
 
         <div className="grid" style={{ gap: 8 }}>
@@ -186,7 +201,7 @@ export function StemSeparationDialog({ open, onClose, onAddStems }: Props) {
           </div>
         </fieldset>
 
-        <div className="grid" style={{ gap: 6, padding: 12, border: "1px solid var(--border)", borderRadius: 10 }}>
+        <div className="grid" style={{ gap: 6, padding: 12, border: "1px solid var(--line)", borderRadius: 10 }}>
           <strong style={{ fontSize: 14 }}>執行環境</strong>
           <span className="small" style={{ opacity: 0.72 }}>{runtimeHint}</span>
           <span className="small" style={{ color: "#f59e0b", opacity: 0.9 }}>
@@ -211,11 +226,12 @@ export function StemSeparationDialog({ open, onClose, onAddStems }: Props) {
               <span className="small" style={{ opacity: 0.65 }}>{resultSummary.stemTypes.map((type) => STEM_LABELS[type]).join("、")}</span>
             </div>
             <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
-              <button className="btn primary" onClick={() => void addStems()} disabled={adding}>
+              <button type="button" className="btn primary" onClick={() => void addStems()} disabled={adding}>
                 {adding ? "加入中…" : "＋ 將全部分軌加入 Band Mixer"}
               </button>
               {result.stems?.tracks.map((stem) => (
                 <button
+                  type="button"
                   className="btn"
                   key={stem.stemType}
                   onClick={() => downloadStem(fileName, stem.stemType, stem.left, stem.right, result.stems!.sampleRate)}
@@ -228,7 +244,7 @@ export function StemSeparationDialog({ open, onClose, onAddStems }: Props) {
         )}
 
         <div className="row" style={{ justifyContent: "flex-end", gap: 8 }}>
-          <button className="btn primary" onClick={() => void startSeparation()} disabled={running || adding || !fileName}>
+          <button type="button" className="btn primary" onClick={() => void startSeparation()} disabled={running || adding || !fileName}>
             {running ? "分離中…" : "開始分離"}
           </button>
         </div>

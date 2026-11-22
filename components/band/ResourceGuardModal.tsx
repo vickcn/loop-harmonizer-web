@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   formatEstimatedMiB,
   type LowLoadActionId,
@@ -54,6 +54,24 @@ export function ResourceGuardModal({
     return initial;
   });
 
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    previousFocusRef.current =
+      typeof document !== "undefined" && document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    panelRef.current?.focus();
+    return () => {
+      const prev = previousFocusRef.current;
+      previousFocusRef.current = null;
+      if (prev && prev.isConnected) {
+        prev.focus();
+      }
+    };
+  }, []);
+
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
@@ -95,7 +113,7 @@ export function ResourceGuardModal({
         if (event.target === event.currentTarget) onCancel();
       }}
     >
-      <div className="card mixer-modal-panel">
+      <div ref={panelRef} tabIndex={-1} className="card mixer-modal-panel">
         <div className="row" style={{ justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
           <div className="grid" style={{ gap: 4 }}>
             <strong id="resource-guard-modal-title" style={{ fontSize: 16 }}>{title}</strong>
@@ -238,7 +256,7 @@ export function ResourceGuardModal({
               {hasSuggestions && (
                 <button
                   type="button"
-                  className="btn mixer-button mixer-primary"
+                  className="btn mixer-button primary"
                   onClick={() =>
                     onConfirm({
                       applyLowLoadActions: [...selectedLowLoad],

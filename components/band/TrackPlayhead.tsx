@@ -1,6 +1,6 @@
 "use client";
 
-import { memo, useRef } from "react";
+import { memo, useRef, useState } from "react";
 
 type Props = {
   playheadSec: number;
@@ -18,6 +18,7 @@ function fmt(sec: number) {
 export const TrackPlayhead = memo(function TrackPlayhead({ playheadSec, durationSec, onChange, onSelect }: Props) {
   const barRef = useRef<HTMLDivElement>(null);
   const activePointerIdRef = useRef<number | null>(null);
+  const [dragging, setDragging] = useState(false);
   const progress = durationSec > 0 ? Math.min(1, playheadSec / durationSec) : 0;
 
   const secFromPointer = (e: React.PointerEvent) => {
@@ -31,6 +32,7 @@ export const TrackPlayhead = memo(function TrackPlayhead({ playheadSec, duration
   const clearDragState = (pointerId: number, target?: HTMLDivElement | null) => {
     if (activePointerIdRef.current !== pointerId) return;
     activePointerIdRef.current = null;
+    setDragging(false);
     if (target && typeof target.hasPointerCapture === "function" && target.hasPointerCapture(pointerId)) {
       try {
         target.releasePointerCapture(pointerId);
@@ -61,13 +63,13 @@ export const TrackPlayhead = memo(function TrackPlayhead({ playheadSec, duration
   };
 
   return (
-    <div className="row" style={{ gap: 8 }}>
+    <div className="row" style={{ gap: 8, flexWrap: "nowrap", minWidth: 0 }}>
       <span className="small" style={{ minWidth: 36, opacity: 0.6, fontVariantNumeric: "tabular-nums" }}>
         {fmt(playheadSec)}
       </span>
       <div
         ref={barRef}
-        className="track-playhead-slider"
+        className={`track-playhead-slider${dragging ? " is-dragging" : ""}`}
         tabIndex={0}
         aria-label="歌曲播放進度，點選、拖曳或按方向鍵以跳轉"
         role="slider"
@@ -75,11 +77,12 @@ export const TrackPlayhead = memo(function TrackPlayhead({ playheadSec, duration
         aria-valuemax={Math.round(durationSec)}
         aria-valuenow={Math.round(playheadSec)}
         aria-valuetext={`${fmt(playheadSec)} / ${fmt(durationSec)}`}
-        style={{ flex: 1, minHeight: 44, cursor: "pointer", position: "relative", userSelect: "none", display: "flex", alignItems: "center", touchAction: "none" }}
+        style={{ flex: 1, minWidth: 0, minHeight: 44, position: "relative", userSelect: "none", display: "flex", alignItems: "center", touchAction: "none" }}
         onPointerDown={(e) => {
           if (e.pointerType === "mouse" && e.button !== 0) return;
           if (activePointerIdRef.current !== null && activePointerIdRef.current !== e.pointerId) return;
           activePointerIdRef.current = e.pointerId;
+          setDragging(true);
           onSelect?.();
           try {
             e.currentTarget.setPointerCapture(e.pointerId);
@@ -104,7 +107,7 @@ export const TrackPlayhead = memo(function TrackPlayhead({ playheadSec, duration
       >
         <div style={{ width: "100%", height: 6, background: "var(--line)", borderRadius: 3, position: "relative" }}>
           <div style={{ width: `${progress * 100}%`, height: "100%", background: "var(--accent)", borderRadius: 3 }} />
-          <div style={{
+          <div className="track-playhead-thumb" style={{
             position: "absolute", top: "50%", left: `${progress * 100}%`,
             transform: "translate(-50%, -50%)",
             width: 14, height: 14, borderRadius: "50%",
@@ -112,7 +115,7 @@ export const TrackPlayhead = memo(function TrackPlayhead({ playheadSec, duration
           }} />
         </div>
       </div>
-      <span className="small" style={{ minWidth: 36, opacity: 0.35, fontVariantNumeric: "tabular-nums" }}>
+      <span className="small" style={{ minWidth: 36, textAlign: "right", opacity: 0.35, fontVariantNumeric: "tabular-nums" }}>
         {fmt(durationSec)}
       </span>
     </div>

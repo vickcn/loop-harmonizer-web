@@ -60,31 +60,27 @@ export const StemMixer = memo(function StemMixer({
               onSelectStem?.(channel.id);
             }}
             style={{
-              gap: 8,
-              padding: "7px 10px",
-              borderRadius: 10,
-              flexWrap: "nowrap",
-              minWidth: 0,
               opacity: channel.muted ? 0.55 : 1,
             }}
           >
-            <strong style={{ minWidth: 88, fontSize: 13, flex: "0 0 auto", whiteSpace: "nowrap" }}>{label}</strong>
+            <strong className="stem-row-label">{label}</strong>
             <input
               aria-label={`${label} 音量`}
-              className="mixer-range is-volume"
+              className="mixer-range is-volume stem-row-slider"
               type="range"
               min={0}
               max={1}
               step={0.01}
               value={channel.volume}
-              style={{ flex: "1 1 70px", minWidth: 56, "--range-progress": `${percent}%` } as CSSProperties}
+              style={{ "--range-progress": `${percent}%` } as CSSProperties}
               onPointerDown={(event) => event.stopPropagation()}
               onPointerMove={(event) => event.stopPropagation()}
               onPointerUp={(event) => event.stopPropagation()}
               onChange={(event) => onChange(channel.id, { volume: Number(event.target.value) })}
             />
-            <span className="small" style={{ width: 34, flex: "0 0 auto", textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{percent}%</span>
+            <span className="small stem-row-pct">{percent}%</span>
             <AdaptiveActionRow
+              className="stem-row-actions"
               items={[
                 {
                   key: "mute",

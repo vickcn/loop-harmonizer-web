@@ -8,6 +8,7 @@ type IconActionButtonProps = {
   label: string;
   shortcut?: string;
   disabledReason?: string;
+  tooltipPlacement?: "auto" | "top" | "bottom";
   pressed?: boolean;
   busy?: boolean;
   disabled?: boolean;
@@ -26,6 +27,7 @@ export function IconActionButton({
   label,
   shortcut,
   disabledReason,
+  tooltipPlacement = "auto",
   pressed,
   busy,
   disabled,
@@ -38,6 +40,12 @@ export function IconActionButton({
   onClick,
 }: IconActionButtonProps) {
   const [showTouchTooltip, setShowTouchTooltip] = useState(false);
+  const [resolvedPlacement, setResolvedPlacement] = useState<"top" | "bottom">(
+    tooltipPlacement === "bottom" ? "bottom" : "top",
+  );
+  const [resolvedAlign, setResolvedAlign] = useState<"left" | "center" | "right">("center");
+  const wrapRef = useRef<HTMLSpanElement | null>(null);
+  const tooltipRef = useRef<HTMLSpanElement | null>(null);
   const pressTimerRef = useRef<number | null>(null);
   const hideTimerRef = useRef<number | null>(null);
   const longPressedRef = useRef(false);
@@ -48,12 +56,53 @@ export function IconActionButton({
       ? `${label} (${shortcut})`
       : label;
 
+  const updateTooltipPosition = () => {
+    const wrapEl = wrapRef.current;
+    if (!wrapEl || typeof window === "undefined") return;
+
+    const rect = wrapEl.getBoundingClientRect();
+    const tipWidth = tooltipRef.current?.offsetWidth || 264;
+    const tipHeight = tooltipRef.current?.offsetHeight || 56;
+    const margin = 12;
+    const spaceAbove = rect.top;
+    const spaceBelow = window.innerHeight - rect.bottom;
+
+    let nextPlacement: "top" | "bottom";
+    if (tooltipPlacement === "bottom") {
+      nextPlacement =
+        spaceBelow < tipHeight + margin && spaceAbove >= tipHeight + margin
+          ? "top"
+          : "bottom";
+    } else {
+      nextPlacement =
+        spaceAbove < tipHeight + margin && spaceBelow > spaceAbove
+          ? "bottom"
+          : "top";
+    }
+
+    const centerX = rect.left + rect.width / 2;
+    const halfW = tipWidth / 2;
+    let nextAlign: "left" | "center" | "right" = "center";
+    if (centerX - halfW < margin) {
+      nextAlign = "left";
+    } else if (centerX + halfW > window.innerWidth - margin) {
+      nextAlign = "right";
+    }
+
+    setResolvedPlacement(nextPlacement);
+    setResolvedAlign(nextAlign);
+  };
+
   const clearTimers = () => {
     if (pressTimerRef.current !== null) {
       window.clearTimeout(pressTimerRef.current);
       pressTimerRef.current = null;
     }
   };
+
+  useEffect(() => {
+    setResolvedPlacement(tooltipPlacement === "bottom" ? "bottom" : "top");
+  }, [tooltipPlacement]);
 
   useEffect(() => () => {
     clearTimers();
@@ -68,6 +117,7 @@ export function IconActionButton({
     pressTimerRef.current = window.setTimeout(() => {
       pressTimerRef.current = null;
       longPressedRef.current = true;
+      updateTooltipPosition();
       setShowTouchTooltip(true);
       if (hideTimerRef.current !== null) window.clearTimeout(hideTimerRef.current);
       hideTimerRef.current = window.setTimeout(() => {
@@ -90,8 +140,21 @@ export function IconActionButton({
     onClick();
   };
 
+  const alignClass =
+    resolvedAlign === "left"
+      ? " is-tooltip-align-left"
+      : resolvedAlign === "right"
+        ? " is-tooltip-align-right"
+        : "";
+  const placementClass = resolvedPlacement === "bottom" ? " is-tooltip-below" : "";
+
   return (
-    <span className={`icon-btn-wrap${showTouchTooltip ? " is-tooltip-visible" : ""}${wrapClassName ? ` ${wrapClassName}` : ""}`}>
+    <span
+      ref={wrapRef}
+      className={`icon-btn-wrap${placementClass}${alignClass}${showTouchTooltip ? " is-tooltip-visible" : ""}${wrapClassName ? ` ${wrapClassName}` : ""}`}
+      onMouseEnter={updateTooltipPosition}
+      onFocus={updateTooltipPosition}
+    >
       <button
         type="button"
         aria-label={label}
@@ -111,7 +174,7 @@ export function IconActionButton({
         {icon}
         {text && <span className="icon-btn-text">{text}</span>}
       </button>
-      <span role="tooltip" className="action-tooltip">
+      <span ref={tooltipRef} role="tooltip" className="action-tooltip">
         {tooltipText}
       </span>
     </span>

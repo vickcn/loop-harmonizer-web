@@ -364,3 +364,30 @@ export function toggleSoloBySelection(
     message: `${targetStem.stemType} ${nextSolo ? "已開啟 Solo" : "已取消 Solo"}`,
   };
 }
+
+export interface BatchPlayAttemptResult {
+  songName: string;
+  started: boolean;
+  reason?: string;
+}
+
+export function formatBatchPlaySummary(
+  results: readonly BatchPlayAttemptResult[],
+): string {
+  const total = results.length;
+  if (total === 0) return "尚未勾選任何歌曲。";
+  const startedCount = results.filter((item) => item.started).length;
+  const failed = results.filter((item) => !item.started);
+  if (failed.length === 0) {
+    return `已啟動批次播放：共 ${startedCount} 首歌曲。`;
+  }
+  const preview = failed
+    .slice(0, 2)
+    .map((item) => `${item.songName}（${item.reason || "無法播放"}）`)
+    .join("；");
+  const suffix = failed.length > 2 ? ` 等 ${failed.length} 首` : "";
+  if (startedCount === 0) {
+    return `批次播放未啟動（0 / ${total} 首）：${preview}${suffix}`;
+  }
+  return `批次播放已啟動 ${startedCount} / ${total} 首；略過 ${failed.length} 首：${preview}${suffix}`;
+}

@@ -141,6 +141,7 @@ export function ProjectToolbar(props: Props) {
               icon={iconForAction(action.key, action.busy)}
               text={action.text}
               label={action.ariaLabel}
+              tooltipPlacement="bottom"
               busy={action.busy}
               disabled={action.disabled}
               disabledReason={action.disabledReason}

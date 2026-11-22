@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import { preloadGoogleSdk } from "@/lib/google/googleDrivePicker";
 import { sharedGoogleAccountManager } from "@/lib/google/googleAccountManager";
 
@@ -25,7 +25,29 @@ export function GoogleAccountButton({
     sharedGoogleAccountManager.getSnapshot,
   );
   const [menuOpen, setMenuOpen] = useState(false);
+  const [menuAlign, setMenuAlign] = useState<"right" | "left">("right");
+  const [menuAbove, setMenuAbove] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useLayoutEffect(() => {
+    if (!menuOpen || typeof window === "undefined") return;
+    const wrapEl = wrapRef.current;
+    if (!wrapEl) return;
+    const rect = wrapEl.getBoundingClientRect();
+    const menuW = menuRef.current?.offsetWidth || 260;
+    const menuH = menuRef.current?.offsetHeight || 240;
+    const margin = 12;
+    const spaceRightFromLeftEdge = window.innerWidth - rect.left;
+    const nextAlign =
+      rect.right < menuW + margin && spaceRightFromLeftEdge >= rect.right
+        ? "left"
+        : "right";
+    const spaceBelow = window.innerHeight - rect.bottom;
+    const nextAbove = spaceBelow < menuH + margin && rect.top > spaceBelow;
+    setMenuAlign(nextAlign);
+    setMenuAbove(nextAbove);
+  }, [menuOpen]);
 
   useEffect(() => {
     sharedGoogleAccountManager.refreshConfigStatus();
@@ -189,7 +211,11 @@ export function GoogleAccountButton({
       </button>
 
       {menuOpen && (
-        <div role="menu" className="google-account-menu">
+        <div
+          ref={menuRef}
+          role="menu"
+          className={`google-account-menu${menuAlign === "left" ? " is-menu-align-left" : ""}${menuAbove ? " is-menu-above" : ""}`}
+        >
           <div className="google-account-menu-header">
             <strong style={{ fontSize: 13 }}>{account.displayName || "Google 使用者"}</strong>
             {account.email && (

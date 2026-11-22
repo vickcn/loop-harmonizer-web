@@ -122,6 +122,14 @@ export async function getProjectRecord(projectId: string): Promise<PersistedProj
   return idbGet<PersistedProjectRecord>("projects", projectId).catch(() => null);
 }
 
+/** 嚴格讀取專案紀錄：IndexedDB 發生錯誤時直接拋出例外，不靜默轉成 null。 */
+export async function getProjectRecordStrict(
+  projectId: string,
+): Promise<PersistedProjectRecord | null> {
+  if (!projectId) return null;
+  return idbGet<PersistedProjectRecord>("projects", projectId);
+}
+
 export async function getAllProjectRecords(): Promise<PersistedProjectRecord[]> {
   const rows = await idbGetAll<PersistedProjectRecord>("projects").catch(() => []);
   return rows.sort((a, b) => Date.parse(b.project.updatedAt) - Date.parse(a.project.updatedAt));
@@ -191,6 +199,16 @@ export async function isProjectDeleted(projectId: string): Promise<boolean> {
     "projectPreferences",
     DELETED_PROJECTS_PREF_KEY,
   ).catch(() => null);
+  return Boolean(rec?.deletedIds?.includes(projectId));
+}
+
+/** 嚴格查詢專案刪除 tombstone：IndexedDB 發生錯誤時直接拋出例外，不靜默轉成 false。 */
+export async function isProjectDeletedStrict(projectId: string): Promise<boolean> {
+  if (!projectId) return false;
+  const rec = await idbGet<DeletedProjectsPreferenceRecord>(
+    "projectPreferences",
+    DELETED_PROJECTS_PREF_KEY,
+  );
   return Boolean(rec?.deletedIds?.includes(projectId));
 }
 

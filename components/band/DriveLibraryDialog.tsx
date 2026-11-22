@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { GoogleAccount } from "@/lib/google/googleAuthTypes";
 import type {
   DriveLibraryEntry,
@@ -44,6 +44,31 @@ export function DriveLibraryDialog({
   onClose,
 }: Props) {
   const [includeOriginalById, setIncludeOriginalById] = useState<Record<string, boolean>>({});
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    previousFocusRef.current =
+      typeof document !== "undefined" && document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    panelRef.current?.focus();
+    const rafId = window.requestAnimationFrame(() => {
+      const panel = panelRef.current;
+      if (panel && !panel.contains(document.activeElement)) {
+        panel.focus();
+      }
+    });
+    return () => {
+      window.cancelAnimationFrame(rafId);
+      const prev = previousFocusRef.current;
+      previousFocusRef.current = null;
+      if (prev && prev.isConnected) {
+        prev.focus();
+      }
+    };
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
@@ -73,7 +98,12 @@ export function DriveLibraryDialog({
         }
       }}
     >
-      <div className="card mixer-modal-panel" style={{ width: "min(680px, 100%)" }}>
+      <div
+        ref={panelRef}
+        tabIndex={-1}
+        className="card mixer-modal-panel"
+        style={{ width: "min(680px, 100%)" }}
+      >
         <div className="row" style={{ justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
           <div className="grid" style={{ gap: 4 }}>
             <strong id="drive-library-dialog-title" style={{ fontSize: 16 }}>

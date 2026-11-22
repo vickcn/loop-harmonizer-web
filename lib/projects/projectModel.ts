@@ -308,6 +308,14 @@ export function bandSongToProjectEntry(
   return entry;
 }
 
+function formatProjectStemsReadyMessage(revisionId?: string): string {
+  const trimmed = revisionId?.trim() ?? "";
+  if (!trimmed) return "已依專案分軌版本就緒";
+  if (trimmed.startsWith("local-")) return "已依專案本機分軌版本就緒";
+  const displayRev = trimmed.length > 24 ? `${trimmed.slice(0, 16)}…` : trimmed;
+  return `已依專案版本 ${displayRev} 就緒`;
+}
+
 export function projectEntryToBandSong(
   entry: ProjectSongEntry,
   options?: {
@@ -409,7 +417,7 @@ export function projectEntryToBandSong(
     separationStage: localStemsReady ? "completed" : "idle",
     separationProgress: localStemsReady ? 1 : 0,
     separationMessage: localStemsReady
-      ? `已依專案版本 ${entry.artifactRef?.revisionId ?? ""} 就緒`
+      ? formatProjectStemsReadyMessage(entry.artifactRef?.revisionId)
       : entry.artifactRef?.manifestFileId
         ? "雲端已備份分軌，點擊播放時按需下載恢復"
         : "",

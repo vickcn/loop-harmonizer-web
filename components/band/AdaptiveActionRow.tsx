@@ -27,7 +27,10 @@ export function AdaptiveActionRow({ items, gap = 6, moreButtonWidth = 40, classN
   const measureRefs = useRef<(HTMLDivElement | null)[]>([]);
   const [visibleCount, setVisibleCount] = useState(items.length);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [menuAlign, setMenuAlign] = useState<"right" | "left">("right");
+  const [menuAbove, setMenuAbove] = useState(false);
   const menuWrapRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
 
   const recompute = () => {
     const container = containerRef.current;
@@ -43,22 +46,38 @@ export function AdaptiveActionRow({ items, gap = 6, moreButtonWidth = 40, classN
           (parseFloat(parentStyle.paddingRight) || 0);
         const colGap = parseFloat(parentStyle.columnGap) || parseFloat(parentStyle.gap) || 0;
         const children = Array.from(parent.children).filter((el) => el instanceof HTMLElement) as HTMLElement[];
+        const containerRect = container.getBoundingClientRect();
+        const parentWraps = parentStyle.flexWrap !== "nowrap";
+        const parentWidth = parent.clientWidth;
         let siblingsWidth = 0;
+        let sameLineCount = 1;
         for (const child of children) {
           if (child === container) continue;
           const style = getComputedStyle(child);
           if (style.position === "absolute" || style.display === "none") continue;
+          const childRect = child.getBoundingClientRect();
+          if (parentWraps && containerRect.height > 0 && childRect.height > 0) {
+            const threshold = Math.max(8, Math.min(childRect.height, containerRect.height) * 0.6);
+            if (Math.abs(childRect.top - containerRect.top) >= threshold) {
+              continue;
+            }
+          }
+          sameLineCount += 1;
           const grow = parseFloat(style.flexGrow) || 0;
           if (grow > 0) {
             const minW = parseFloat(style.minWidth) || 56;
             siblingsWidth += minW;
           } else {
-            siblingsWidth += child.getBoundingClientRect().width;
+            siblingsWidth += childRect.width;
           }
         }
-        const totalGaps = Math.max(0, children.length - 1) * colGap;
-        const parentAvailable = parent.clientWidth - padX - siblingsWidth - totalGaps;
-        if (parentAvailable > 0) {
+        if (parentWidth > 0) {
+          const totalGaps = Math.max(0, sameLineCount - 1) * colGap;
+          const parentAvailable = parentWidth - padX - siblingsWidth - totalGaps;
+          if (parentAvailable <= 0) {
+            setVisibleCount((prev) => (prev === 0 ? prev : 0));
+            return;
+          }
           available = parentAvailable;
         }
       }
@@ -102,6 +121,25 @@ export function AdaptiveActionRow({ items, gap = 6, moreButtonWidth = 40, classN
     return () => observer.disconnect();
   }, [items.length, gap, moreButtonWidth]);
 
+  useLayoutEffect(() => {
+    if (!menuOpen || typeof window === "undefined") return;
+    const wrapEl = menuWrapRef.current;
+    if (!wrapEl) return;
+    const rect = wrapEl.getBoundingClientRect();
+    const menuW = menuRef.current?.offsetWidth || 200;
+    const menuH = menuRef.current?.offsetHeight || 180;
+    const margin = 12;
+    const spaceRightFromLeftEdge = window.innerWidth - rect.left;
+    const nextAlign =
+      rect.right < menuW + margin && spaceRightFromLeftEdge >= rect.right
+        ? "left"
+        : "right";
+    const spaceBelow = window.innerHeight - rect.bottom;
+    const nextAbove = spaceBelow < menuH + margin && rect.top > spaceBelow;
+    setMenuAlign(nextAlign);
+    setMenuAbove(nextAbove);
+  }, [menuOpen]);
+
   useEffect(() => {
     if (!menuOpen) return;
     const onPointerDown = (event: PointerEvent) => {
@@ -129,18 +167,20 @@ export function AdaptiveActionRow({ items, gap = 6, moreButtonWidth = 40, classN
       className={`adaptive-action-row${className ? ` ${className}` : ""}`}
       style={{ gap }}
     >
-      <div className="adaptive-measure-strip" aria-hidden="true" style={{ gap }}>
-        {items.map((item, index) => (
-          <div
-            key={item.key}
-            ref={(el) => {
-              measureRefs.current[index] = el;
-            }}
-            style={{ flex: "0 0 auto" }}
-          >
-            {item.renderInline()}
-          </div>
-        ))}
+      <div className="adaptive-measure-clip" aria-hidden="true">
+        <div className="adaptive-measure-strip" style={{ gap }}>
+          {items.map((item, index) => (
+            <div
+              key={item.key}
+              ref={(el) => {
+                measureRefs.current[index] = el;
+              }}
+              style={{ flex: "0 0 auto" }}
+            >
+              {item.renderInline()}
+            </div>
+          ))}
+        </div>
       </div>
 
       {inlineItems.map((item) => (
@@ -159,7 +199,11 @@ export function AdaptiveActionRow({ items, gap = 6, moreButtonWidth = 40, classN
             onClick={() => setMenuOpen((value) => !value)}
           />
           {menuOpen && (
-            <div role="menu" className="adaptive-overflow-menu">
+            <div
+              ref={menuRef}
+              role="menu"
+              className={`adaptive-overflow-menu${menuAlign === "left" ? " is-menu-align-left" : ""}${menuAbove ? " is-menu-above" : ""}`}
+            >
               {overflowItems.map((item) => (
                 <button
                   key={item.key}

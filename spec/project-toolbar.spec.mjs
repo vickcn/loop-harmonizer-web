@@ -25,7 +25,10 @@ import {
   createEmptyProject,
   createInitialPersistedProjectRecord,
 } from "../lib/projects/projectModel.ts";
-import { ProjectManualSyncCoordinator } from "../lib/projects/projectSyncCoordinator.ts";
+import {
+  PROJECT_STATE_UNAVAILABLE_MESSAGE,
+  ProjectManualSyncCoordinator,
+} from "../lib/projects/projectSyncCoordinator.ts";
 import {
   buildDeleteProjectConfirmConfig,
   resolveProjectManagerActionGroups,
@@ -354,7 +357,7 @@ test("1 & 2 & 10. ProjectToolbar renders strictly 3 actions, ProjectManagerDialo
   assert.equal(dialogSrc.includes("目前專案與工作區操作（次要操作）"), true);
   assert.equal(dialogSrc.includes("危險操作"), true);
 
-  // 10. 手機窄螢幕 CSS 防溢出契約
+  // 10. 手機窄螢幕 CSS 防溢出契約 & Tooltip 防直條／頂部裁切契約
   const cssSrc = fs.readFileSync(path.resolve("app/globals.css"), "utf8");
   const mobileBlockStart = cssSrc.indexOf("@media (max-width: 640px)");
   assert.ok(mobileBlockStart !== -1);
@@ -362,6 +365,117 @@ test("1 & 2 & 10. ProjectToolbar renders strictly 3 actions, ProjectManagerDialo
   assert.equal(mobileBlock.includes("grid-template-columns: repeat(3, minmax(0, 1fr))"), true);
   assert.equal(mobileBlock.includes("flex-direction: column"), true);
   assert.equal(mobileBlock.includes("min-width: 0"), true);
+  assert.equal(cssSrc.includes("width: max-content;"), true);
+  assert.equal(cssSrc.includes("is-tooltip-below"), true);
+  assert.equal(cssSrc.includes("is-tooltip-align-left"), true);
+  assert.equal(cssSrc.includes("is-tooltip-align-right"), true);
+
+  const iconBtnSrc = fs.readFileSync(
+    path.resolve("components/band/IconActionButton.tsx"),
+    "utf8",
+  );
+  assert.equal(toolbarSrc.includes('tooltipPlacement="bottom"'), true);
+  assert.equal(iconBtnSrc.includes("getBoundingClientRect"), true);
+
+  // 11. Micro-interactions 契約（.badge、primary、手機回饋列保留、選單防溢出、清除選取、單一捲動與背景快捷鍵保護）
+  assert.equal(cssSrc.includes(".badge {"), true);
+  assert.equal(cssSrc.includes(".mixer-button.is-danger"), true);
+  assert.equal(cssSrc.includes(".mixer-modal-body {"), true);
+  assert.equal(cssSrc.includes(".is-menu-align-left"), true);
+  assert.equal(/\.mixer-shortcut-bar\s*\{\s*display:\s*none/.test(cssSrc), false);
+  const guardSrc = fs.readFileSync(path.resolve("components/band/ResourceGuardModal.tsx"), "utf8");
+  assert.equal(guardSrc.includes("mixer-primary"), false);
+  const songCardSrc = fs.readFileSync(path.resolve("components/band/SongCard.tsx"), "utf8");
+  assert.equal(songCardSrc.includes("onPointerDown={(event) => event.stopPropagation()}"), true);
+  const bandMixerSrc = fs.readFileSync(path.resolve("components/band/BandMixer.tsx"), "utf8");
+  assert.equal(bandMixerSrc.includes("清除選取"), true);
+  assert.equal(bandMixerSrc.includes("全選"), true);
+  assert.equal(bandMixerSrc.includes("Boolean(projectDialogMode) ||"), true);
+
+  // 12. Management-app 流程安全性與狀態真相契約（優先項 1～7）
+  assert.equal(bandMixerSrc.includes("window.confirm("), false);
+  assert.equal(bandMixerSrc.includes("projectListLoadSeqRef"), true);
+  assert.equal(bandMixerSrc.includes("offlineAssessmentSeqRef"), true);
+  assert.equal(bandMixerSrc.includes("flushCurrentWorkspaceBeforeSwitch"), true);
+  assert.equal(bandMixerSrc.includes("teardownActiveWorkspaceRuntime"), true);
+  assert.equal(bandMixerSrc.includes("formatBatchPlaySummary"), true);
+  const openEntryStart = bandMixerSrc.indexOf("const handleOpenProjectEntry");
+  const createSubmitStart = bandMixerSrc.indexOf("const handleCreateProjectSubmit");
+  const saveAsSubmitStart = bandMixerSrc.indexOf("const handleSaveAsProjectSubmit");
+  assert.ok(openEntryStart !== -1 && createSubmitStart > openEntryStart && saveAsSubmitStart > createSubmitStart);
+  const openEntrySlice = bandMixerSrc.slice(openEntryStart, createSubmitStart);
+  const createSubmitSlice = bandMixerSrc.slice(createSubmitStart, saveAsSubmitStart);
+  assert.equal(openEntrySlice.includes("setActive: false"), true);
+  assert.equal(createSubmitSlice.includes("setActive: false"), true);
+  assert.ok(openEntrySlice.indexOf("openProjectMetadataAndEntries") < openEntrySlice.indexOf("teardownActiveWorkspaceRuntime"));
+  assert.ok(createSubmitSlice.indexOf("createNewProject") < createSubmitSlice.indexOf("teardownActiveWorkspaceRuntime"));
+  assert.equal(dialogSrc.includes("清除篩選條件"), true);
+  assert.equal(dialogSrc.includes("建立第一個專案"), true);
+  assert.equal(dialogSrc.includes("所有可用歌曲均已本機就緒"), true);
+
+  // 13. 窄版面防溢出與手機雙列分軌契約
+  const adaptiveRowSrc = fs.readFileSync(
+    path.resolve("components/band/AdaptiveActionRow.tsx"),
+    "utf8",
+  );
+  const stemMixerSrc = fs.readFileSync(
+    path.resolve("components/band/StemMixer.tsx"),
+    "utf8",
+  );
+  assert.equal(cssSrc.includes(".grid { display: grid; grid-template-columns: minmax(0, 1fr);"), true);
+  assert.equal(cssSrc.includes(".grid > * { min-width: 0; }"), true);
+  assert.equal(cssSrc.includes(".adaptive-measure-clip"), true);
+  assert.equal(cssSrc.includes("overflow-wrap: anywhere"), true);
+  assert.equal(cssSrc.includes("@media (max-width: 540px)"), true);
+  assert.equal(cssSrc.includes(".stem-row-slider"), true);
+  assert.equal(adaptiveRowSrc.includes("adaptive-measure-clip"), true);
+  assert.equal(stemMixerSrc.includes("stem-row-label"), true);
+  assert.equal(stemMixerSrc.includes("stem-row-slider"), true);
+  assert.equal(stemMixerSrc.includes("stem-row-actions"), true);
+  assert.equal(songCardSrc.includes("song-separation-status-text"), true);
+  assert.equal(songCardSrc.includes("song-card-header-meta"), true);
+
+  // 14. 歌曲狀態過多濃縮為彩色光點（Hover / 長按浮動詳情）契約
+  const statusIndicatorsSrc = fs.readFileSync(
+    path.resolve("components/band/SongStatusIndicators.tsx"),
+    "utf8",
+  );
+  assert.equal(songCardSrc.includes("SongStatusIndicators"), true);
+  assert.equal(songCardSrc.includes("buildSongStatusIndicators"), true);
+  assert.equal(statusIndicatorsSrc.includes("onMouseEnter"), true);
+  assert.equal(statusIndicatorsSrc.includes("onTouchStart"), true);
+  assert.equal(statusIndicatorsSrc.includes("onTouchMove"), true);
+  assert.equal(statusIndicatorsSrc.includes("onContextMenu"), true);
+  assert.equal(statusIndicatorsSrc.includes("status-dot-tooltip"), true);
+  assert.equal(cssSrc.includes(".status-dot-cluster"), true);
+  assert.equal(cssSrc.includes(".status-led-dot"), true);
+  assert.equal(cssSrc.includes(".status-dot-tooltip"), true);
+
+  // 15. 分軌播放來源一致性與自動切換契約
+  assert.equal(bandMixerSrc.includes("switchingSourceSongIdsRef"), true);
+  assert.equal(bandMixerSrc.includes("switchSourceRef"), true);
+  assert.equal(bandMixerSrc.includes("已自動切換為分軌混音"), true);
+  const releaseIdleStart = bandMixerSrc.indexOf("const releaseIdleResources =");
+  const ensureStemsStart = bandMixerSrc.indexOf("const ensureStemsInstalledForReadySong =");
+  assert.ok(releaseIdleStart !== -1 && ensureStemsStart > releaseIdleStart);
+  const releaseIdleSlice = bandMixerSrc.slice(releaseIdleStart, ensureStemsStart);
+  assert.equal(releaseIdleSlice.includes('playbackSource: song.playbackSource === "stems" ? "original"'), false);
+  assert.equal(songCardSrc.includes("stem-source-inactive-banner"), true);
+  assert.equal(songCardSrc.includes("切換分軌混音"), true);
+
+  // 16. 手機速度拉桿長按解鎖防誤觸契約
+  const touchSliderSrc = fs.readFileSync(
+    path.resolve("components/band/TouchGuardedRangeSlider.tsx"),
+    "utf8",
+  );
+  assert.equal(songCardSrc.includes("TouchGuardedRangeSlider"), true);
+  assert.equal(touchSliderSrc.includes("passive: false"), true);
+  assert.equal(touchSliderSrc.includes("shouldCancelSliderLongPress"), true);
+  assert.equal(touchSliderSrc.includes("computeRelativeSliderValue"), true);
+  assert.equal(touchSliderSrc.includes("onContextMenu"), true);
+  assert.equal(touchSliderSrc.includes("長按拉桿再左右滑動以調整速度"), true);
+  assert.equal(cssSrc.includes(".touch-guarded-slider"), true);
+  assert.equal(cssSrc.includes("touch-action: pan-y"), true);
 });
 
 test("3 & 4 & 5 & 6 & 11 & 12. Save stays local (auto & manual), Sync uploads manually, guides auth & handles conflict without losing local edits", async () => {
@@ -1671,4 +1785,364 @@ test("P2 (LocalSaveState Status Resolution & 3-Button Toolbar Contract): accurat
   const saveAsSlice = mixerSrc.slice(saveAsStart, saveAsEnd);
   assert.equal(saveAsSlice.includes("prepareAndSaveProjectAs"), true);
   assert.equal(saveAsSlice.includes(".catch(() => undefined)"), false);
+});
+
+test("P1 (Fail-Closed Post-Auth State Check): aborts sync safely on isDeletedFn/getRecordFn errors, protects local state, allows retry, and prevents stale/cross-switch continuation", async () => {
+  configureInMemoryIdbForTests();
+  clearCachedFolderLayoutForAccount();
+  try {
+    const server = createDriveMockServer();
+    let nowMs = 2_000_000;
+    let currentUserSub = "user-a";
+    let currentUserEmail = "a@example.com";
+
+    const accountManager = new GoogleAccountManager({
+      now: () => nowMs,
+      getConfigStatus: () => ({
+        configured: true,
+        clientId: "test-client",
+        apiKey: "test-key",
+        appId: "test-app",
+        missingFields: [],
+        message: null,
+      }),
+      ensureSdkLoaded: async () => undefined,
+      getSdkReadiness: () => "ready",
+      requestAccessToken: async () => ({
+        accessToken: `token-${currentUserSub}-${nowMs}`,
+        expiresInSec: 3600,
+        grantedScopes: ["https://www.googleapis.com/auth/drive.file", "openid", "profile", "email"],
+      }),
+      fetchImpl: async (url) => {
+        if (String(url).includes("oauth2/v3/userinfo")) {
+          return new Response(
+            JSON.stringify({ sub: currentUserSub, email: currentUserEmail, name: currentUserSub }),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify({ user: { permissionId: `perm-${currentUserSub}` } }), {
+          status: 200,
+        });
+      },
+    });
+
+    const song = createBandSong({
+      id: "fc_song_1",
+      projectEntryId: "fc_song_1",
+      name: "Fail Closed Song",
+      fileName: "fail-closed.mp3",
+      sourceAudioId: "fc_song_1_original",
+      settingsKey: "k-fc-1",
+      originalBpm: 112,
+      sourceAudioHash: "f".repeat(64),
+      durationSec: 120,
+    });
+
+    let projA = createInitialPersistedProjectRecord(
+      createEmptyProject({
+        name: "Fail Closed Proj A",
+        storageProvider: "google_drive",
+        ownerAccountId: "google:user-a",
+      }),
+      { dirty: true, syncStatus: "dirty" },
+    );
+    projA = {
+      ...projA,
+      project: buildProjectFromBandSongs({
+        existingProject: projA.project,
+        songs: [song],
+        incrementRevision: false,
+      }),
+    };
+    const projB = createInitialPersistedProjectRecord(
+      createEmptyProject({
+        name: "Fail Closed Proj B",
+        storageProvider: "google_drive",
+        ownerAccountId: "google:user-a",
+      }),
+      { dirty: true, syncStatus: "dirty" },
+    );
+    await saveProjectRecord(projA);
+    await saveProjectRecord(projB);
+
+    let activeProject = projA;
+    const localStatesByProject = new Map([[projA.projectId, "saved"]]);
+
+    const ctrl = new ProjectAutoSyncController({
+      localDebounceMs: 40,
+      retryBackoffMs: [5],
+      maxRetries: 0,
+      getAuthContext: () => {
+        const snap = accountManager.getSnapshot();
+        const tok = snap.account
+          ? accountManager.getValidAccessToken(snap.account.accountId)
+          : null;
+        return {
+          accountId: snap.account?.accountId ?? null,
+          accessToken: tok,
+          generation: snap.generation,
+          isGenerationValid: (g, a) => accountManager.isGenerationValid(g, a),
+          onAuthExpired: () => accountManager.markTokenExpired(snap.generation),
+        };
+      },
+      syncDriveFn: async (p) => saveProjectToDrive({ ...p, fetchImpl: server.fetchImpl }),
+      onStatusChanged: (pid, outcome) => {
+        if (outcome.status === "local_saved") {
+          localStatesByProject.set(pid, "saved");
+        } else if (outcome.status === "local_save_error") {
+          localStatesByProject.set(pid, "error");
+        }
+        if ("record" in outcome && outcome.record && activeProject?.projectId === pid) {
+          activeProject = outcome.record;
+        }
+      },
+    });
+
+    let syncProjectManuallyCalls = 0;
+    const origSyncProjectManually = ctrl.syncProjectManually.bind(ctrl);
+    ctrl.syncProjectManually = async (projectId) => {
+      syncProjectManuallyCalls += 1;
+      return origSyncProjectManually(projectId);
+    };
+
+    let customGetRecord = null;
+    let customIsDeleted = null;
+
+    const buildCoordinator = (useInjectedFns = true) =>
+      new ProjectManualSyncCoordinator({
+        getActiveProject: () => activeProject,
+        getSongCount: () => 1,
+        getHasLegacySongs: () => false,
+        isGoogleConfigured: () => true,
+        getExternalBusyAction: () => null,
+        getAuthSnapshot: () => {
+          const snap = accountManager.getSnapshot();
+          const tok = snap.account
+            ? accountManager.getValidAccessToken(snap.account.accountId)
+            : null;
+          return {
+            accountId: snap.account?.accountId ?? null,
+            accessToken: tok,
+            generation: snap.generation,
+          };
+        },
+        getSyncController: () => ctrl,
+        signInGoogle: async () => {
+          const after = await accountManager.signIn();
+          return {
+            accountId: after.account?.accountId ?? null,
+            accessToken: after.account
+              ? accountManager.getValidAccessToken(after.account.accountId)
+              : null,
+            generation: after.generation,
+          };
+        },
+        reauthorizeGoogle: async () => {
+          const after = await accountManager.reauthorize();
+          return {
+            accountId: after.account?.accountId ?? null,
+            accessToken: after.account
+              ? accountManager.getValidAccessToken(after.account.accountId)
+              : null,
+            generation: after.generation,
+          };
+        },
+        captureLatestSnapshot: () => undefined,
+        ...(useInjectedFns
+          ? {
+              getProjectRecordFn: (id) =>
+                customGetRecord ? customGetRecord(id) : getProjectRecord(id),
+              isProjectDeletedFn: (id) =>
+                customIsDeleted ? customIsDeleted(id) : Promise.resolve(false),
+            }
+          : {}),
+        onLocalSaveStateChange: (pid, state) => {
+          localStatesByProject.set(pid, state);
+        },
+        onFreshRecordLoaded: (rec) => {
+          if (activeProject?.projectId === rec.projectId) {
+            activeProject = rec;
+          }
+        },
+      });
+
+    const coordinator = buildCoordinator(true);
+    const strictDefaultCoordinator = buildCoordinator(false);
+
+    // 3a. 注入 isDeletedFn() 非同步 reject -> 中止同步、回報 project_state_unavailable、零 Drive 寫入、保留本機狀態
+    customIsDeleted = async () => {
+      throw new DOMException("Failed to read projectPreferences", "UnknownError");
+    };
+    const resDelReject = await coordinator.requestSync();
+    assert.equal(resDelReject.kind, "aborted");
+    assert.equal(resDelReject.reason, "project_state_unavailable");
+    assert.equal(resDelReject.message, PROJECT_STATE_UNAVAILABLE_MESSAGE);
+    assert.equal(syncProjectManuallyCalls, 0);
+    assert.equal(server.writeRequests.length, 0);
+    assert.equal(coordinator.isBusy(), false);
+    assert.equal(localStatesByProject.get(projA.projectId), "saved");
+    const dbAfterDelReject = await getProjectRecord(projA.projectId);
+    assert.equal(dbAfterDelReject?.syncStatus, "dirty");
+    assert.equal(dbAfterDelReject?.project.songs.length, 1);
+
+    // 3b. 注入 isDeletedFn() 同步 throw -> 同樣安全停止
+    accountManager.signOut();
+    customIsDeleted = () => {
+      throw new Error("synchronous tombstone read failure");
+    };
+    const resDelSyncThrow = await coordinator.requestSync();
+    assert.equal(resDelSyncThrow.kind, "aborted");
+    assert.equal(resDelSyncThrow.reason, "project_state_unavailable");
+    assert.equal(resDelSyncThrow.message, PROJECT_STATE_UNAVAILABLE_MESSAGE);
+    assert.equal(syncProjectManuallyCalls, 0);
+    assert.equal(server.writeRequests.length, 0);
+
+    // 3c. 使用預設 Strict IDB (projectPreferences 讀取失敗) -> 亦不可被 projectStore.catch 吞掉，必須回報 project_state_unavailable
+    accountManager.signOut();
+    setInMemoryIdbHooksForTests({
+      beforeRead(storeName) {
+        if (storeName === "projectPreferences") {
+          throw new DOMException("Simulated projectPreferences read error", "AbortError");
+        }
+      },
+    });
+    const resStrictDelFail = await strictDefaultCoordinator.requestSync();
+    assert.equal(resStrictDelFail.kind, "aborted");
+    assert.equal(resStrictDelFail.reason, "project_state_unavailable");
+    assert.equal(resStrictDelFail.message, PROJECT_STATE_UNAVAILABLE_MESSAGE);
+    assert.equal(syncProjectManuallyCalls, 0);
+    assert.equal(server.writeRequests.length, 0);
+    setInMemoryIdbHooksForTests({});
+
+    // 4a. getRecordFn() 拋出錯誤（即使 isDeletedFn() 回傳 false）-> 必須停止且不誤判成有效專案或已刪除
+    accountManager.signOut();
+    customIsDeleted = async () => false;
+    customGetRecord = async () => {
+      throw new Error("IndexedDB projects read failed");
+    };
+    const resRecReject = await coordinator.requestSync();
+    assert.equal(resRecReject.kind, "aborted");
+    assert.equal(resRecReject.reason, "project_state_unavailable");
+    assert.equal(resRecReject.message, PROJECT_STATE_UNAVAILABLE_MESSAGE);
+    assert.equal(syncProjectManuallyCalls, 0);
+    assert.equal(server.writeRequests.length, 0);
+
+    // 4b. 使用預設 Strict IDB (projects 讀取失敗) -> 明確區分讀取失敗，回報 project_state_unavailable
+    accountManager.signOut();
+    setInMemoryIdbHooksForTests({
+      beforeRead(storeName) {
+        if (storeName === "projects") {
+          throw new DOMException("Simulated projects read error", "AbortError");
+        }
+      },
+    });
+    const resStrictRecFail = await strictDefaultCoordinator.requestSync();
+    assert.equal(resStrictRecFail.kind, "aborted");
+    assert.equal(resStrictRecFail.reason, "project_state_unavailable");
+    assert.equal(resStrictRecFail.message, PROJECT_STATE_UNAVAILABLE_MESSAGE);
+    assert.equal(syncProjectManuallyCalls, 0);
+    assert.equal(server.writeRequests.length, 0);
+    setInMemoryIdbHooksForTests({});
+
+    // 4c. 對照組：getRecordFn() 成功回傳 null（專案不存在）且 isDeletedFn() 回傳 false -> 回報 project_deleted
+    accountManager.signOut();
+    customGetRecord = async () => null;
+    customIsDeleted = async () => false;
+    const resMissing = await coordinator.requestSync();
+    assert.equal(resMissing.kind, "aborted");
+    assert.equal(resMissing.reason, "project_deleted");
+    assert.equal(syncProjectManuallyCalls, 0);
+    assert.equal(server.writeRequests.length, 0);
+
+    // 2. isDeletedFn() 成功且明確回傳 true -> 維持 project_deleted 中止流程
+    accountManager.signOut();
+    customGetRecord = null;
+    customIsDeleted = async () => true;
+    const resDeletedTrue = await coordinator.requestSync();
+    assert.equal(resDeletedTrue.kind, "aborted");
+    assert.equal(resDeletedTrue.reason, "project_deleted");
+    assert.equal(syncProjectManuallyCalls, 0);
+    assert.equal(server.writeRequests.length, 0);
+
+    // 1 & 7. 使用者重試且 isDeletedFn() 恢復回傳 false、getRecordFn() 正常讀取 -> 進入後續檢查並同步成功
+    accountManager.signOut();
+    customGetRecord = null;
+    customIsDeleted = async () => false;
+    const resRetrySuccess = await coordinator.requestSync();
+    assert.equal(resRetrySuccess.kind, "synced_outcome");
+    assert.equal(resRetrySuccess.outcome?.status, "synced");
+    assert.equal(syncProjectManuallyCalls, 1);
+    assert.ok(server.writeRequests.length > 0);
+
+    projA = await getProjectRecord(projA.projectId);
+    activeProject = projA;
+
+    // 8a. 查詢期間切換專案 -> 即使查詢返回，也不得繼續同步
+    accountManager.signOut();
+    const writesBeforeSwitch = server.writeRequests.length;
+    const callsBeforeSwitch = syncProjectManuallyCalls;
+    const switchQueryDef = createDeferred();
+    customIsDeleted = () => switchQueryDef.promise;
+    const switchPromise = coordinator.requestSync();
+    await new Promise((r) => setTimeout(r, 15));
+    activeProject = projB;
+    switchQueryDef.resolve(false);
+    const switchRes = await switchPromise;
+    assert.equal(switchRes.kind, "aborted");
+    assert.equal(switchRes.reason, "project_switched");
+    assert.equal(syncProjectManuallyCalls, callsBeforeSwitch);
+    assert.equal(server.writeRequests.length, writesBeforeSwitch);
+
+    // 8b. 查詢期間切換 / 變更 Google 帳號 -> 即使查詢返回，也不得繼續同步
+    activeProject = projA;
+    accountManager.signOut();
+    const writesBeforeAuthChange = server.writeRequests.length;
+    const authChangeQueryDef = createDeferred();
+    customIsDeleted = () => authChangeQueryDef.promise;
+    const authChangePromise = coordinator.requestSync();
+    await new Promise((r) => setTimeout(r, 15));
+    // 模擬查詢等待期間切換為 user-b 並完成登入（使 generation 與 accountId 雙重改變）
+    currentUserSub = "user-b";
+    currentUserEmail = "b@example.com";
+    await accountManager.signIn();
+    authChangeQueryDef.resolve(false);
+    const authChangeRes = await authChangePromise;
+    assert.equal(authChangeRes.kind, "aborted");
+    assert.equal(authChangeRes.reason, "auth_changed");
+    assert.equal(syncProjectManuallyCalls, callsBeforeSwitch);
+    assert.equal(server.writeRequests.length, writesBeforeAuthChange);
+
+    // 8c. 查詢期間呼叫 invalidate() (stale_operation 防護)，不論之後查詢 reject 或 resolve 皆中止且不觸發同步
+    currentUserSub = "user-a";
+    currentUserEmail = "a@example.com";
+    accountManager.signOut();
+    const staleQueryDef = createDeferred();
+    customIsDeleted = () => staleQueryDef.promise;
+    const stalePromise = coordinator.requestSync();
+    await new Promise((r) => setTimeout(r, 15));
+    coordinator.invalidate();
+    staleQueryDef.reject(new Error("late query failure after invalidate"));
+    const staleRes = await stalePromise;
+    assert.equal(staleRes.kind, "aborted");
+    assert.equal(staleRes.reason, "stale_operation");
+    assert.equal(syncProjectManuallyCalls, callsBeforeSwitch);
+    assert.equal(server.writeRequests.length, writesBeforeAuthChange);
+
+    // 使用者重試（使用預設 Strict Coordinator 且無任何錯誤注入）也正常完成同步
+    activeProject = projB;
+    accountManager.signOut();
+    const writesBeforeFinalStrict = server.writeRequests.length;
+    const strictSuccessRes = await strictDefaultCoordinator.requestSync();
+    assert.equal(strictSuccessRes.kind, "synced_outcome");
+    assert.equal(strictSuccessRes.outcome?.status, "synced");
+    assert.equal(syncProjectManuallyCalls, callsBeforeSwitch + 1);
+    assert.ok(server.writeRequests.length > writesBeforeFinalStrict);
+
+    await ctrl.dispose();
+    accountManager.dispose();
+  } finally {
+    setInMemoryIdbHooksForTests({});
+    clearCachedFolderLayoutForAccount();
+    resetInMemoryIdbForTests();
+  }
 });

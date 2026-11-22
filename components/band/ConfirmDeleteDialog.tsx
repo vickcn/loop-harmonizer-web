@@ -13,6 +13,9 @@ type Props = {
   open: boolean;
   title: string;
   subtitle?: string;
+  badgeLabel?: string;
+  changeHeading?: string;
+  preserveHeading?: string;
   deleteItems: string[];
   preserveItems: string[];
   recoverability: string;
@@ -44,6 +47,9 @@ export function ConfirmDeleteDialog({
   open,
   title,
   subtitle,
+  badgeLabel,
+  changeHeading,
+  preserveHeading,
   deleteItems,
   preserveItems,
   recoverability,
@@ -184,14 +190,14 @@ export function ConfirmDeleteDialog({
               flexShrink: 0,
             }}
           >
-            {danger ? "刪除確認" : "清理確認"}
+            {badgeLabel ?? (danger ? "刪除確認" : "清理確認")}
           </span>
         </div>
 
         <div className="grid mixer-modal-section" style={{ gap: 8 }}>
           <div className="grid" style={{ gap: 4 }}>
-            <strong className="small" style={{ color: "#fca5a5" }}>
-              將刪除以下資料
+            <strong className="small" style={{ color: danger ? "#fca5a5" : "#bae6fd" }}>
+              {changeHeading ?? "將刪除以下資料"}
             </strong>
             <ul className="mixer-modal-list">
               {deleteItems.map((item, idx) => (
@@ -204,7 +210,7 @@ export function ConfirmDeleteDialog({
 
           <div className="grid" style={{ gap: 4, paddingTop: 6, borderTop: "1px solid rgba(148, 163, 184, 0.14)" }}>
             <strong className="small" style={{ color: "#6ee7b7" }}>
-              以下資料會完整保留
+              {preserveHeading ?? "以下資料會完整保留"}
             </strong>
             <ul className="mixer-modal-list">
               {preserveItems.map((item, idx) => (

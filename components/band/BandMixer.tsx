@@ -240,10 +240,12 @@ import {
   applyResetMix,
   applyResetSpeed,
   describePlaybackError,
+  formatBatchPlaySummary,
   resolveShortcutAction,
   sanitizeMixerSelection,
   toggleMuteBySelection,
   toggleSoloBySelection,
+  type BatchPlayAttemptResult,
   type MixerSelection,
 } from "@/lib/band/mixerShortcuts";
 
@@ -349,14 +351,19 @@ export function BandMixer() {
   const [deleteDialog, setDeleteDialog] = useState<{
     title: string;
     subtitle?: string;
+    badgeLabel?: string;
+    changeHeading?: string;
+    preserveHeading?: string;
     deleteItems: string[];
     preserveItems: string[];
     recoverability: string;
     safetyNote?: string | null;
     confirmLabel: string;
+    cancelLabel?: string;
     danger?: boolean;
     checkboxLabel?: string;
     checkboxDescription?: string;
+    onCancelNotice?: () => void;
     onExecute: (checkboxChecked: boolean) => Promise<
       | { status: "success"; message?: string }
       | { status: "blocked"; reason: string }
@@ -412,6 +419,10 @@ export function BandMixer() {
   const sessionRef = useRef(session);
   const selectionRef = useRef<MixerSelection>(selection);
   const startingSongIdsRef = useRef<Set<string>>(startingSongIds);
+  const switchingSourceSongIdsRef = useRef<Set<string>>(new Set());
+  const switchSourceRef = useRef<
+    ((song: BandSong, playbackSource: "original" | "stems", options?: { autoReason?: string }) => Promise<void>) | null
+  >(null);
   const profileWarningRef = useRef<string>(profileWarning);
   const hintTimerRef = useRef<number | null>(null);
   const cardFeedbackTimersRef = useRef<Map<string, number>>(new Map());
@@ -456,12 +467,14 @@ export function BandMixer() {
   const [projectListLoading, setProjectListLoading] = useState(false);
   const [projectListError, setProjectListError] = useState<string | null>(null);
   const [projectListIncompleteReason, setProjectListIncompleteReason] = useState<string | null>(null);
+  const projectListLoadSeqRef = useRef(0);
   const cloudProjectsMapRef = useRef(new Map<string, { project: BandProject; driveVersion?: string | null }>());
   const [promoteProgress, setPromoteProgress] = useState<PromoteLocalToDriveProgress | null>(null);
   const [promoteBackupFailures, setPromoteBackupFailures] = useState<Array<{ entryId: string; displayName: string; reason: string }>>([]);
   const promoteAbortRef = useRef<AbortController | null>(null);
   const [offlineAssessment, setOfflineAssessment] = useState<ProjectOfflineAssessment | null>(null);
   const [offlineAssessmentLoading, setOfflineAssessmentLoading] = useState(false);
+  const offlineAssessmentSeqRef = useRef(0);
   const [offlineDownloadProgress, setOfflineDownloadProgress] = useState<ProjectOfflineDownloadProgress | null>(null);
   const [offlineDownloadResult, setOfflineDownloadResult] = useState<{
     completedCount: number;
@@ -1576,6 +1589,17 @@ export function BandMixer() {
 
     if (idleSongIds.length > 0) {
       const idleIdSet = new Set(idleSongIds);
+      const nextIdleSongs = sessionRef.current.songs.map((song) => (
+        idleIdSet.has(song.id)
+          ? {
+              ...song,
+              status: song.status === "playing" ? song.status : ("stopped" as const),
+              audioLoadState: "unloaded" as const,
+              stemIds: [],
+            }
+          : song
+      ));
+      sessionRef.current = { ...sessionRef.current, songs: nextIdleSongs };
       setSession((previous) => ({
         ...previous,
         songs: previous.songs.map((song) => (
@@ -1585,7 +1609,6 @@ export function BandMixer() {
                 status: song.status === "playing" ? song.status : "stopped",
                 audioLoadState: "unloaded",
                 stemIds: [],
-                playbackSource: song.playbackSource === "stems" ? "original" : song.playbackSource,
               }
             : song
         )),
@@ -1846,6 +1869,10 @@ export function BandMixer() {
         persistenceMessage: "已保存在此裝置",
       };
       applySongToEngine(readySong);
+      sessionRef.current = {
+        ...sessionRef.current,
+        songs: sessionRef.current.songs.map((item) => (item.id === song.id ? readySong : item)),
+      };
       setSession((previous) => ({
         ...previous,
         songs: previous.songs.map((item) => (item.id === song.id ? readySong : item)),
@@ -3713,13 +3740,13 @@ export function BandMixer() {
     if (res.ok) showCardFeedback(song.id, "已保留目前分頁設定並更新本機資料。");
   };
 
-  const playSong = async (song: BandSong) => {
+  const playSong = async (song: BandSong): Promise<{ started: boolean; reason?: string }> => {
     if (isFocusLocked()) {
       const msg = "目前處於分離專注模式，已暫停音訊處理並鎖定啟動播放；請待分離完成或點擊「中止分離」。";
       setPlaybackErrors((previous) => ({ ...previous, [song.id]: msg }));
       showCardFeedback(song.id, msg);
       showShortcutHint(msg);
-      return;
+      return { started: false, reason: "分離專注模式啟動中" };
     }
     const activeProjForPlay = activeProjectRecordRef.current;
     const isOnDemandCandidate = Boolean(
@@ -3732,9 +3759,14 @@ export function BandMixer() {
         : "此歌曲缺少本機原始音檔，請先重新選取音檔。";
       setPlaybackErrors((previous) => ({ ...previous, [song.id]: msg }));
       showShortcutHint(msg);
-      return;
+      return {
+        started: false,
+        reason: song.persistenceStatus === "restoring" ? "正在恢復音檔" : "缺少本機原始音檔",
+      };
     }
-    if (startingSongIdsRef.current.has(song.id)) return;
+    if (startingSongIdsRef.current.has(song.id)) {
+      return { started: false, reason: "正在啟動播放中" };
+    }
     startingSongIdsRef.current.add(song.id);
     getEngine().primeContextFromGesture();
     setStartingSongIds((previous) => new Set(previous).add(song.id));
@@ -3778,7 +3810,7 @@ export function BandMixer() {
             const msg = "此歌曲尚未下載至本機，請先重新授權 Google 帳號後再點擊播放。";
             setPlaybackErrors((previous) => ({ ...previous, [song.id]: msg }));
             showShortcutHint(msg);
-            return;
+            return { started: false, reason: "需要重新授權 Google 帳號" };
           }
           setRestoringOnDemandBySongId((prev) => ({
             ...prev,
@@ -3809,7 +3841,7 @@ export function BandMixer() {
               },
             });
             if (activeProjectIdRef.current !== activeProjForPlay.projectId) {
-              return;
+              return { started: false, reason: "已切換專案" };
             }
             const updatedSong = {
               ...song,
@@ -3878,12 +3910,15 @@ export function BandMixer() {
         }
       }
       const ready = await ensureSongAudioReady(songForReady);
-      if (!ready) return;
+      if (!ready) {
+        const failedMsg = sessionRef.current.songs.find((item) => item.id === song.id)?.persistenceMessage;
+        return { started: false, reason: failedMsg || "音訊尚未就緒" };
+      }
       if (isFocusLocked()) {
         const msg = "分離專注模式已啟動，取消本次播放。";
         setPlaybackErrors((previous) => ({ ...previous, [song.id]: msg }));
         showCardFeedback(song.id, msg);
-        return;
+        return { started: false, reason: "分離專注模式已啟動" };
       }
       const latestSong = sessionRef.current.songs.find((item) => item.id === song.id) ?? song;
       const trackIds = getSongPlaybackTrackIds(latestSong);
@@ -3911,7 +3946,7 @@ export function BandMixer() {
           setProfileWarning(admission.message);
           showCardFeedback(latestSong.id, admission.message);
           showShortcutHint(admission.message);
-          return;
+          return { started: false, reason: admission.message };
         }
 
         const otherPlayingSongs = sessionRef.current.songs.filter(
@@ -3941,7 +3976,7 @@ export function BandMixer() {
           setProfileWarning(admission.message);
           showCardFeedback(latestSong.id, admission.message);
           showShortcutHint(admission.message);
-          return;
+          return { started: false, reason: admission.message };
         }
 
         const decision = await requestGuardConfirmation({
@@ -3951,7 +3986,7 @@ export function BandMixer() {
         });
         if (!decision) {
           setPlaybackErrors((previous) => ({ ...previous, [latestSong.id]: admission.message }));
-          return;
+          return { started: false, reason: "已取消高負載確認" };
         }
 
         if (decision.applyLowLoadActions.includes("pause-other-songs")) {
@@ -3981,7 +4016,7 @@ export function BandMixer() {
           setProfileWarning(admission.message);
           showCardFeedback(latestSong.id, admission.message);
           showShortcutHint(admission.message);
-          return;
+          return { started: false, reason: admission.message };
         }
       }
 
@@ -4085,7 +4120,7 @@ export function BandMixer() {
           const repairedDiag = engine.diagnosePlayback(repairedTrackIds);
           console.info("[BandMixer AudioDiag][Repaired]", JSON.stringify(repairedDiag));
           updateSong(repairedSong.id, { status: "playing" });
-          return;
+          return { started: true };
         }
 
         if (engine.hasTrack(preparedSong.sourceAudioId)) {
@@ -4145,15 +4180,17 @@ export function BandMixer() {
           }
           showCardFeedback(fallbackSong.id, fallbackMsg);
           showShortcutHint(fallbackMsg);
-          return;
+          return { started: true };
         }
       }
 
       updateSong(preparedSong.id, { status: "playing" });
+      return { started: true };
     } catch (error) {
       const errorMsg = describePlaybackError(error);
       setPlaybackErrors((previous) => ({ ...previous, [song.id]: errorMsg }));
       showShortcutHint(errorMsg);
+      return { started: false, reason: errorMsg };
     } finally {
       startingSongIdsRef.current.delete(song.id);
       setStartingSongIds((previous) => {
@@ -4220,6 +4257,15 @@ export function BandMixer() {
       }));
       persistSongDebounced(result.changedSong.id);
       showCardFeedback(result.changedSong.id, result.message);
+      if (
+        targetSelection.stemId &&
+        result.changedSong.playbackSource === "original" &&
+        result.changedSong.stemIds.length > 0
+      ) {
+        void switchSourceRef.current?.(result.changedSong, "stems", {
+          autoReason: "已自動切換為分軌混音",
+        });
+      }
     }
     showShortcutHint(result.message);
   }, [applySongAudioPatch, applySongToEngine, isFocusLocked, persistSongDebounced, showCardFeedback, showShortcutHint]);
@@ -4251,75 +4297,150 @@ export function BandMixer() {
       }));
       persistSongDebounced(result.changedSong.id);
       showCardFeedback(result.changedSong.id, result.message);
+      if (
+        result.changedSong.playbackSource === "original" &&
+        result.changedSong.stemIds.length > 0
+      ) {
+        void switchSourceRef.current?.(result.changedSong, "stems", {
+          autoReason: "已自動切換為分軌混音",
+        });
+      }
     } else if (targetSelection.songId) {
       showCardFeedback(targetSelection.songId, result.message);
     }
     showShortcutHint(result.message);
   }, [applySongAudioPatch, applySongToEngine, isFocusLocked, persistSongDebounced, showCardFeedback, showShortcutHint]);
 
-  const switchSource = async (song: BandSong, playbackSource: "original" | "stems") => {
+  const switchSource = async (
+    song: BandSong,
+    playbackSource: "original" | "stems",
+    options?: { autoReason?: string },
+  ) => {
     if (isFocusLocked()) {
       const msg = "分離專注模式啟動中，已鎖定切換播放來源。";
       showCardFeedback(song.id, msg);
       showShortcutHint(msg);
       return;
     }
-    if (song.playbackSource === playbackSource || (playbackSource === "stems" && song.stemIds.length === 0)) return;
-    const engine = getEngine();
-    const oldIds = getSongPlaybackTrackIds(song);
-    const nextSong = { ...song, playbackSource };
-    const newIds = getSongPlaybackTrackIds(nextSong);
-    if (song.status === "playing") {
-      const cap = await collectDeviceCapabilities();
-      const perfSignals = sharedPerfTelemetry.getSignals();
-      const profileEval = sharedResourceProfileManager.evaluate(cap, perfSignals);
-      setResourceProfile(profileEval.profile);
-      const projected = Math.max(0, engine.getActiveSoundTouchCount() - 1) + 1;
-      const admission = evaluateTaskAdmission({
-        operation: "soundtouch-playback",
-        profile: profileEval.profile,
-        capabilities: cap,
-        estimatedTaskMemoryBytes: 0,
-        inMemoryAudioBytes: engine.getTrackMemoryEstimateBytes(),
-        projectedActiveSoundTouchTracks: projected,
-        performanceSignals: perfSignals,
-        separationFocusActive: isFocusLocked(),
-      });
-      if (!admission.allowed) {
-        setProfileWarning(admission.message);
-        showShortcutHint(admission.message);
-        showCardFeedback(song.id, admission.message);
-        return;
+    if (switchingSourceSongIdsRef.current.has(song.id)) return;
+    const initialSong = sessionRef.current.songs.find((candidate) => candidate.id === song.id) ?? song;
+    if (
+      initialSong.playbackSource === playbackSource ||
+      (playbackSource === "stems" && initialSong.stemIds.length === 0)
+    ) {
+      return;
+    }
+    switchingSourceSongIdsRef.current.add(song.id);
+    try {
+      const engine = getEngine();
+      let currentSong = sessionRef.current.songs.find((candidate) => candidate.id === song.id) ?? initialSong;
+      if (playbackSource === "stems") {
+        const stemsMissing =
+          currentSong.stemIds.length === 0 ||
+          currentSong.stemIds.some((id) => !engine.hasTrack(id)) ||
+          (currentSong.separationUsesChunkPlayback && !engine.hasHealthyStemMixBus(currentSong.id));
+        if (stemsMissing) {
+          await ensureStemsInstalledForReadySong(currentSong, currentSong.playbackSource);
+          currentSong = sessionRef.current.songs.find((candidate) => candidate.id === song.id) ?? currentSong;
+        }
+        const stemsReady =
+          currentSong.stemIds.length > 0 &&
+          currentSong.stemIds.every((id) => engine.hasTrack(id)) &&
+          (!currentSong.separationUsesChunkPlayback || engine.hasHealthyStemMixBus(currentSong.id));
+        if (!stemsReady) {
+          const msg = "目前找不到可播放的本機分軌資料，暫維持原始混音（請重新分離或從雲端恢復分軌）。";
+          showCardFeedback(song.id, msg);
+          showShortcutHint(msg);
+          return;
+        }
+      } else {
+        if (currentSong.sourceAudioMissing) {
+          const msg = "缺少原始音檔，無法切回原始混音。";
+          showCardFeedback(song.id, msg);
+          showShortcutHint(msg);
+          return;
+        }
+        if (!engine.hasTrack(currentSong.sourceAudioId)) {
+          const ready = await ensureSongAudioReady(currentSong);
+          if (!ready) return;
+          currentSong = sessionRef.current.songs.find((candidate) => candidate.id === song.id) ?? currentSong;
+        }
       }
-      if (admission.requiresWarning) {
-        setProfileWarning(admission.message);
-        showShortcutHint(admission.message);
-        showCardFeedback(song.id, admission.message);
+
+      if (currentSong.playbackSource === playbackSource) return;
+      const oldIds = getSongPlaybackTrackIds(currentSong);
+      const livePos =
+        currentSong.status === "playing" && oldIds[0]
+          ? engine.getTrackPosition(oldIds[0])
+          : currentSong.playheadSec;
+
+      if (currentSong.status === "playing") {
+        const cap = await collectDeviceCapabilities();
+        const perfSignals = sharedPerfTelemetry.getSignals();
+        const profileEval = sharedResourceProfileManager.evaluate(cap, perfSignals);
+        setResourceProfile(profileEval.profile);
+        const projected = Math.max(0, engine.getActiveSoundTouchCount() - 1) + 1;
+        const admission = evaluateTaskAdmission({
+          operation: "soundtouch-playback",
+          profile: profileEval.profile,
+          capabilities: cap,
+          estimatedTaskMemoryBytes: 0,
+          inMemoryAudioBytes: engine.getTrackMemoryEstimateBytes(),
+          projectedActiveSoundTouchTracks: projected,
+          performanceSignals: perfSignals,
+          separationFocusActive: isFocusLocked(),
+        });
+        if (!admission.allowed) {
+          setProfileWarning(admission.message);
+          showShortcutHint(admission.message);
+          showCardFeedback(song.id, admission.message);
+          return;
+        }
+        if (admission.requiresWarning) {
+          setProfileWarning(admission.message);
+          showShortcutHint(admission.message);
+          showCardFeedback(song.id, admission.message);
+        }
       }
+
+      // 再讀一次最新分軌音量/靜音設定，避免非同步準備期間的調整被覆寫
+      const latestBeforeCommit = sessionRef.current.songs.find((candidate) => candidate.id === song.id) ?? currentSong;
+      const committedSong: BandSong = {
+        ...latestBeforeCommit,
+        playbackSource,
+      };
+      const committedNewIds = getSongPlaybackTrackIds(committedSong);
+      engine.seekTracks(committedNewIds, livePos);
+      applySongToEngine(committedSong);
+      if (committedSong.status === "playing") {
+        await engine.playTracks(committedNewIds);
+        engine.crossfadeTracks(oldIds, committedNewIds);
+      }
+      sessionRef.current = {
+        ...sessionRef.current,
+        songs: sessionRef.current.songs.map((candidate) => (candidate.id === song.id ? committedSong : candidate)),
+      };
+      setSession((previous) => ({
+        ...previous,
+        songs: previous.songs.map((candidate) => (candidate.id === song.id ? committedSong : candidate)),
+      }));
+      if (playbackSource === "original") {
+        setSelection((previous) => (
+          previous.songId === song.id && previous.stemId
+            ? { songId: song.id, stemId: null }
+            : previous
+        ));
+      }
+      if (options?.autoReason) {
+        showCardFeedback(song.id, options.autoReason);
+        showShortcutHint(options.autoReason);
+      }
+      persistSongDebounced(song.id, 150);
+    } finally {
+      switchingSourceSongIdsRef.current.delete(song.id);
     }
-    engine.seekTracks(newIds, song.playheadSec);
-    applySongToEngine(nextSong);
-    if (song.status === "playing") {
-      await engine.playTracks(newIds);
-      engine.crossfadeTracks(oldIds, newIds);
-    }
-    sessionRef.current = {
-      ...sessionRef.current,
-      songs: sessionRef.current.songs.map((candidate) => candidate.id === song.id ? nextSong : candidate),
-    };
-    setSession((previous) => ({
-      ...previous,
-      songs: previous.songs.map((candidate) => candidate.id === song.id ? nextSong : candidate),
-    }));
-    if (playbackSource === "original") {
-      setSelection((previous) => (
-        previous.songId === song.id && previous.stemId
-          ? { songId: song.id, stemId: null }
-          : previous
-      ));
-    }
-    persistSongDebounced(song.id, 150);
   };
+  switchSourceRef.current = switchSource;
 
   const abortSongSeparation = async (song: BandSong) => {
     sharedPerfTelemetry.markAbortRequested();
@@ -5352,6 +5473,12 @@ export function BandMixer() {
         return nextSongs.find((n) => n.id === song.id) ?? candidate;
       }),
     }));
+    const updatedSong = nextSongs.find((n) => n.id === song.id);
+    if (updatedSong && updatedSong.playbackSource === "original" && updatedSong.stemIds.length > 0) {
+      void switchSourceRef.current?.(updatedSong, "stems", {
+        autoReason: "已自動切換為分軌混音",
+      });
+    }
     if (shouldPersist) {
       persistSongDebounced(song.id, 300);
     }
@@ -6403,6 +6530,15 @@ export function BandMixer() {
   };
 
   shortcutHandlerRef.current = (event: KeyboardEvent) => {
+    if (
+      Boolean(projectDialogMode) ||
+      Boolean(deleteDialog) ||
+      Boolean(guardDialog) ||
+      Boolean(driveExportModalSongId) ||
+      driveLibraryOpen
+    ) {
+      return;
+    }
     const action = resolveShortcutAction(event);
     if (!action) return;
     event.preventDefault();
@@ -6495,17 +6631,18 @@ export function BandMixer() {
     };
   }, []);
 
-  const clearWorkspaceForProjectSwitch = useCallback(async () => {
+  const teardownActiveWorkspaceRuntime = useCallback(async (options?: {
+    discardPendingLocal?: boolean;
+  }) => {
     manualSyncCoordinatorRef.current?.invalidate();
     const prevProjectId = activeProjectIdRef.current;
-    await Promise.all([
-      flushPendingSongPersists().catch(() => undefined),
-      prevProjectId
-        ? autoSyncControllerRef.current
-            ?.invalidateProject(prevProjectId, { discardPendingLocal: false })
-            .catch(() => undefined)
-        : autoSyncControllerRef.current?.flushLocalSaves({ suppressStatusCallback: true }).catch(() => undefined),
-    ]);
+    if (prevProjectId) {
+      await autoSyncControllerRef.current
+        ?.invalidateProject(prevProjectId, {
+          discardPendingLocal: options?.discardPendingLocal ?? true,
+        })
+        .catch(() => undefined);
+    }
     const engine = getEngine();
     for (const s of sessionRef.current.songs) {
       const ids = [s.sourceAudioId, ...s.stemIds];
@@ -6525,6 +6662,108 @@ export function BandMixer() {
     setLocalSaveState("idle");
   }, [getEngine]);
 
+  const flushCurrentWorkspaceBeforeSwitch = async (): Promise<
+    { ok: true } | { ok: false; failures: string[]; summary: string }
+  > => {
+    const prevActive = activeProjectRecordRef.current;
+    const prevProjectId = activeProjectIdRef.current;
+    if (prevActive) {
+      const probe = buildProjectFromBandSongs({
+        existingProject: prevActive.project,
+        songs: sessionRef.current.songs,
+        incrementRevision: false,
+      });
+      if (!isProjectContentEqual(prevActive.project, probe)) {
+        scheduleActiveProjectSave(sessionRef.current.songs);
+      }
+    }
+
+    const failures: string[] = [];
+    const inFlightEntries = [...inFlightAudioPersistsRef.current.entries()];
+    if (inFlightEntries.length > 0) {
+      try {
+        const audioResults = await Promise.all(inFlightEntries.map(([, p]) => p));
+        for (const r of audioResults) {
+          if (!r.ok && r.failure) {
+            failures.push(`音檔「${r.failure.songName}」保存失敗：${r.failure.reason}`);
+          }
+        }
+      } catch (err) {
+        failures.push(err instanceof Error ? err.message : "待保存音檔寫入 IndexedDB 失敗。");
+      }
+    }
+
+    try {
+      const songFlush = await flushPendingSongPersists();
+      if (!songFlush.ok) {
+        for (const item of songFlush.failed) {
+          failures.push(`歌曲「${item.songName}」保存失敗：${item.reason}`);
+        }
+      }
+    } catch (err) {
+      failures.push(err instanceof Error ? err.message : "待保存歌曲寫入 IndexedDB 失敗。");
+    }
+
+    if (autoSyncControllerRef.current) {
+      try {
+        const projFlush = await autoSyncControllerRef.current.flushLocalSaves(
+          prevProjectId
+            ? { projectId: prevProjectId, suppressStatusCallback: true }
+            : { suppressStatusCallback: true },
+        );
+        for (const item of projFlush.failed) {
+          failures.push(`專案紀錄保存失敗：${item.reason}`);
+        }
+      } catch (err) {
+        failures.push(err instanceof Error ? err.message : "專案寫入 IndexedDB 失敗。");
+      }
+    }
+
+    if (failures.length > 0) {
+      if (prevProjectId) {
+        setLocalSaveState("error");
+        autoSyncControllerRef.current?.setProjectLocalSaveState(prevProjectId, "error");
+      }
+      return {
+        ok: false,
+        failures,
+        summary: failures[0] || "寫入本機 IndexedDB 失敗，已停止切換以免資料遺失。",
+      };
+    }
+
+    return { ok: true };
+  };
+
+  const promptForceSwitchAfterSaveFailure = (
+    actionLabel: string,
+    failures: string[],
+    retryForceAction: () => Promise<void>,
+  ) => {
+    openDeleteConfirmDialog(
+      {
+        title: "目前工作區尚有未成功保存的變更",
+        subtitle: `執行「${actionLabel}」前寫入本機 IndexedDB 失敗`,
+        badgeLabel: "未保存變更",
+        changeHeading: "以下本機變更寫入失敗，繼續切換將會遺失",
+        preserveHeading: "保留的既有資料",
+        deleteItems: failures,
+        preserveItems: [
+          "已成功寫入 IndexedDB 的既有歌曲、音檔與先前已保存專案版本",
+        ],
+        recoverability:
+          "建議先點「留在目前工作區」並清理儲存空間後按「儲存」；僅在確認可放棄本次修改時再強制切換。",
+        confirmLabel: "放棄未保存變更並繼續",
+        cancelLabel: "留在目前工作區",
+        danger: true,
+        onExecute: async () => {
+          await retryForceAction();
+          return { status: "success" };
+        },
+      },
+      false,
+    );
+  };
+
   const applyProjectWorkspaceState = useCallback((record: PersistedProjectRecord, songs: BandSong[]) => {
     activeProjectRecordRef.current = record;
     activeProjectIdRef.current = record.projectId;
@@ -6537,6 +6776,7 @@ export function BandMixer() {
   }, []);
 
   const refreshProjectListEntries = useCallback(async () => {
+    const seq = ++projectListLoadSeqRef.current;
     const auth = getProjectAuthContext();
     setProjectListLoading(true);
     setProjectListError(null);
@@ -6547,7 +6787,7 @@ export function BandMixer() {
         accessToken: auth.accessToken,
         includeCloud: Boolean(auth.accountId && auth.accessToken),
       });
-      if (!mountedRef.current) return;
+      if (!mountedRef.current || seq !== projectListLoadSeqRef.current) return;
       cloudProjectsMapRef.current = res.cloudProjectsMap;
       setProjectListEntries(res.projects);
       setProjectListError(res.cloudError ?? null);
@@ -6557,11 +6797,11 @@ export function BandMixer() {
           : null,
       );
     } catch (err) {
-      if (mountedRef.current) {
+      if (mountedRef.current && seq === projectListLoadSeqRef.current) {
         setProjectListError(err instanceof Error ? err.message : "無法載入專案清單。");
       }
     } finally {
-      if (mountedRef.current) {
+      if (mountedRef.current && seq === projectListLoadSeqRef.current) {
         setProjectListLoading(false);
       }
     }
@@ -6579,21 +6819,40 @@ export function BandMixer() {
     }
   };
 
-  const handleOpenProjectEntry = async (entry: ProjectListEntrySummary) => {
+  const handleOpenProjectEntry = async (
+    entry: ProjectListEntrySummary,
+    options?: { forceDiscardFailed?: boolean },
+  ) => {
     const gen = ++projectOpGenerationRef.current;
     setProjectDialogError(null);
     updateProjectBusyState({ action: "open", message: `正在載入專案「${entry.name}」Metadata…` });
     try {
-      await clearWorkspaceForProjectSwitch();
-      if (gen !== projectOpGenerationRef.current || !mountedRef.current) return;
+      if (!options?.forceDiscardFailed) {
+        const flush = await flushCurrentWorkspaceBeforeSwitch();
+        if (gen !== projectOpGenerationRef.current || !mountedRef.current) return;
+        if (!flush.ok) {
+          setProjectDialogError(flush.summary);
+          promptForceSwitchAfterSaveFailure(
+            `開啟專案「${entry.name}」`,
+            flush.failures,
+            () => handleOpenProjectEntry(entry, { forceDiscardFailed: true }),
+          );
+          return;
+        }
+      }
+
       const auth = getProjectAuthContext();
       const cloudHint = cloudProjectsMapRef.current.get(entry.projectId);
       const res = await openProjectMetadataAndEntries({
         projectId: entry.projectId,
         cloudEntryHint: cloudHint,
         auth,
-        setActive: true,
+        setActive: false,
       });
+      if (gen !== projectOpGenerationRef.current || !mountedRef.current) return;
+      await teardownActiveWorkspaceRuntime({ discardPendingLocal: true });
+      if (gen !== projectOpGenerationRef.current || !mountedRef.current) return;
+      await setActiveProjectId(res.record.projectId);
       if (gen !== projectOpGenerationRef.current || !mountedRef.current) return;
       applyProjectWorkspaceState(res.record, res.songs);
       setProjectDialogMode(null);
@@ -6614,11 +6873,14 @@ export function BandMixer() {
     }
   };
 
-  const handleCreateProjectSubmit = async (params: {
-    name: string;
-    description?: string;
-    storageProvider: ProjectStorageProvider;
-  }) => {
+  const handleCreateProjectSubmit = async (
+    params: {
+      name: string;
+      description?: string;
+      storageProvider: ProjectStorageProvider;
+    },
+    options?: { forceDiscardFailed?: boolean },
+  ) => {
     const gen = ++projectOpGenerationRef.current;
     setProjectDialogError(null);
     updateProjectBusyState({
@@ -6628,16 +6890,33 @@ export function BandMixer() {
         : `正在建立本機專案「${params.name}」…`,
     });
     try {
-      await clearWorkspaceForProjectSwitch();
+      if (!options?.forceDiscardFailed) {
+        const flush = await flushCurrentWorkspaceBeforeSwitch();
+        if (gen !== projectOpGenerationRef.current || !mountedRef.current) return;
+        if (!flush.ok) {
+          setProjectDialogError(flush.summary);
+          promptForceSwitchAfterSaveFailure(
+            `建立專案「${params.name}」`,
+            flush.failures,
+            () => handleCreateProjectSubmit(params, { forceDiscardFailed: true }),
+          );
+          return;
+        }
+      }
+
       const auth = getProjectAuthContext();
       const { record, syncOutcome } = await createNewProject({
         name: params.name,
         description: params.description,
         storageProvider: params.storageProvider,
         auth,
-        setActive: true,
+        setActive: false,
         syncImmediatelyIfDrive: params.storageProvider === "google_drive",
       });
+      if (gen !== projectOpGenerationRef.current || !mountedRef.current) return;
+      await teardownActiveWorkspaceRuntime({ discardPendingLocal: true });
+      if (gen !== projectOpGenerationRef.current || !mountedRef.current) return;
+      await setActiveProjectId(record.projectId);
       if (gen !== projectOpGenerationRef.current || !mountedRef.current) return;
       applyProjectWorkspaceState(record, []);
       setProjectDialogMode(null);
@@ -6721,7 +7000,7 @@ export function BandMixer() {
         setActive: false,
       });
       if (gen !== projectOpGenerationRef.current || !mountedRef.current) return;
-      await clearWorkspaceForProjectSwitch();
+      await teardownActiveWorkspaceRuntime({ discardPendingLocal: false });
       if (gen !== projectOpGenerationRef.current || !mountedRef.current) return;
       await setActiveProjectId(opened.record.projectId);
       applyProjectWorkspaceState(opened.record, opened.songs);
@@ -6946,26 +7225,59 @@ export function BandMixer() {
             showShortcutHint(`已同步「${outcome.record.project.name}」（v${outcome.record.localRevision}）至 Google Drive。`);
           }
         } else if (outcome.status === "remote_ahead") {
-          const loadRemote =
-            typeof window !== "undefined" &&
-            window.confirm("雲端有較新的版本，且本機沒有未同步修改。要載入雲端版本嗎？");
-          if (loadRemote) {
-            const loaded = await loadRemoteAheadProject({
-              projectId,
-              remoteProject: outcome.remoteProject,
-              expectedLocalRevisionToken: outcome.record.project.revisionToken,
-            });
-            await clearWorkspaceForProjectSwitch();
-            const nextAuth = getProjectAuthContext();
-            const nextSongs = await projectToBandSongsMetadataOnly(loaded.project, {
-              currentAccountId: nextAuth.accountId,
-              hasValidGoogleToken: Boolean(nextAuth.accountId && nextAuth.accessToken),
-            });
-            applyProjectWorkspaceState(loaded, nextSongs);
-            showShortcutHint(`已載入雲端版本（v${loaded.localRevision}）。`);
-          } else {
-            showShortcutHint("雲端有較新版本，尚未載入；本機資料未被覆蓋。");
-          }
+          const remoteProject = outcome.remoteProject;
+          const localRecordBeforeLoad = outcome.record;
+          const remoteUpdatedLabel = remoteProject.updatedAt
+            ? new Date(remoteProject.updatedAt).toLocaleString("zh-TW", {
+                month: "2-digit",
+                day: "2-digit",
+                hour: "2-digit",
+                minute: "2-digit",
+              })
+            : "未知時間";
+          openDeleteConfirmDialog(
+            {
+              title: "雲端有更新版本可用",
+              subtitle: localRecordBeforeLoad.project.name,
+              badgeLabel: "雲端新版",
+              changeHeading: "版本對比與即將套用的變更",
+              preserveHeading: "以下本機資料將完整保留",
+              deleteItems: [
+                `本機目前版本：v${localRecordBeforeLoad.localRevision}（${localRecordBeforeLoad.project.songs.length} 首歌曲，無未同步修改）`,
+                `雲端最新版本：v${remoteProject.revision}（${remoteProject.songs.length} 首歌曲 · 更新於 ${remoteUpdatedLabel}）`,
+                "載入後將把此專案清單與混音設定更新至雲端版本",
+              ],
+              preserveItems: [
+                "Google Drive 與本機 IndexedDB 的原始音檔及已完成分軌快取",
+                "點擊播放或切換來源時仍會保留本地已就緒的資源引用",
+              ],
+              recoverability: "切換前本機已與遠端基底同步，或可從 Google Drive revisions/ 目錄查閱歷史版本。",
+              confirmLabel: `載入雲端版本 (v${remoteProject.revision})`,
+              cancelLabel: "維持本機版本",
+              danger: false,
+              onCancelNotice: () => {
+                showShortcutHint("雲端有較新版本，尚未載入；本機資料未被覆蓋。");
+              },
+              onExecute: async () => {
+                const loaded = await loadRemoteAheadProject({
+                  projectId,
+                  remoteProject,
+                  expectedLocalRevisionToken: localRecordBeforeLoad.project.revisionToken,
+                });
+                const nextAuth = getProjectAuthContext();
+                const nextSongs = await projectToBandSongsMetadataOnly(loaded.project, {
+                  currentAccountId: nextAuth.accountId,
+                  hasValidGoogleToken: Boolean(nextAuth.accountId && nextAuth.accessToken),
+                });
+                await teardownActiveWorkspaceRuntime({ discardPendingLocal: true });
+                applyProjectWorkspaceState(loaded, nextSongs);
+                showShortcutHint(`已載入雲端版本（v${loaded.localRevision}）。`);
+                void refreshProjectListEntries();
+                return { status: "success" };
+              },
+            },
+            false,
+          );
         } else if (outcome.status === "conflict") {
           showShortcutHint("偵測到跨裝置版本衝突，請選擇衝突處理方式。");
           openProjectModal("conflict");
@@ -7063,6 +7375,35 @@ export function BandMixer() {
     }
   };
 
+  const refreshOfflineAssessment = async (
+    project: BandProject,
+    auth: ProjectAuthContext,
+  ) => {
+    if (!auth.accountId || !auth.accessToken) return;
+    const seq = ++offlineAssessmentSeqRef.current;
+    setOfflineAssessmentLoading(true);
+    try {
+      const cap = await collectDeviceCapabilities();
+      const assessment = await assessProjectOfflineDownload({
+        project,
+        accountId: auth.accountId,
+        accessToken: auth.accessToken,
+        capabilities: cap,
+      });
+      if (mountedRef.current && seq === offlineAssessmentSeqRef.current) {
+        setOfflineAssessment(assessment);
+      }
+    } catch (err) {
+      if (mountedRef.current && seq === offlineAssessmentSeqRef.current) {
+        setProjectDialogError(err instanceof Error ? err.message : "無法評估離線下載容量。");
+      }
+    } finally {
+      if (mountedRef.current && seq === offlineAssessmentSeqRef.current) {
+        setOfflineAssessmentLoading(false);
+      }
+    }
+  };
+
   const handleOpenOfflineDialog = async () => {
     const active = activeProjectRecordRef.current;
     if (!active) return;
@@ -7075,27 +7416,7 @@ export function BandMixer() {
       setProjectDialogError("下載專案供離線使用需要先登入 Google 帳號。");
       return;
     }
-    setOfflineAssessmentLoading(true);
-    try {
-      const cap = await collectDeviceCapabilities();
-      const assessment = await assessProjectOfflineDownload({
-        project: active.project,
-        accountId: auth.accountId,
-        accessToken: auth.accessToken,
-        capabilities: cap,
-      });
-      if (mountedRef.current) {
-        setOfflineAssessment(assessment);
-      }
-    } catch (err) {
-      if (mountedRef.current) {
-        setProjectDialogError(err instanceof Error ? err.message : "無法評估離線下載容量。");
-      }
-    } finally {
-      if (mountedRef.current) {
-        setOfflineAssessmentLoading(false);
-      }
-    }
+    await refreshOfflineAssessment(active.project, auth);
   };
 
   const handleStartOfflineDownload = async () => {
@@ -7147,6 +7468,7 @@ export function BandMixer() {
         });
         sessionRef.current = { ...sessionRef.current, songs: merged };
         setSession((prev) => ({ ...prev, songs: merged }));
+        await refreshOfflineAssessment(active.project, auth);
       }
       void refreshCacheStats();
     } catch (err) {
@@ -7160,9 +7482,9 @@ export function BandMixer() {
   const executeConflictResolution = async (params: {
     strategy: "load_remote" | "save_local_as_new" | "overwrite_remote";
     newProjectNameForSaveAs?: string;
-  }) => {
+  }): Promise<{ ok: true } | { ok: false; errorMessage: string }> => {
     const active = activeProjectRecordRef.current;
-    if (!active) return;
+    if (!active) return { ok: false, errorMessage: "目前沒有作用中的專案。" };
     const gen = ++projectOpGenerationRef.current;
     setProjectDialogError(null);
     updateProjectBusyState({ action: "conflict", message: "正在套用版本衝突處理…" });
@@ -7174,8 +7496,10 @@ export function BandMixer() {
         newProjectNameForSaveAs: params.newProjectNameForSaveAs,
         auth,
       });
-      if (gen !== projectOpGenerationRef.current || !mountedRef.current) return;
-      await clearWorkspaceForProjectSwitch();
+      if (gen !== projectOpGenerationRef.current || !mountedRef.current) {
+        return { ok: false, errorMessage: "操作已被新的切換取代，已中止。" };
+      }
+      await teardownActiveWorkspaceRuntime({ discardPendingLocal: true });
       const nextSongs = await projectToBandSongsMetadataOnly(res.activeRecord.project, {
         currentAccountId: auth.accountId,
         hasValidGoogleToken: Boolean(auth.accountId && auth.accessToken),
@@ -7185,8 +7509,11 @@ export function BandMixer() {
       setProjectDialogMode(null);
       showShortcutHint(`已完成版本衝突處理，目前專案為「${res.activeRecord.project.name}」。`);
       void refreshProjectListEntries();
+      return { ok: true };
     } catch (err) {
-      setProjectDialogError(err instanceof Error ? err.message : "處理版本衝突失敗。");
+      const msg = err instanceof Error ? err.message : "處理版本衝突失敗。";
+      setProjectDialogError(msg);
+      return { ok: false, errorMessage: msg };
     } finally {
       if (gen === projectOpGenerationRef.current && mountedRef.current) {
         updateProjectBusyState(null);
@@ -7214,8 +7541,8 @@ export function BandMixer() {
         confirmLabel: "確認覆寫雲端專案",
         danger: true,
         onExecute: async () => {
-          await executeConflictResolution({ strategy: "overwrite_remote" });
-          return { status: "success" };
+          const res = await executeConflictResolution({ strategy: "overwrite_remote" });
+          return res.ok ? { status: "success" } : { status: "error", message: res.errorMessage };
         },
       });
       return;
@@ -7237,7 +7564,7 @@ export function BandMixer() {
         currentAccountId: auth.accountId,
         hasValidGoogleToken: Boolean(auth.accountId && auth.accessToken),
       });
-      await clearWorkspaceForProjectSwitch();
+      await teardownActiveWorkspaceRuntime({ discardPendingLocal: false });
       applyProjectWorkspaceState(res.record, nextSongs);
       setProjectDialogMode(null);
       showShortcutHint(
@@ -7295,7 +7622,7 @@ export function BandMixer() {
             autoSyncController: autoSyncControllerRef.current ?? undefined,
           });
           if (activeProjectIdRef.current === resolvedTarget.projectId) {
-            await clearWorkspaceForProjectSwitch();
+            await teardownActiveWorkspaceRuntime({ discardPendingLocal: true });
             activeProjectRecordRef.current = null;
             activeProjectIdRef.current = null;
             setActiveProjectRecord(null);
@@ -7312,8 +7639,20 @@ export function BandMixer() {
     );
   };
 
-  const exitProjectToLegacyWorkspace = async () => {
-    await clearWorkspaceForProjectSwitch();
+  const exitProjectToLegacyWorkspace = async (options?: { forceDiscardFailed?: boolean }) => {
+    if (!options?.forceDiscardFailed) {
+      const flush = await flushCurrentWorkspaceBeforeSwitch();
+      if (!flush.ok) {
+        setProjectDialogError(flush.summary);
+        promptForceSwitchAfterSaveFailure(
+          "返回預設工作空間",
+          flush.failures,
+          () => exitProjectToLegacyWorkspace({ forceDiscardFailed: true }),
+        );
+        return;
+      }
+    }
+    await teardownActiveWorkspaceRuntime({ discardPendingLocal: true });
     await setActiveProjectId(null);
     activeProjectRecordRef.current = null;
     activeProjectIdRef.current = null;
@@ -7325,7 +7664,7 @@ export function BandMixer() {
   };
 
   const selectedSongs = session.songs.filter((song) => song.selected);
-  const hasMultipleSelectedSongs = selectedSongs.length > 1;
+  const hasSelectedSongs = selectedSongs.length > 0;
   const focusLocked = Boolean(separationFocus?.active) || sharedSeparationJobManager.isGlobalFocusActive();
   const focusAbortSong = separationFocus
     ? session.songs.find((song) => song.id === separationFocus.songId) ?? null
@@ -7335,14 +7674,31 @@ export function BandMixer() {
       showShortcutHint("分離專注模式啟動中，已鎖定批次播放。");
       return;
     }
-    for (const target of selectedSongs) {
-      if (isFocusLocked()) break;
-      await playSong(target);
+    const results: BatchPlayAttemptResult[] = [];
+    for (let i = 0; i < selectedSongs.length; i += 1) {
+      const target = selectedSongs[i];
+      if (isFocusLocked()) {
+        for (let j = i; j < selectedSongs.length; j += 1) {
+          results.push({
+            songName: selectedSongs[j].name,
+            started: false,
+            reason: "分離專注模式啟動中",
+          });
+        }
+        break;
+      }
+      const res = await playSong(target);
+      results.push({
+        songName: target.name,
+        started: res.started,
+        reason: res.reason,
+      });
     }
+    showShortcutHint(formatBatchPlaySummary(results));
   };
 
   return (
-    <div className={`grid mixer-shell${hasMultipleSelectedSongs ? " has-selected" : ""}`} style={{ gap: 16 }}>
+    <div className={`grid mixer-shell${hasSelectedSongs ? " has-selected" : ""}`} style={{ gap: 16 }}>
       <ProjectToolbar
         activeProject={activeProjectRecord}
         songCount={session.songs.length}
@@ -7801,7 +8157,7 @@ export function BandMixer() {
       )}
 
       {session.songs.length > 0 && (
-        <div className={`card row mixer-bulk-controls${hasMultipleSelectedSongs ? " is-selected" : ""}`} style={{ gap: 8, flexWrap: "wrap", alignItems: "center", paddingBlock: 10 }}>
+        <div className={`card row mixer-bulk-controls${hasSelectedSongs ? " is-selected" : ""}`} style={{ gap: 8, flexWrap: "wrap", alignItems: "center", paddingBlock: 10 }}>
           <strong style={{ fontSize: 13 }}>批次播放</strong>
           <span className="small selected-song-count" style={{ opacity: selectedSongs.length ? 0.9 : 0.65 }}>已選 {selectedSongs.length} 首</span>
           <IconActionButton
@@ -7847,6 +8203,52 @@ export function BandMixer() {
             className="is-compact"
             onClick={() => selectedSongs.forEach(stopSong)}
           />
+          <button
+            type="button"
+            className="btn mixer-button mixer-bulk-select-all-btn"
+            disabled={
+              session.songs.length === 0 ||
+              selectedSongs.length === session.songs.length ||
+              focusLocked
+            }
+            title={
+              focusLocked
+                ? "分離專注模式啟動中"
+                : selectedSongs.length === session.songs.length
+                  ? "已全選所有歌曲"
+                  : "全選目前清單所有歌曲"
+            }
+            style={{ minHeight: 40, padding: "6px 10px", fontSize: 12 }}
+            onClick={() => {
+              setSession((prev) => ({
+                ...prev,
+                songs: prev.songs.map((s) => (s.selected ? s : { ...s, selected: true })),
+              }));
+            }}
+          >
+            全選
+          </button>
+          <button
+            type="button"
+            className="btn mixer-button mixer-bulk-clear-btn"
+            disabled={selectedSongs.length === 0 || focusLocked}
+            title={
+              focusLocked
+                ? "分離專注模式啟動中"
+                : selectedSongs.length === 0
+                  ? "目前尚未勾選任何歌曲"
+                  : "清除全部勾選狀態"
+            }
+            style={{ minHeight: 40, padding: "6px 10px", fontSize: 12 }}
+            onClick={() => {
+              setSession((prev) => ({
+                ...prev,
+                songs: prev.songs.map((s) => (s.selected ? { ...s, selected: false } : s)),
+              }));
+            }}
+          >
+            清除選取
+          </button>
         </div>
       )}
 
@@ -8096,6 +8498,9 @@ export function BandMixer() {
           open
           title={deleteDialog.title}
           subtitle={deleteDialog.subtitle}
+          badgeLabel={deleteDialog.badgeLabel}
+          changeHeading={deleteDialog.changeHeading}
+          preserveHeading={deleteDialog.preserveHeading}
           deleteItems={deleteDialog.deleteItems}
           preserveItems={deleteDialog.preserveItems}
           recoverability={deleteDialog.recoverability}
@@ -8112,6 +8517,7 @@ export function BandMixer() {
               : undefined
           }
           confirmLabel={deleteDialog.confirmLabel}
+          cancelLabel={deleteDialog.cancelLabel}
           danger={deleteDialog.danger}
           submitting={deleteSubmitting}
           onConfirm={async () => {
@@ -8143,9 +8549,11 @@ export function BandMixer() {
           }}
           onCancel={() => {
             if (deleteSubmitting) return;
+            const activeDialog = deleteDialog;
             setDeleteDialog(null);
             setDeleteDialogCheckbox(false);
             setDeleteError("");
+            activeDialog?.onCancelNotice?.();
           }}
         />
       )}

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { GoogleAccount } from "@/lib/google/googleAuthTypes";
 import { computeEntryBackupStatus } from "@/lib/projects/projectModel";
 import { resolveProjectManagerActionGroups } from "@/lib/projects/projectToolbarModel";
@@ -133,6 +133,37 @@ export function ProjectManagerDialog(props: Props) {
 
   const [backupOriginals, setBackupOriginals] = useState(true);
   const [conflictSaveAsName, setConflictSaveAsName] = useState("");
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  const nameInputRef = useRef<HTMLInputElement | null>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    previousFocusRef.current =
+      typeof document !== "undefined" && document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    return () => {
+      const prev = previousFocusRef.current;
+      previousFocusRef.current = null;
+      if (prev && prev.isConnected) {
+        prev.focus();
+      }
+    };
+  }, [open]);
+
+  useEffect(() => {
+    if (!open || !mode) return;
+    const targetIsNameInput = mode === "create" || mode === "save_as" || mode === "rename";
+    const rafId = window.requestAnimationFrame(() => {
+      if (targetIsNameInput && nameInputRef.current && !nameInputRef.current.disabled) {
+        nameInputRef.current.focus();
+      } else {
+        panelRef.current?.focus();
+      }
+    });
+    return () => window.cancelAnimationFrame(rafId);
+  }, [open, mode]);
 
   useEffect(() => {
     if (!open) return;
@@ -225,9 +256,14 @@ export function ProjectManagerDialog(props: Props) {
         }
       }}
     >
-      <div className="card mixer-modal-panel" style={{ width: "min(700px, 100%)" }}>
-        <div className="row" style={{ justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
-          <div className="grid" style={{ gap: 4 }}>
+      <div
+        ref={panelRef}
+        tabIndex={-1}
+        className="card mixer-modal-panel is-structured"
+        style={{ width: "min(700px, 100%)" }}
+      >
+        <div className="row mixer-modal-header" style={{ justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+          <div className="grid" style={{ gap: 4, minWidth: 0, flex: 1 }}>
             <strong id="project-manager-dialog-title" style={{ fontSize: 16 }}>
               {titleByMode[mode]}
             </strong>
@@ -244,6 +280,7 @@ export function ProjectManagerDialog(props: Props) {
           )}
         </div>
 
+        <div className="mixer-modal-body">
         {busyMessage && (
           <div role="status" aria-live="polite" className="row mixer-modal-section" style={{ gap: 8, alignItems: "center" }}>
             <span className="mixer-spinner" aria-hidden="true" />
@@ -329,20 +366,69 @@ export function ProjectManagerDialog(props: Props) {
             )}
 
             {filteredProjects.length === 0 ? (
-              <div className="mixer-modal-section" style={{ textAlign: "center", padding: "24px 12px" }}>
-                <p className="small" style={{ margin: 0, opacity: 0.75 }}>
-                  {props.projectsLoading ? "正在讀取專案清單（僅讀取 Metadata）…" : "找不到符合條件的專案"}
-                </p>
+              <div className="mixer-modal-section grid" style={{ textAlign: "center", padding: "24px 12px", gap: 10, justifyItems: "center" }}>
+                {props.projectsLoading ? (
+                  <div className="row" style={{ gap: 8, justifyContent: "center" }}>
+                    <span className="mixer-spinner" aria-hidden="true" />
+                    <p className="small" style={{ margin: 0, opacity: 0.78 }}>
+                      正在讀取專案清單（僅讀取 Metadata）…
+                    </p>
+                  </div>
+                ) : props.projects.length === 0 && Boolean(props.cloudError) ? (
+                  <>
+                    <p className="small" style={{ margin: 0, color: "#fde68a" }}>
+                      雲端專案清單讀取失敗，且目前沒有本機專案。
+                    </p>
+                    <button
+                      type="button"
+                      className="btn mixer-button"
+                      disabled={isBusy}
+                      onClick={props.onRefreshProjects}
+                    >
+                      ↻ 重試讀取
+                    </button>
+                  </>
+                ) : props.projects.length > 0 ? (
+                  <>
+                    <p className="small" style={{ margin: 0, opacity: 0.78 }}>
+                      目前篩選條件下沒有符合的專案（共 {props.projects.length} 個專案）
+                    </p>
+                    <button
+                      type="button"
+                      className="btn mixer-button"
+                      onClick={() => {
+                        setSearchText("");
+                        setProviderFilter("all");
+                      }}
+                    >
+                      清除篩選條件
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <p className="small" style={{ margin: 0, opacity: 0.78 }}>
+                      尚未建立任何專案
+                    </p>
+                    <button
+                      type="button"
+                      className="btn mixer-button primary"
+                      disabled={isBusy}
+                      onClick={() => props.onChangeMode("create")}
+                    >
+                      ＋ 建立第一個專案
+                    </button>
+                  </>
+                )}
               </div>
             ) : (
-              <div className="grid" style={{ gap: 8, maxHeight: "48dvh", overflowY: "auto" }}>
+              <div className="grid" style={{ gap: 8 }}>
                 {filteredProjects.map((entry) => {
                   const isCurrent = activeProject?.projectId === entry.projectId;
                   return (
                     <div key={entry.projectId} className={`project-list-item${isCurrent ? " is-current" : ""}`}>
                       <div className="grid" style={{ gap: 4, flex: "1 1 240px", minWidth: 0 }}>
                         <div className="row" style={{ gap: 6, flexWrap: "wrap", alignItems: "center" }}>
-                          <strong style={{ fontSize: 14 }}>{entry.name}</strong>
+                          <strong style={{ fontSize: 14, overflowWrap: "anywhere", minWidth: 0 }}>{entry.name}</strong>
                           {isCurrent && <span className="song-focus-pill">目前開啟</span>}
                           <span className={`project-provider-badge ${entry.storageProvider === "google_drive" ? "is-drive" : "is-local"}`}>
                             {entry.storageProvider === "google_drive" ? "Google Drive" : "本機"}
@@ -518,6 +604,7 @@ export function ProjectManagerDialog(props: Props) {
             <label className="grid" style={{ gap: 4 }}>
               <span className="small" style={{ fontWeight: 600 }}>專案名稱 *</span>
               <input
+                ref={nameInputRef}
                 type="text"
                 required
                 maxLength={80}
@@ -622,6 +709,7 @@ export function ProjectManagerDialog(props: Props) {
             <label className="grid" style={{ gap: 4 }}>
               <span className="small" style={{ fontWeight: 600 }}>新專案名稱 *</span>
               <input
+                ref={nameInputRef}
                 type="text"
                 required
                 maxLength={80}
@@ -667,7 +755,7 @@ export function ProjectManagerDialog(props: Props) {
               <span className="small" style={{ opacity: 0.8 }}>
                 僅有同時具備 Drive 原曲（或原曲備份）且已上傳指定分軌（或未分離）的歌曲，才會標記為「可跨裝置恢復」。
               </span>
-              <div className="grid" style={{ gap: 6, maxHeight: 200, overflowY: "auto" }}>
+              <div className="grid" style={{ gap: 6 }}>
                 {activeProject.project.songs.length === 0 ? (
                   <span className="small" style={{ opacity: 0.7 }}>此專案目前沒有歌曲，將只上傳專案結構至 Google Drive。</span>
                 ) : (
@@ -763,7 +851,7 @@ export function ProjectManagerDialog(props: Props) {
                   <div key={idx} className="card-warning-banner">{w}</div>
                 ))}
                 {props.offlineAssessment.perSongDetails.length > 0 && (
-                  <div className="grid" style={{ gap: 4, maxHeight: 160, overflowY: "auto" }}>
+                  <div className="grid" style={{ gap: 4 }}>
                     {props.offlineAssessment.perSongDetails.map((d) => (
                       <div key={d.entryId} className="row" style={{ justifyContent: "space-between", gap: 8 }}>
                         <span className="small">{d.displayName}</span>
@@ -830,7 +918,11 @@ export function ProjectManagerDialog(props: Props) {
                 }
                 onClick={() => void props.onStartOfflineDownload()}
               >
-                {props.offlineDownloadProgress ? "逐首下載中…" : "確認逐首下載並保存至本機"}
+                {props.offlineDownloadProgress
+                  ? "逐首下載中…"
+                  : props.offlineAssessment && !props.offlineAssessmentLoading && props.offlineAssessment.songsToDownloadCount === 0
+                    ? "所有可用歌曲均已本機就緒"
+                    : "確認逐首下載並保存至本機"}
               </button>
             </div>
           </div>
@@ -918,6 +1010,7 @@ export function ProjectManagerDialog(props: Props) {
             </div>
           </div>
         )}
+        </div>
       </div>
     </div>
   );

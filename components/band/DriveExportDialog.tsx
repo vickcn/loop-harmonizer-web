@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { BandSong } from "@/lib/band/bandTypes";
 import type { GoogleAccount } from "@/lib/google/googleAuthTypes";
 import type { WavExportFormat } from "@/lib/audio/chunkedWavExporter";
@@ -65,6 +65,31 @@ export function DriveExportDialog({
   >([...allRoles]);
   const [includeSessionJson, setIncludeSessionJson] = useState(true);
   const [includeCustomMix, setIncludeCustomMix] = useState(false);
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    previousFocusRef.current =
+      typeof document !== "undefined" && document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    panelRef.current?.focus();
+    const rafId = window.requestAnimationFrame(() => {
+      const panel = panelRef.current;
+      if (panel && !panel.contains(document.activeElement)) {
+        panel.focus();
+      }
+    });
+    return () => {
+      window.cancelAnimationFrame(rafId);
+      const prev = previousFocusRef.current;
+      previousFocusRef.current = null;
+      if (prev && prev.isConnected) {
+        prev.focus();
+      }
+    };
+  }, [open]);
 
   useEffect(() => {
     setSelectedRoles([...requiredStemRolesForMode(song?.separationMode ?? "four_stem")]);
@@ -127,7 +152,7 @@ export function DriveExportDialog({
         }
       }}
     >
-      <div className="card mixer-modal-panel">
+      <div ref={panelRef} tabIndex={-1} className="card mixer-modal-panel">
         <div className="row" style={{ justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
           <div className="grid" style={{ gap: 4 }}>
             <strong id="drive-export-dialog-title" style={{ fontSize: 16 }}>

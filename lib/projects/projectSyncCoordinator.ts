@@ -1,6 +1,6 @@
 import {
-  getProjectRecord,
-  isProjectDeleted,
+  getProjectRecordStrict,
+  isProjectDeletedStrict,
 } from "../storage/projectStore.ts";
 import { ProjectAutoSyncController, type ProjectDriveSyncOutcome } from "./projectDriveSync.ts";
 import {
@@ -9,6 +9,9 @@ import {
   type ProjectToolbarBusyAction,
 } from "./projectToolbarModel.ts";
 import type { PersistedProjectRecord } from "./projectTypes.ts";
+
+export const PROJECT_STATE_UNAVAILABLE_MESSAGE =
+  "無法確認專案最新狀態，已安全停止同步，請稍後重試。";
 
 export interface CoordinatorAuthSnapshot {
   accountId: string | null;
@@ -27,8 +30,8 @@ export interface ProjectManualSyncCoordinatorDeps {
   signInGoogle: () => Promise<CoordinatorAuthSnapshot>;
   reauthorizeGoogle: () => Promise<CoordinatorAuthSnapshot>;
   captureLatestSnapshot: (projectId: string) => void;
-  getProjectRecordFn?: typeof getProjectRecord;
-  isProjectDeletedFn?: typeof isProjectDeleted;
+  getProjectRecordFn?: typeof getProjectRecordStrict;
+  isProjectDeletedFn?: typeof isProjectDeletedStrict;
   onBusyChange?: (busy: { action: ProjectToolbarBusyAction; message: string } | null) => void;
   onLocalSaveStateChange?: (projectId: string, state: LocalSaveState) => void;
   onFreshRecordLoaded?: (record: PersistedProjectRecord) => void;
@@ -53,6 +56,7 @@ export type ManualSyncFlowResult =
         | "stale_operation"
         | "project_switched"
         | "project_deleted"
+        | "project_state_unavailable"
         | "provider_changed"
         | "auth_changed"
         | "external_busy";
@@ -65,6 +69,77 @@ export type ManualSyncFlowResult =
       outcome: ProjectDriveSyncOutcome | null;
       localSaveFailed: boolean;
     };
+
+type PostAuthProjectStateCheck =
+  | {
+      status: "ok";
+      record: PersistedProjectRecord;
+    }
+  | {
+      status: "deleted";
+      cause: "tombstone" | "missing_record";
+    }
+  | {
+      status: "unavailable";
+      failedChecks: Array<"getProjectRecord" | "isProjectDeleted">;
+      errorMessage: string;
+    };
+
+async function loadPostAuthProjectState(
+  projectId: string,
+  getRecordFn: (projectId: string) => Promise<PersistedProjectRecord | null>,
+  isDeletedFn: (projectId: string) => Promise<boolean>,
+): Promise<PostAuthProjectStateCheck> {
+  const [recordResult, deletedResult] = await Promise.allSettled([
+    Promise.resolve().then(() => getRecordFn(projectId)),
+    Promise.resolve().then(() => isDeletedFn(projectId)),
+  ]);
+
+  const failedChecks: Array<"getProjectRecord" | "isProjectDeleted"> = [];
+  const errorMessages: string[] = [];
+
+  if (recordResult.status === "rejected") {
+    failedChecks.push("getProjectRecord");
+    errorMessages.push(
+      recordResult.reason instanceof Error
+        ? recordResult.reason.message
+        : String(recordResult.reason ?? "讀取專案紀錄失敗"),
+    );
+  }
+
+  if (deletedResult.status === "rejected") {
+    failedChecks.push("isProjectDeleted");
+    errorMessages.push(
+      deletedResult.reason instanceof Error
+        ? deletedResult.reason.message
+        : String(deletedResult.reason ?? "查詢專案刪除狀態失敗"),
+    );
+  } else if (typeof deletedResult.value !== "boolean") {
+    failedChecks.push("isProjectDeleted");
+    errorMessages.push("專案刪除狀態回傳格式無效");
+  }
+
+  if (failedChecks.length > 0) {
+    return {
+      status: "unavailable",
+      failedChecks,
+      errorMessage: errorMessages.join("; "),
+    };
+  }
+
+  // 唯有 isDeletedFn 成功且明確回傳 false，才可認定專案未被刪除
+  const deleted = (deletedResult as PromiseFulfilledResult<boolean>).value;
+  if (deleted === true) {
+    return { status: "deleted", cause: "tombstone" };
+  }
+
+  const freshRecord = (recordResult as PromiseFulfilledResult<PersistedProjectRecord | null>).value;
+  if (!freshRecord) {
+    return { status: "deleted", cause: "missing_record" };
+  }
+
+  return { status: "ok", record: freshRecord };
+}
 
 /**
  * 手動 Google Drive 同步編排器（Auth-First + Single-Flight + Cross-Account / Switch Guards）：
@@ -191,8 +266,8 @@ export class ProjectManualSyncCoordinator {
       this.activeOperation.opId === opId &&
       this.activeOperation.projectId === targetProjectId;
 
-    const getRecordFn = this.deps.getProjectRecordFn ?? getProjectRecord;
-    const isDeletedFn = this.deps.isProjectDeletedFn ?? isProjectDeleted;
+    const getRecordFn = this.deps.getProjectRecordFn ?? getProjectRecordStrict;
+    const isDeletedFn = this.deps.isProjectDeletedFn ?? isProjectDeletedStrict;
 
     try {
       // 1. 需要登入或 Token 失效時，先在同步前完成 Google 授權，絕不先進入 syncProjectManually()
@@ -266,10 +341,11 @@ export class ProjectManualSyncCoordinator {
           };
         }
 
-        const [freshRecord, deleted] = await Promise.all([
-          getRecordFn(targetProjectId).catch(() => null),
-          isDeletedFn(targetProjectId).catch(() => false),
-        ]);
+        const stateCheck = await loadPostAuthProjectState(
+          targetProjectId,
+          getRecordFn,
+          isDeletedFn,
+        );
 
         if (!isOpStillCurrent()) {
           return {
@@ -288,13 +364,46 @@ export class ProjectManualSyncCoordinator {
           };
         }
 
-        if (deleted || !freshRecord) {
+        const busyAfterLoad = this.deps.getExternalBusyAction();
+        if (busyAfterLoad && busyAfterLoad !== "sync") {
+          return {
+            kind: "aborted",
+            reason: "external_busy",
+            message: "目前有其他專案操作進行中，已中止同步。",
+          };
+        }
+
+        const liveAuthAfterLoad = this.deps.getAuthSnapshot();
+        if (
+          !liveAuthAfterLoad.accountId ||
+          !liveAuthAfterLoad.accessToken ||
+          liveAuthAfterLoad.accountId !== afterAuth.accountId ||
+          liveAuthAfterLoad.generation !== afterAuth.generation
+        ) {
+          return {
+            kind: "aborted",
+            reason: "auth_changed",
+            message: "Google 帳號狀態已於授權期間變更，已中止本次同步。",
+          };
+        }
+
+        if (stateCheck.status === "unavailable") {
+          return {
+            kind: "aborted",
+            reason: "project_state_unavailable",
+            message: PROJECT_STATE_UNAVAILABLE_MESSAGE,
+          };
+        }
+
+        if (stateCheck.status === "deleted") {
           return {
             kind: "aborted",
             reason: "project_deleted",
             message: "專案已刪除或不存在，已取消同步。",
           };
         }
+
+        const freshRecord = stateCheck.record;
 
         if (freshRecord.storageProvider !== "google_drive") {
           return {
@@ -306,11 +415,11 @@ export class ProjectManualSyncCoordinator {
 
         const recordOwner =
           freshRecord.ownerAccountId || freshRecord.project.ownerAccountId || expectedOwner;
-        if (recordOwner && liveAuth.accountId !== recordOwner) {
+        if (recordOwner && liveAuthAfterLoad.accountId !== recordOwner) {
           return {
             kind: "account_mismatch",
             expectedAccountId: recordOwner,
-            actualAccountId: liveAuth.accountId,
+            actualAccountId: liveAuthAfterLoad.accountId,
             message: "登入的 Google 帳號與此專案擁有者不符，已阻止跨帳號上傳。",
           };
         }

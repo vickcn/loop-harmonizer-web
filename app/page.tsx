@@ -30,18 +30,15 @@ export default function IndexPage() {
       <div className="col-full" style={{ display: "flex", flexWrap: "wrap", gap: 20, justifyContent: "center" }}>
         {TOOLS.map((tool) => (
           tool.ready ? (
-            <Link key={tool.href} href={tool.href} style={{ textDecoration: "none" }}>
-              <div className="card" style={{ width: 260, cursor: "pointer", transition: "border-color .15s" }}
-                onMouseEnter={(e) => (e.currentTarget.style.borderColor = "var(--accent)")}
-                onMouseLeave={(e) => (e.currentTarget.style.borderColor = "")}
-              >
+            <Link key={tool.href} href={tool.href} className="home-tool-link">
+              <div className="card home-tool-card">
                 <div style={{ fontSize: 40, marginBottom: 12 }}>{tool.icon}</div>
                 <h2 style={{ margin: "0 0 8px", fontSize: "1.1rem" }}>{tool.title}</h2>
                 <p className="small" style={{ margin: 0 }}>{tool.desc}</p>
               </div>
             </Link>
           ) : (
-            <div key={tool.href} className="card" style={{ width: 260, opacity: 0.45 }}>
+            <div key={tool.href} className="card home-tool-card" style={{ opacity: 0.45, cursor: "default" }}>
               <div style={{ fontSize: 40, marginBottom: 12 }}>{tool.icon}</div>
               <h2 style={{ margin: "0 0 8px", fontSize: "1.1rem" }}>{tool.title}</h2>
               <p className="small" style={{ margin: 0 }}>{tool.desc}</p>

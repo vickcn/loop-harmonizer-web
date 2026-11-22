@@ -2,14 +2,16 @@
 
 import { memo, useEffect, useRef, useState, type CSSProperties } from "react";
 import type { BandSong, StemChannel } from "@/lib/band/bandTypes";
-import type { ProjectSongAvailabilityState, ProjectSongBackupStatus } from "@/lib/projects/projectTypes";
 import type { StemSeparationMode } from "@/lib/separation/stemTypes";
 import type { DriveExportProgress } from "@/lib/google/driveExportManager";
 import { getEffectivePlaybackRate } from "@/lib/band/songModel";
+import { buildSongStatusIndicators } from "@/lib/band/songStatusIndicators";
 import { TrackPlayhead } from "./TrackPlayhead";
 import { StemMixer } from "./StemMixer";
 import { IconActionButton } from "./IconActionButton";
 import { AdaptiveActionRow, type AdaptiveActionItem } from "./AdaptiveActionRow";
+import { SongStatusIndicators } from "./SongStatusIndicators";
+import { TouchGuardedRangeSlider } from "./TouchGuardedRangeSlider";
 
 type Props = {
   song: BandSong;
@@ -194,31 +196,6 @@ function DriveCloudUploadIcon() {
 
 const STATUS_COLOR = { stopped: "var(--muted)", playing: "#22c55e", paused: "#f59e0b" };
 const STATUS_LABEL = { stopped: "停止", playing: "播放中", paused: "暫停" };
-const PERSISTENCE_BADGE = {
-  saving: { label: "儲存中…", tone: "is-saving" },
-  saved: { label: "已保存在此裝置", tone: "is-saved" },
-  error: { label: "儲存失敗", tone: "is-error" },
-  restoring: { label: "正在恢復歌曲…", tone: "is-saving" },
-  missing_audio: { label: "需重新匯入音檔", tone: "is-warn" },
-  conflict: { label: "分頁設定衝突", tone: "is-warn" },
-  unsaved: { label: "僅此工作階段", tone: "is-warn" },
-} as const;
-const PROJECT_AVAILABILITY_BADGE: Record<ProjectSongAvailabilityState, { label: string; tone: string }> = {
-  local_playable: { label: "本機可播放", tone: "is-saved" },
-  cloud_not_downloaded: { label: "已備份但尚未下載", tone: "is-drive" },
-  downloading: { label: "下載中", tone: "is-saving" },
-  stems_loaded: { label: "已載入分軌", tone: "is-drive-stem" },
-  needs_reauth: { label: "需要重新授權", tone: "is-warn" },
-  original_missing: { label: "來源音訊遺失", tone: "is-error" },
-  stems_missing: { label: "分軌成果缺失", tone: "is-error" },
-};
-const PROJECT_BACKUP_BADGE: Record<ProjectSongBackupStatus, { label: string; tone: string }> = {
-  local_only: { label: "僅本機可用", tone: "is-warn" },
-  original_backed_up: { label: "原曲已備份", tone: "is-drive" },
-  stems_backed_up: { label: "分軌已備份", tone: "is-drive-stem" },
-  cross_device_ready: { label: "可跨裝置恢復", tone: "is-saved" },
-  pending_sync: { label: "尚待同步", tone: "is-saving" },
-};
 const MANUAL_RATE_MIN = 0.25;
 const MANUAL_RATE_MAX = 4;
 const MANUAL_RATE_STEP = 0.05;
@@ -299,8 +276,7 @@ export const SongCard = memo(function SongCard(props: Props) {
     || (Boolean(song.sourceAudioMissing) && song.playbackSource !== "stems" && !canOnDemandRestore);
   const playBlockedForAudio = audioUnavailable && !canOnDemandRestore;
   const playBusy = Boolean(props.isStartingPlayback) || isDownloadingOnDemand;
-  const availabilityInfo = song.availabilityState ? PROJECT_AVAILABILITY_BADGE[song.availabilityState] : null;
-  const backupInfo = song.backupStatus ? PROJECT_BACKUP_BADGE[song.backupStatus] : null;
+  const statusItems = buildSongStatusIndicators(song, { isActive: props.isActive });
   const separateActionLabel =
     song.separationStatus === "cancelling"
       ? "正在停…"
@@ -311,15 +287,12 @@ export const SongCard = memo(function SongCard(props: Props) {
           : song.separationStatus === "failed"
             ? "重試分離音軌"
             : "分離音軌";
-  const persistenceInfo = song.persistenceStatus ? PERSISTENCE_BADGE[song.persistenceStatus] : null;
   const rate = getEffectivePlaybackRate(song);
   const coarseRate = song.tempoMode === "target-bpm"
     ? song.targetBpm / Math.max(1, song.originalBpm)
     : song.manualRate;
   const masterVolumePct = Math.round(song.masterVolume * 100);
   const manualRatePosition = rateToSliderPosition(song.manualRate);
-  const manualRatePct = manualRatePosition * 100;
-  const fineOffsetPct = ((song.fineRateOffset + 0.05) / 0.1) * 100;
   const isDefaultKey = song.keyShiftSemitones === 0;
   const isDefaultSpeed = Math.abs(rate - 1) < 0.0005 && song.fineRateOffset === 0 && song.targetBpm === song.originalBpm && song.manualRate === 1;
   const isDefaultMix = isDefaultKey && isDefaultSpeed;
@@ -363,79 +336,25 @@ export const SongCard = memo(function SongCard(props: Props) {
 
       <div className="song-card-body grid" style={{ gap: 14 }}>
         <div className="row" style={{ justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
-        <div className="row" style={{ gap: 10 }}>
+        <div className="row" style={{ gap: 10, flex: "1 1 180px", minWidth: 0 }}>
           <input
             className="song-select"
             type="checkbox"
             aria-label={`選取 ${song.name}`}
             checked={song.selected}
+            onPointerDown={(event) => event.stopPropagation()}
+            onFocus={(event) => event.stopPropagation()}
+            onClick={(event) => event.stopPropagation()}
             onChange={(event) => props.onChange({ selected: event.target.checked })}
           />
-          <div>
-            <strong style={{ display: "block", fontSize: 16 }}>{song.name}</strong>
-            <span className="small" style={{ opacity: 0.5 }}>{song.fileName}</span>
+          <div style={{ minWidth: 0, flex: 1 }}>
+            <strong style={{ display: "block", fontSize: 16, overflowWrap: "anywhere" }}>{song.name}</strong>
+            <span className="small" style={{ opacity: 0.5, display: "block", overflowWrap: "anywhere" }}>{song.fileName}</span>
           </div>
         </div>
-        <div className="row" style={{ gap: 8, flexWrap: "wrap", alignItems: "center", justifyContent: "flex-end" }}>
-          <div className="row" style={{ gap: 6, flexWrap: "wrap", alignItems: "center" }}>
-            {props.isActive && <span className="song-focus-pill">焦點中</span>}
-            {song.muted && <span className="song-muted-pill">已靜音</span>}
-            {availabilityInfo && (
-              <span
-                className={`song-storage-pill ${availabilityInfo.tone}`}
-                title={song.persistenceMessage || availabilityInfo.label}
-              >
-                {availabilityInfo.label}
-              </span>
-            )}
-            {backupInfo && (
-              <span
-                className={`song-storage-pill ${backupInfo.tone}`}
-                title={`雲端備份狀態：${backupInfo.label}`}
-              >
-                {backupInfo.label}
-              </span>
-            )}
-            {song.source?.provider === "google_drive" && (
-              <span
-                className="song-storage-pill is-drive"
-                title={`Google Drive 來源（File ID: ${song.source.fileId}）`}
-              >
-                Google Drive
-              </span>
-            )}
-            {song.importedStemOrigin && (
-              <span
-                className="song-storage-pill is-drive-stem"
-                title={`已自 Google Drive 匯入分軌（${song.importedStemOrigin.pcmFormat}）`}
-              >
-                雲端分軌
-              </span>
-            )}
-            {song.driveExport && (
-              <span
-                className="song-storage-pill is-saved"
-                title={`已備份至 Google Drive（Revision: ${song.driveExport.revisionId}）`}
-              >
-                已存 Drive
-              </span>
-            )}
-            {song.audioLoadState === "unloaded" && !song.sourceAudioMissing && (
-              <span className="song-storage-pill is-warn" title="為節省記憶體採延遲解碼，按播放或載入時才解碼">
-                待按需解碼
-              </span>
-            )}
-            {song.audioLoadState === "decoding" && (
-              <span className="song-storage-pill is-saving">音訊解碼中…</span>
-            )}
-            {persistenceInfo && (
-              <span
-                className={`song-storage-pill ${persistenceInfo.tone}`}
-                title={song.persistenceMessage || persistenceInfo.label}
-              >
-                {persistenceInfo.label}
-              </span>
-            )}
+        <div className="row song-card-header-meta" style={{ gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+          <div className="row song-card-badges" style={{ gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+            <SongStatusIndicators items={statusItems} />
             <span className="small" style={{ color: STATUS_COLOR[song.status], whiteSpace: "nowrap" }}>● {STATUS_LABEL[song.status]}</span>
           </div>
           <div className="row" style={{ gap: 6, flexWrap: "nowrap", flex: "0 0 auto" }}>
@@ -763,18 +682,16 @@ export const SongCard = memo(function SongCard(props: Props) {
                   onClick={() => props.onChange({ targetBpm: song.originalBpm, tempoMode: "target-bpm", manualRate: 1, fineRateOffset: 0 })}
                 />
               </div>
-              <input
-                aria-label="倍率粗調拉桿"
-                className="manual-rate-slider mixer-range is-speed"
-                type="range"
+              <TouchGuardedRangeSlider
+                ariaLabel="倍率粗調拉桿"
+                className="manual-rate-slider"
                 disabled={focusLocked}
                 min={0}
                 max={1}
                 step={0.001}
                 value={manualRatePosition}
-                style={{ "--range-progress": `${manualRatePct}%` } as CSSProperties}
-                onChange={(event) => {
-                  const position = Number(event.target.value);
+                valueText={`${song.manualRate.toFixed(3)}×`}
+                onChange={(position) => {
                   const nextRate = sliderPositionToRate(position);
                   setManualRate(nextRate);
                 }}
@@ -788,17 +705,15 @@ export const SongCard = memo(function SongCard(props: Props) {
                   {coarseRate.toFixed(3)}× {song.fineRateOffset >= 0 ? "+" : ""}{song.fineRateOffset.toFixed(3)}
                 </span>
               </div>
-              <input
-                aria-label={`${song.name} 倍率微調`}
-                className="mixer-range is-speed"
-                type="range"
+              <TouchGuardedRangeSlider
+                ariaLabel={`${song.name} 倍率微調`}
                 disabled={focusLocked}
                 min={-0.05}
                 max={0.05}
                 step={0.001}
                 value={song.fineRateOffset}
-                style={{ "--range-progress": `${fineOffsetPct}%` } as CSSProperties}
-                onChange={(event) => props.onChange({ fineRateOffset: Number(event.target.value) })}
+                valueText={`${song.fineRateOffset >= 0 ? "+" : ""}${song.fineRateOffset.toFixed(3)}`}
+                onChange={(nextOffset) => props.onChange({ fineRateOffset: nextOffset })}
               />
             </div>
           </div>
@@ -1285,8 +1200,12 @@ export const SongCard = memo(function SongCard(props: Props) {
             </div>
           )}
           {song.separationStatus === "completed" && (
-            <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-              <span className="small" style={{ color: "#34d399" }}>
+            <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap", minWidth: 0 }}>
+              <span
+                className="small song-separation-status-text"
+                style={{ color: "#34d399" }}
+                title={song.separationMessage || undefined}
+              >
                 ✓ {song.separationMessage || "音軌分離已完成"}
                 {totalChunks > 0 ? `（已完成 ${completedChunks || totalChunks} / ${totalChunks} 段${song.separationCommittedBytes ? `｜${committedMiB} MiB` : ""}）` : ""}
               </span>
@@ -1362,17 +1281,33 @@ export const SongCard = memo(function SongCard(props: Props) {
             </div>
           )}
           {song.stemIds.length > 0 && stemsOpen && (
-            <StemMixer
-              channels={song.stemChannels}
-              selectedStemId={props.selectedStemId}
-              exportLocked={focusLocked}
-              exportDisabledReason={focusLockReason}
-              onSelectStem={props.onSelectStem}
-              onToggleMute={props.onToggleStemMute}
-              onToggleSolo={props.onToggleStemSolo}
-              onChange={props.onStemChange}
-              onDownload={props.onDownloadStem}
-            />
+            <div className={`grid stem-mixer-wrap${song.playbackSource !== "stems" ? " is-source-original" : ""}`} style={{ gap: 8 }}>
+              {song.playbackSource !== "stems" && (
+                <div role="status" className="stem-source-inactive-banner">
+                  <span>目前播放「原始混音」；調整下方分軌將自動切至分軌混音</span>
+                  <button
+                    type="button"
+                    className="btn mixer-button primary"
+                    style={{ padding: "4px 10px", fontSize: 12 }}
+                    disabled={focusLocked || isSeparating}
+                    onClick={() => props.onSwitchSource("stems")}
+                  >
+                    切換分軌混音
+                  </button>
+                </div>
+              )}
+              <StemMixer
+                channels={song.stemChannels}
+                selectedStemId={props.selectedStemId}
+                exportLocked={focusLocked}
+                exportDisabledReason={focusLockReason}
+                onSelectStem={props.onSelectStem}
+                onToggleMute={props.onToggleStemMute}
+                onToggleSolo={props.onToggleStemSolo}
+                onChange={props.onStemChange}
+                onDownload={props.onDownloadStem}
+              />
+            </div>
           )}
           <details className="playback-note">
             <summary>播放同步說明</summary>

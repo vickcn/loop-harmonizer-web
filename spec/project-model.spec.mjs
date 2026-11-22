@@ -538,3 +538,56 @@ test("Backup status accurately distinguishes partial backup vs cross-device read
   assert.equal(validateProjectDocument(cloudDoc, { expectedAccountId: "google:acc1" }).valid, true);
   assert.equal(validateProjectDocument(cloudDoc, { expectedAccountId: "google:acc2" }).valid, false);
 });
+
+test("projectEntryToBandSong formats long local-* revisionId as concise user-facing ready message", () => {
+  const restored = projectEntryToBandSong(
+    {
+      entryId: "e-local",
+      sourceAudioHash: "c".repeat(64),
+      source: { provider: "local", fileName: "song.mp3" },
+      originalBackup: null,
+      displayName: "Song",
+      fileName: "song.mp3",
+      durationSec: 120,
+      order: 0,
+      artifactRef: {
+        revisionId: `local-sep:song_1794640394595_3zr89p:${"a".repeat(64)}:demucs-v1:loop-harmonizer-stems-v2:r1794700415429_lit2o`,
+        sourceAudioHash: "c".repeat(64),
+        separationMode: "four_stem",
+        modelVersion: "browser-demucs-v1",
+        processingVersion: "loop-harmonizer-stems-v2",
+        sampleRate: 44100,
+        channelCount: 2,
+        totalSamples: 882000,
+        localTaskId: "sep-task-1",
+      },
+      settings: {
+        displayName: "Song",
+        fileName: "song.mp3",
+        originalBpm: 120,
+        targetBpm: 120,
+        tempoMode: "target-bpm",
+        manualRate: 1,
+        fineRateOffset: 0,
+        savedRates: [1],
+        keyShiftSemitones: 0,
+        masterVolume: 1,
+        muted: false,
+        loop: false,
+        playbackSource: "stems",
+        separationMode: "four_stem",
+        stemChannels: [
+          { stemType: "vocals", volume: 1, muted: false, solo: false },
+          { stemType: "drums", volume: 1, muted: false, solo: false },
+        ],
+      },
+    },
+    {
+      localStemsReady: true,
+      localTaskId: "sep-task-1",
+    },
+  );
+  assert.equal(restored.separationMessage, "已依專案本機分軌版本就緒");
+  assert.equal(restored.separationMessage.includes("local-sep:"), false);
+  assert.equal(restored.artifactRef?.revisionId.startsWith("local-sep:"), true);
+});
