@@ -45,6 +45,18 @@ export interface GoogleAccountManagerDeps {
 
 const TOKEN_EXPIRY_SAFETY_BUFFER_MS = 60_000;
 
+/** 純讀取：供 React render 從 Snapshot 推導 UI，絕不通知訂閱者或變更帳戶狀態。 */
+export function isGoogleTokenSnapshotUsable(
+  snapshot: Pick<GoogleAuthSnapshot, "status" | "account" | "expiresAt">,
+  now = Date.now(),
+): boolean {
+  return (
+    snapshot.status === "signed_in" &&
+    Boolean(snapshot.account) &&
+    (snapshot.expiresAt === null || now < snapshot.expiresAt - TOKEN_EXPIRY_SAFETY_BUFFER_MS)
+  );
+}
+
 async function fetchGoogleUserAccount(
   accessToken: string,
   grantedScopes: string[],
@@ -154,6 +166,7 @@ export class GoogleAccountManager {
   >();
   private sdkUnsubscribe: (() => void) | null = null;
   private authInFlight: Promise<GoogleAuthSnapshot> | null = null;
+  private tokenExpiryTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(deps: GoogleAccountManagerDeps = {}) {
     this.deps = {
@@ -190,6 +203,7 @@ export class GoogleAccountManager {
 
   private updateSnapshot(next: GoogleAuthSnapshot): void {
     this.snapshot = next;
+    this.scheduleTokenExpiry();
     for (const listener of this.listeners) {
       try {
         listener();
@@ -197,6 +211,25 @@ export class GoogleAccountManager {
         // ignore listener errors
       }
     }
+  }
+
+  private scheduleTokenExpiry(): void {
+    if (this.tokenExpiryTimer !== null) {
+      clearTimeout(this.tokenExpiryTimer);
+      this.tokenExpiryTimer = null;
+    }
+    if (this.snapshot.status !== "signed_in" || this.snapshot.expiresAt === null) return;
+    const generation = this.snapshot.generation;
+    const delayMs = Math.max(0, this.snapshot.expiresAt - TOKEN_EXPIRY_SAFETY_BUFFER_MS - this.deps.now());
+    this.tokenExpiryTimer = setTimeout(() => {
+      this.tokenExpiryTimer = null;
+      if (this.snapshot.generation !== generation) return;
+      if (!isGoogleTokenSnapshotUsable(this.snapshot, this.deps.now())) {
+        this.markTokenExpired(generation, "Google 授權已過期，請重新授權後繼續。");
+      }
+    }, delayMs);
+    // Node 測試環境不應因 OAuth 到期通知而被長計時器阻擋結束；瀏覽器環境無此方法。
+    this.tokenExpiryTimer.unref?.();
   }
 
   private emitSessionEnd(
@@ -268,20 +301,24 @@ export class GoogleAccountManager {
   }
 
   getValidAccessToken(expectedAccountId?: string): string | null {
-    if (this.snapshot.status !== "signed_in" || !this.accessToken) {
-      return null;
-    }
-    if (expectedAccountId && this.snapshot.account?.accountId !== expectedAccountId) {
-      return null;
-    }
-    if (
-      this.snapshot.expiresAt !== null &&
-      this.deps.now() >= this.snapshot.expiresAt - TOKEN_EXPIRY_SAFETY_BUFFER_MS
-    ) {
-      this.markTokenExpired(this.snapshot.generation, "Google 授權已過期，請重新授權後繼續。");
+    if (!this.hasUsableAccessToken(expectedAccountId)) {
+      const accountMatches =
+        !expectedAccountId || this.snapshot.account?.accountId === expectedAccountId;
+      if (accountMatches && this.snapshot.status === "signed_in" && this.accessToken) {
+        this.markTokenExpired(this.snapshot.generation, "Google 授權已過期，請重新授權後繼續。");
+      }
       return null;
     }
     return this.accessToken;
+  }
+
+  /** 純讀取：可由事件/API 前置檢查使用，禁止在 render 期改用 getValidAccessToken。 */
+  hasUsableAccessToken(expectedAccountId?: string): boolean {
+    return (
+      Boolean(this.accessToken) &&
+      (!expectedAccountId || this.snapshot.account?.accountId === expectedAccountId) &&
+      isGoogleTokenSnapshotUsable(this.snapshot, this.deps.now())
+    );
   }
 
   markTokenExpired(expectedGeneration?: number, message = "Google 授權已過期，請重新授權後再試。"): void {
@@ -510,6 +547,10 @@ export class GoogleAccountManager {
   }
 
   dispose(): void {
+    if (this.tokenExpiryTimer !== null) {
+      clearTimeout(this.tokenExpiryTimer);
+      this.tokenExpiryTimer = null;
+    }
     this.sdkUnsubscribe?.();
     this.sdkUnsubscribe = null;
     this.listeners.clear();

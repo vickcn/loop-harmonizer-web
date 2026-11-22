@@ -200,7 +200,10 @@ import {
   type ProjectAuthContext,
   type PromoteLocalToDriveProgress,
 } from "@/lib/projects/projectManager";
-import { sharedGoogleAccountManager } from "@/lib/google/googleAccountManager";
+import {
+  isGoogleTokenSnapshotUsable,
+  sharedGoogleAccountManager,
+} from "@/lib/google/googleAccountManager";
 import {
   isGoogleDrivePickerConfigured,
   type PickedDriveFile,
@@ -390,6 +393,7 @@ export function BandMixer() {
   const [cacheStats, setCacheStats] = useState<StorageStatsSummary>(INITIAL_STORAGE_STATS);
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [showStorage, setShowStorage] = useState(false);
+  const [uploadMoreOpen, setUploadMoreOpen] = useState(false);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [diagnosticLogs, setDiagnosticLogs] = useState<SeparationDiagnosticEntry[]>([]);
   const googleAuth = useSyncExternalStore(
@@ -416,6 +420,7 @@ export function BandMixer() {
   const driveExportPauseRequestedRef = useRef(false);
   const lastDriveExportSelectionRef = useRef<DriveExportSelection | null>(null);
   const driveRestoreAbortRef = useRef<AbortController | null>(null);
+  const uploadMoreRef = useRef<HTMLDivElement | null>(null);
   const sessionRef = useRef(session);
   const selectionRef = useRef<MixerSelection>(selection);
   const startingSongIdsRef = useRef<Set<string>>(startingSongIds);
@@ -425,6 +430,24 @@ export function BandMixer() {
   >(null);
   const profileWarningRef = useRef<string>(profileWarning);
   const hintTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (!uploadMoreOpen) return;
+    const closeIfOutside = (event: PointerEvent) => {
+      if (!uploadMoreRef.current?.contains(event.target as Node)) {
+        setUploadMoreOpen(false);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setUploadMoreOpen(false);
+    };
+    window.addEventListener("pointerdown", closeIfOutside);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", closeIfOutside);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [uploadMoreOpen]);
   const cardFeedbackTimersRef = useRef<Map<string, number>>(new Map());
   const shortcutHandlerRef = useRef<(event: KeyboardEvent) => void>(() => undefined);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -7705,7 +7728,7 @@ export function BandMixer() {
         hasLegacySongs={hasLegacyWorkspaceSongs}
         isGoogleConfigured={isGoogleDrivePickerConfigured()}
         isGoogleSignedIn={Boolean(googleAuth.account)}
-        hasValidGoogleToken={Boolean(googleAuth.account && sharedGoogleAccountManager.getValidAccessToken())}
+        hasValidGoogleToken={isGoogleTokenSnapshotUsable(googleAuth)}
         projectBusyState={projectBusyState}
         otherProjectJobs={otherProjectJobs}
         localSaveState={localSaveState}
@@ -7716,7 +7739,7 @@ export function BandMixer() {
         onOpenConflict={() => openProjectModal("conflict")}
         onReauthorizeSync={() => void handleReauthorizeAndSync()}
       />
-      <div className="card row mixer-upload" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+      <div className="card row mixer-upload">
         <button
           type="button"
           className={`btn mixer-button primary${loading ? " is-loading" : ""}`}
@@ -7738,23 +7761,85 @@ export function BandMixer() {
             </>
           ) : "＋ 載入歌曲 (Alt+N)"}
         </button>
-        <GoogleDrivePickerButton
-          multiple
-          disabled={loading || focusLocked || Boolean(driveImportProgress)}
-          onMetadataPicked={(picked, ctx) => void handleDriveMetadataPicked(picked, ctx)}
-          onError={(message) => showShortcutHint(message)}
-        />
-        {isGoogleDrivePickerConfigured() && (
+        <div className="mixer-upload-overflow" ref={uploadMoreRef}>
           <button
             type="button"
-            className="btn mixer-button"
-            disabled={loading || focusLocked}
-            title="瀏覽並恢復 Google Drive .loopHarmonizer 雲端音樂成果"
-            onClick={() => void openDriveLibrary()}
+            className={`btn mixer-button mixer-upload-more${uploadMoreOpen ? " is-pressed" : ""}`}
+            aria-label="更多載入與工具操作"
+            aria-expanded={uploadMoreOpen}
+            aria-haspopup="menu"
+            title="更多操作"
+            onClick={() => setUploadMoreOpen((open) => !open)}
           >
-            📚 雲端成果庫
+            ⋯
           </button>
-        )}
+          {uploadMoreOpen && (
+            <div
+              className="mixer-upload-more-menu"
+              role="menu"
+              aria-label="載入與工具操作"
+            >
+              <GoogleDrivePickerButton
+                multiple
+                disabled={loading || focusLocked || Boolean(driveImportProgress)}
+                onMetadataPicked={(picked, ctx) => void handleDriveMetadataPicked(picked, ctx)}
+                onError={(message) => showShortcutHint(message)}
+              />
+              {isGoogleDrivePickerConfigured() && (
+                <button
+                  type="button"
+                  className="btn mixer-button mixer-upload-menu-action"
+                  disabled={loading || focusLocked}
+                  title="瀏覽並恢復 Google Drive .loopHarmonizer 雲端音樂成果"
+                  onClick={() => {
+                    setUploadMoreOpen(false);
+                    void openDriveLibrary();
+                  }}
+                >
+                  📚 雲端成果庫
+                </button>
+              )}
+              <span className="mixer-upload-menu-divider" aria-hidden="true" />
+              <GoogleAccountButton
+                disabled={focusLocked}
+                onRequestRevoke={requestRevokeGoogleAuth}
+                onError={(msg) => showShortcutHint(msg)}
+              />
+              <button
+                type="button"
+                className="btn mixer-button mixer-upload-menu-action"
+                onClick={() => {
+                  setUploadMoreOpen(false);
+                  void releaseIdleResources();
+                }}
+              >
+                🧹 釋放閒置資源
+              </button>
+              <button
+                type="button"
+                className={`btn mixer-button mixer-upload-menu-action${showShortcuts ? " primary" : ""}`}
+                aria-pressed={showShortcuts}
+                onClick={() => {
+                  setUploadMoreOpen(false);
+                  setShowShortcuts((value) => !value);
+                }}
+              >
+                ? 快捷鍵說明
+              </button>
+              <button
+                type="button"
+                className={`btn mixer-button mixer-upload-menu-action${showStorage ? " primary" : ""}${cacheStats.isLowStorage ? " is-danger" : ""}`}
+                aria-pressed={showStorage}
+                onClick={() => {
+                  setUploadMoreOpen(false);
+                  setShowStorage((value) => !value);
+                }}
+              >
+                {cacheStats.isLowStorage ? "💾⚠" : "💾"} 本機儲存空間
+              </button>
+            </div>
+          )}
+        </div>
         <input
           ref={fileInputRef}
           type="file"
@@ -7780,35 +7865,6 @@ export function BandMixer() {
             if (targetId && picked.length) void handleRelinkFile(targetId, picked);
           }}
         />
-        <div className="mixer-toolbar-actions">
-          <GoogleAccountButton
-            disabled={focusLocked}
-            onRequestRevoke={requestRevokeGoogleAuth}
-            onError={(msg) => showShortcutHint(msg)}
-          />
-          <IconActionButton
-            icon="🧹"
-            label="釋放閒置資源（卸載未播放歌曲緩衝與閒置 Worker）"
-            onClick={() => void releaseIdleResources()}
-          />
-          <IconActionButton
-            icon="?"
-            label="快捷鍵說明"
-            pressed={showShortcuts}
-            primary={showShortcuts}
-            expanded={showShortcuts}
-            onClick={() => setShowShortcuts((value) => !value)}
-          />
-          <IconActionButton
-            icon={cacheStats.isLowStorage ? "💾⚠" : "💾"}
-            label={cacheStats.isLowStorage ? "儲存空間管理（空間偏低）" : "本機儲存空間管理"}
-            pressed={showStorage}
-            primary={showStorage}
-            expanded={showStorage}
-            danger={cacheStats.isLowStorage}
-            onClick={() => setShowStorage((value) => !value)}
-          />
-        </div>
         {uploadStatus && (
           <span role="status" aria-live="polite" className="small" style={{ color: "#38bdf8", width: "100%" }}>
             {uploadStatus}

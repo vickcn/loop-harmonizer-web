@@ -5,7 +5,10 @@ import {
   GOOGLE_IDENTITY_SCOPES,
   GOOGLE_REQUESTED_SCOPES,
 } from "../lib/google/googleAuthTypes.ts";
-import { GoogleAccountManager } from "../lib/google/googleAccountManager.ts";
+import {
+  GoogleAccountManager,
+  isGoogleTokenSnapshotUsable,
+} from "../lib/google/googleAccountManager.ts";
 import { configureInMemoryIdbForTests, resetInMemoryIdbForTests } from "../lib/storage/indexedDb.ts";
 
 function makeManager(overrides = {}) {
@@ -99,6 +102,30 @@ test("GoogleAccountManager signs in with immutable sub ID, keeps token only in m
   } finally {
     resetInMemoryIdbForTests();
   }
+});
+
+test("token snapshot validity is a pure render-safe read and expiry is applied outside the read", async () => {
+  const { manager, advanceTime } = makeManager();
+  let notifications = 0;
+  const unsubscribe = manager.subscribe(() => {
+    notifications += 1;
+  });
+  const signedIn = await manager.signIn();
+  const notificationBaseline = notifications;
+
+  assert.equal(manager.getValidAccessToken("google:other-account"), null);
+  assert.equal(manager.getSnapshot().status, "signed_in", "account mismatch must not expire this session");
+
+  assert.equal(isGoogleTokenSnapshotUsable(signedIn, signedIn.expiresAt - 60_001), true);
+  assert.equal(isGoogleTokenSnapshotUsable(signedIn, signedIn.expiresAt - 60_000), false);
+  assert.equal(manager.getSnapshot().status, "signed_in");
+  assert.equal(notifications, notificationBaseline, "pure snapshot read must not notify subscribers");
+
+  advanceTime(3_550_000);
+  assert.equal(manager.getValidAccessToken(signedIn.account.accountId), null);
+  assert.equal(manager.getSnapshot().status, "expired");
+  unsubscribe();
+  manager.dispose();
 });
 
 test("GoogleAccountManager falls back to Drive about.user.permissionId when userinfo fails", async () => {

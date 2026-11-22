@@ -1316,6 +1316,77 @@ li.status-dot-tooltip-row.is-row-highlighted {
   flex-wrap: wrap;
 }
 
+/* 載入區只保留主要 CTA；次要雲端與工具操作收進可鍵盤關閉的 ⋯ 選單。 */
+.mixer-upload {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+
+.mixer-upload-overflow {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.mixer-upload-more {
+  min-width: 46px;
+  font-size: 24px;
+  line-height: 1;
+  padding-inline: 12px;
+}
+
+.mixer-upload-more-menu {
+  position: absolute;
+  z-index: 80;
+  top: calc(100% + 8px);
+  left: 0;
+  display: grid;
+  gap: 6px;
+  width: min(280px, calc(100vw - 40px));
+  padding: 8px;
+  border: 1px solid rgba(138, 180, 248, 0.32);
+  border-radius: 14px;
+  background: #171b2a;
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.38);
+}
+
+.mixer-upload-more-menu .mixer-button,
+.mixer-upload-more-menu .google-account-btn,
+.mixer-upload-more-menu .google-account-wrap {
+  width: 100%;
+  justify-content: flex-start;
+}
+
+.mixer-upload-menu-action {
+  min-height: 40px;
+  padding-inline: 12px;
+}
+
+.mixer-upload-menu-divider {
+  height: 1px;
+  margin: 2px 4px;
+  background: rgba(148, 163, 184, 0.22);
+}
+
+@media (max-width: 640px) {
+  .mixer-upload {
+    gap: 8px;
+  }
+
+  .mixer-upload > .mixer-button.primary {
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .mixer-upload-more-menu {
+    right: 0;
+    left: auto;
+  }
+}
+
 .adaptive-action-row {
   position: relative;
   display: flex;
