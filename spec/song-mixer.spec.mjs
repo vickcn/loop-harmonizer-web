@@ -4,8 +4,10 @@ import test from "node:test";
 import {
   createBandSong,
   getEffectivePlaybackRate,
+  getSongLoopRange,
   getSongPlaybackTrackIds,
   getStemAudibility,
+  normalizeSongLoopRange,
   reorderSongList,
   serializeSongSettings,
 } from "../lib/band/songModel.ts";
@@ -56,6 +58,26 @@ test("manual rate overrides target BPM while fine tuning remains additive", () =
   song.fineRateOffset = 0.025;
 
   assert.ok(Math.abs(getEffectivePlaybackRate(song) - 0.825) < 0.000001);
+});
+
+test("A/B loop range is clamped to the real duration and leaves invalid ranges as full-song loop", () => {
+  const song = createBandSong({
+    id: "loop-range",
+    name: "Loop range",
+    sourceAudioId: "loop-range-original",
+    originalBpm: 120,
+    durationSec: 120,
+  });
+
+  Object.assign(song, normalizeSongLoopRange(song, 18.25, 42.75));
+  assert.deepEqual(getSongLoopRange(song), { startSec: 18.25, endSec: 42.75 });
+
+  Object.assign(song, normalizeSongLoopRange(song, 118, 200));
+  assert.deepEqual(getSongLoopRange(song), { startSec: 118, endSec: 120 });
+
+  Object.assign(song, normalizeSongLoopRange(song, 80, 80.1));
+  assert.equal(getSongLoopRange(song), null);
+  assert.equal(song.loopEndSec, null);
 });
 
 test("song playback selects either original audio or stems, never both", () => {
@@ -134,6 +156,8 @@ test("persisted song settings contain JSON controls but no source audio", () => 
     fineRateOffset: 0,
     savedRates: [1],
     loop: false,
+    loopStartSec: 0,
+    loopEndSec: null,
     separationMode: null,
     stemVolumes: { vocals: 0.9 },
     stemMuted: { vocals: false },

@@ -1,5 +1,5 @@
 import type { BandSong, ImportedStemOrigin, SongAudioLoadState, SongSource } from "../band/bandTypes.ts";
-import { clampBpmValue, createBandSong, sanitizeSongSavedRates } from "../band/songModel.ts";
+import { clampBpmValue, createBandSong, normalizeSongLoopRange, sanitizeSongSavedRates } from "../band/songModel.ts";
 import { computeSha256HexSync } from "../audio/chunkedWavExporter.ts";
 import type { StemSeparationMode } from "../separation/stemTypes.ts";
 import {
@@ -178,6 +178,7 @@ export function extractProjectSongSettings(song: BandSong): ProjectSongSettings 
     masterVolume: Math.max(0, Math.min(1, Number.isFinite(song.masterVolume) ? song.masterVolume : 1)),
     muted: Boolean(song.muted),
     loop: Boolean(song.loop),
+    ...normalizeSongLoopRange(song, song.loopStartSec, song.loopEndSec),
     playbackSource: song.playbackSource === "stems" ? "stems" : "original",
     separationMode: song.separationMode ?? null,
     stemChannels: song.stemChannels.map((ch) => ({
@@ -404,6 +405,7 @@ export function projectEntryToBandSong(
     masterVolume: Math.max(0, Math.min(1, s.masterVolume)),
     muted: Boolean(s.muted),
     loop: Boolean(s.loop),
+    ...normalizeSongLoopRange(song, s.loopStartSec, s.loopEndSec),
     playbackSource:
       localStemsReady && s.playbackSource === "stems"
         ? "stems"

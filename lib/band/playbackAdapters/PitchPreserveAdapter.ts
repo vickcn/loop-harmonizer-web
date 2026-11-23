@@ -18,7 +18,7 @@
  * 接入點：MultiTrackEngine.createAdapter("pitch-preserve") 回傳此 adapter。
  */
 
-import type { AdapterPlaybackMode, PlayOptions, TrackPlaybackAdapter } from "./types";
+import type { AdapterPlaybackMode, PlaybackLoopRange, PlayOptions, TrackPlaybackAdapter } from "./types";
 
 // Module-level cache: per AudioContext，只需 addModule 一次
 const workletModuleCache = new WeakMap<AudioContext, Promise<void>>();
@@ -48,6 +48,7 @@ export class PitchPreserveAdapter implements TrackPlaybackAdapter {
   private _pausedAt = 0;
   private _playbackRate = 1;
   private _loop = false;
+  private _loopRange: PlaybackLoopRange | null = null;
   private _isPlaying = false;
   private _workletStarted = false; // true 後 getPosition 才開始計時
 
@@ -79,7 +80,10 @@ export class PitchPreserveAdapter implements TrackPlaybackAdapter {
     this._loop = options.loop;
 
     const dur = this.buffer.duration;
-    const offset = dur > 0 ? ((options.offsetSec % dur) + dur) % dur : 0;
+    this._loopRange = options.loop
+      ? this._normalizeLoopRange(options.loopStartSec, options.loopEndSec, dur)
+      : null;
+    const offset = this._normalizeOffset(options.offsetSec, dur);
     this._pausedAt = offset;
     this._isPlaying = true;
     this._workletStarted = false;
@@ -95,7 +99,8 @@ export class PitchPreserveAdapter implements TrackPlaybackAdapter {
     const raw = this._startAudioOffset + elapsed;
     const dur = this.buffer.duration;
     if (dur <= 0) return 0;
-    if (this._loop) return ((raw % dur) + dur) % dur;
+    if (this._loop && !this._loopRange) return ((raw % dur) + dur) % dur;
+    if (this._loopRange) return Math.min(raw, this._loopRange.endSec);
     return Math.min(raw, dur);
   }
 
@@ -148,12 +153,15 @@ export class PitchPreserveAdapter implements TrackPlaybackAdapter {
     // 現有 WSOLA worklet 僅保音高變速，未提供獨立變調參數。
   }
 
-  setLoop(loop: boolean, onEnded: (() => void) | null): void {
+  setLoop(loop: boolean, onEnded: (() => void) | null, loopRange?: PlaybackLoopRange | null): void {
     const wasLoop = this._loop;
     this._loop = loop;
     this.onEnded = onEnded;
+    this._loopRange = loop
+      ? this._normalizeLoopRange(loopRange?.startSec, loopRange?.endSec, this.buffer?.duration ?? 0)
+      : null;
     if (this._isPlaying && this._workletStarted) {
-      if (!loop && wasLoop) this._startEndedTimer();
+      if (!loop || this._loopRange) this._startEndedTimer();
       else if (loop && !wasLoop) this._stopEndedTimer();
     }
   }
@@ -193,7 +201,7 @@ export class PitchPreserveAdapter implements TrackPlaybackAdapter {
     this._startAudioOffset = offsetSec;
     this._workletStarted = true;
 
-    if (!this._loop) this._startEndedTimer();
+    if (!this._loop || this._loopRange) this._startEndedTimer();
   }
 
   private async _ensureWorkletNode(): Promise<void> {
@@ -232,13 +240,25 @@ export class PitchPreserveAdapter implements TrackPlaybackAdapter {
 
   private _startEndedTimer(): void {
     this._stopEndedTimer();
-    if (!this.buffer) return;
-    const dur = this.buffer.duration;
+    const buffer = this.buffer;
+    if (!buffer) return;
+    const dur = buffer.duration;
     this._endedTimer = setInterval(() => {
       if (!this._isPlaying || !this.ctx || !this._workletStarted) return;
       const pos = this.getPosition(this.ctx);
-      if (pos >= dur - 0.08) {
+      const endSec = this._loopRange?.endSec ?? dur;
+      if (pos >= endSec - 0.08) {
         this._stopEndedTimer();
+        if (this._loop && this._loopRange) {
+          const startSec = this._loopRange.startSec;
+          this.workletNode?.port.postMessage({ type: "setPosition", seconds: startSec, sampleRate: buffer.sampleRate });
+          this.workletNode?.port.postMessage({ type: "play" });
+          this._startWallTime = this.ctx.currentTime;
+          this._startAudioOffset = startSec;
+          this._pausedAt = startSec;
+          this._startEndedTimer();
+          return;
+        }
         this.workletNode?.port.postMessage({ type: "stop" });
         try { this.workletNode?.disconnect(); } catch { /* ok */ }
         this._isPlaying = false;
@@ -261,5 +281,26 @@ export class PitchPreserveAdapter implements TrackPlaybackAdapter {
       clearInterval(this._rampTimer);
       this._rampTimer = null;
     }
+  }
+
+  private _normalizeLoopRange(
+    startSec: number | undefined,
+    endSec: number | undefined,
+    duration: number,
+  ): PlaybackLoopRange | null {
+    if (!Number.isFinite(startSec) || !Number.isFinite(endSec) || duration <= 0) return null;
+    const start = Math.max(0, Math.min(duration, startSec!));
+    const end = Math.max(start, Math.min(duration, endSec!));
+    return end - start >= 0.05 ? { startSec: start, endSec: end } : null;
+  }
+
+  private _normalizeOffset(offsetSec: number, duration: number): number {
+    if (this._loopRange) {
+      if (offsetSec < this._loopRange.startSec || offsetSec >= this._loopRange.endSec) {
+        return this._loopRange.startSec;
+      }
+      return offsetSec;
+    }
+    return duration > 0 ? ((offsetSec % duration) + duration) % duration : 0;
   }
 }

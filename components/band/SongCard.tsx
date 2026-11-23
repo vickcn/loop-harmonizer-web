@@ -4,17 +4,18 @@ import { memo, useEffect, useRef, useState, type CSSProperties } from "react";
 import type { BandSong, StemChannel } from "@/lib/band/bandTypes";
 import type { StemSeparationMode } from "@/lib/separation/stemTypes";
 import type { DriveExportProgress } from "@/lib/google/driveExportManager";
-import { getEffectivePlaybackRate } from "@/lib/band/songModel";
+import { getEffectivePlaybackRate, MIN_LOOP_REGION_SECONDS, normalizeSongLoopRange } from "@/lib/band/songModel";
 import { buildSongStatusIndicators } from "@/lib/band/songStatusIndicators";
 import { TrackPlayhead } from "./TrackPlayhead";
 import { StemMixer } from "./StemMixer";
 import { IconActionButton } from "./IconActionButton";
 import { AdaptiveActionRow, type AdaptiveActionItem } from "./AdaptiveActionRow";
-import { SongStatusIndicators } from "./SongStatusIndicators";
 import { TouchGuardedRangeSlider } from "./TouchGuardedRangeSlider";
+import { SongCardHeader } from "./SongCardHeader";
 
 type Props = {
   song: BandSong;
+  waveformPeaks?: readonly number[];
   collapsed: boolean;
   onToggleCollapse: () => void;
   onChange: (patch: Partial<BandSong>) => void;
@@ -300,6 +301,19 @@ export const SongCard = memo(function SongCard(props: Props) {
     manualRate: clampManualRate(value),
     tempoMode: "manual-rate",
   });
+  const setLoopStart = (seconds: number) => {
+    const currentEnd = song.loopEndSec ?? song.durationSec;
+    const nextEnd = currentEnd > seconds + MIN_LOOP_REGION_SECONDS
+      ? currentEnd
+      : song.durationSec;
+    props.onChange(normalizeSongLoopRange(song, seconds, nextEnd));
+  };
+  const setLoopEnd = (seconds: number) => {
+    const nextStart = seconds > song.loopStartSec + MIN_LOOP_REGION_SECONDS
+      ? song.loopStartSec
+      : 0;
+    props.onChange(normalizeSongLoopRange(song, nextStart, seconds));
+  };
 
   return (
     <article
@@ -335,45 +349,18 @@ export const SongCard = memo(function SongCard(props: Props) {
       </div>
 
       <div className="song-card-body grid" style={{ gap: 14 }}>
-        <div className="row" style={{ justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
-        <div className="row" style={{ gap: 10, flex: "1 1 180px", minWidth: 0 }}>
-          <input
-            className="song-select"
-            type="checkbox"
-            aria-label={`選取 ${song.name}`}
-            checked={song.selected}
-            onPointerDown={(event) => event.stopPropagation()}
-            onFocus={(event) => event.stopPropagation()}
-            onClick={(event) => event.stopPropagation()}
-            onChange={(event) => props.onChange({ selected: event.target.checked })}
-          />
-          <div style={{ minWidth: 0, flex: 1 }}>
-            <strong style={{ display: "block", fontSize: 16, overflowWrap: "anywhere" }}>{song.name}</strong>
-            <span className="small" style={{ opacity: 0.5, display: "block", overflowWrap: "anywhere" }}>{song.fileName}</span>
-          </div>
-        </div>
-        <div className="row song-card-header-meta" style={{ gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-          <div className="row song-card-badges" style={{ gap: 6, flexWrap: "wrap", alignItems: "center" }}>
-            <SongStatusIndicators items={statusItems} />
-            <span className="small" style={{ color: STATUS_COLOR[song.status], whiteSpace: "nowrap" }}>● {STATUS_LABEL[song.status]}</span>
-          </div>
-          <div className="row" style={{ gap: 6, flexWrap: "nowrap", flex: "0 0 auto" }}>
-            <IconActionButton
-              icon={<ChevronIcon expanded={!props.collapsed} />}
-              label={props.collapsed ? "展開歌曲" : "收合歌曲"}
-              className="song-card-action is-compact"
-              onClick={props.onToggleCollapse}
-            />
-            <IconActionButton
-              icon="🗑"
-              label="移除歌曲"
-              danger
-              className="song-card-action is-compact"
-              onClick={() => props.onRemove(false)}
-            />
-          </div>
-        </div>
-      </div>
+        <SongCardHeader
+          songName={song.name}
+          fileName={song.fileName}
+          selected={song.selected}
+          collapsed={props.collapsed}
+          statusLabel={STATUS_LABEL[song.status]}
+          statusColor={STATUS_COLOR[song.status]}
+          statusItems={statusItems}
+          onSelect={(selected) => props.onChange({ selected })}
+          onToggleCollapse={props.onToggleCollapse}
+          onRemove={() => props.onRemove(false)}
+        />
 
       {isDownloadingOnDemand && (
         <div
@@ -471,7 +458,20 @@ export const SongCard = memo(function SongCard(props: Props) {
       )}
 
       {!props.collapsed && <>
-        <TrackPlayhead playheadSec={song.playheadSec} durationSec={song.durationSec} onChange={props.onSeek} onSelect={props.onSelectSong} />
+        <TrackPlayhead
+          playheadSec={song.playheadSec}
+          durationSec={song.durationSec}
+          loopStartSec={song.loopStartSec}
+          loopEndSec={song.loopEndSec}
+          loopEnabled={song.loop}
+          waveformPeaks={props.waveformPeaks}
+          onChange={props.onSeek}
+          onSetLoopStart={setLoopStart}
+          onSetLoopEnd={setLoopEnd}
+          onClearLoopRange={() => props.onChange({ loopStartSec: 0, loopEndSec: null })}
+          onSelect={props.onSelectSong}
+          disabled={focusLocked}
+        />
 
         <div className="row song-transport" style={{ gap: 6, flexWrap: "wrap", minWidth: 0 }}>
           <AdaptiveActionRow
@@ -526,7 +526,9 @@ export const SongCard = memo(function SongCard(props: Props) {
               },
               {
                 key: "loop",
-                label: song.loop ? "循環播放中（切換單次）" : "單次播放（開啟循環）",
+                label: song.loop
+                  ? (song.loopEndSec !== null ? "A–B 循環播放中（切換單次）" : "整首循環播放中（切換單次）")
+                  : (song.loopEndSec !== null ? "單次播放（開啟 A–B 循環）" : "單次播放（開啟循環）"),
                 shortcut: "Alt+L",
                 pressed: song.loop,
                 disabled: focusLocked,
@@ -535,7 +537,9 @@ export const SongCard = memo(function SongCard(props: Props) {
                 renderInline: () => (
                   <IconActionButton
                     icon={<LoopIcon />}
-                    label={song.loop ? "循環播放中（點擊切換單次）" : "單次播放（點擊開啟循環）"}
+                    label={song.loop
+                      ? (song.loopEndSec !== null ? "A–B 循環播放中（點擊切換單次）" : "整首循環播放中（點擊切換單次）")
+                      : (song.loopEndSec !== null ? "單次播放（點擊開啟 A–B 循環）" : "單次播放（點擊開啟循環）")}
                     shortcut="Alt+L"
                     pressed={song.loop}
                     primary={song.loop}
@@ -615,6 +619,14 @@ export const SongCard = memo(function SongCard(props: Props) {
           </div>
         )}
 
+        <details className="song-performance-panel">
+          <summary>
+            <span>調整音色與速度</span>
+            <span className="song-performance-summary-value">
+              {rate.toFixed(3)}× · Key {song.keyShiftSemitones >= 0 ? "+" : ""}{song.keyShiftSemitones}st
+            </span>
+          </summary>
+          <div className="song-performance-panel-body">
         <div className="song-pitch-tempo-grid">
           <div className="grid" style={{ gap: 6 }}>
             <div className="row" style={{ justifyContent: "space-between", gap: 8 }}>
@@ -739,10 +751,20 @@ export const SongCard = memo(function SongCard(props: Props) {
             )}
           </div>
         </details>
+          </div>
+        </details>
 
-        <section className="grid" style={{ gap: 10, paddingTop: 12, borderTop: "1px solid var(--line)" }}>
-          <div className="row" style={{ gap: 8, flexWrap: "nowrap", minWidth: 0 }}>
-            <strong style={{ flex: "0 0 auto" }}>音軌</strong>
+        <section className="grid song-separation-panel" style={{ gap: 10 }}>
+          <div className="song-separation-panel-heading">
+            <div>
+              <span className="section-kicker">STEMS</span>
+              <strong>音軌分離與混音</strong>
+            </div>
+            <span className="small song-separation-summary">
+              {song.stemIds.length > 0 ? `${song.stemChannels.length} 軌可混音` : "尚未建立分軌"}
+            </span>
+          </div>
+          <div className="row song-separation-toolbar" style={{ gap: 8, flexWrap: "nowrap", minWidth: 0 }}>
             <select className="input" aria-label="分離軌數模式" value={mode} disabled={isSeparating || focusLocked} style={{ flex: "0 0 auto" }} onChange={(event) => setSelectedMode(event.target.value as StemSeparationMode)}>
               <option value="two_stem">2 Stem</option>
               <option value="four_stem">4 Stem</option>

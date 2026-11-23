@@ -134,7 +134,7 @@ export function ProjectToolbar(props: Props) {
           </div>
         </div>
 
-        <div className="project-toolbar-actions">
+        <div className="project-toolbar-actions" aria-label="專案主要操作">
           {actions.map((action) => (
             <IconActionButton
               key={action.key}

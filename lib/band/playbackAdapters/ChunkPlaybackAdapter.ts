@@ -69,6 +69,7 @@ export class ChunkedStemMixBuffer implements SoundTouchBufferLike {
   private lruCounter = 0;
   private lastPositionChunk = 0;
   private loopEnabled: boolean;
+  private loopAnchorChunk = 0;
   private disposed = false;
   private residentPeakAbs = 0;
   private missingChunkCount = 0;
@@ -88,10 +89,12 @@ export class ChunkedStemMixBuffer implements SoundTouchBufferLike {
     this.loadChunkFn = options.loadChunk ?? getChunkRecord;
   }
 
-  setLoopEnabled(loop: boolean): void {
+  setLoopEnabled(loop: boolean, loopStartSec?: number): void {
     this.loopEnabled = loop;
     if (loop && this.totalChunks > 0) {
-      void this.ensureChunkLoaded(0);
+      const sample = Math.floor(Math.max(0, loopStartSec ?? 0) * this.sampleRate);
+      this.loopAnchorChunk = this.chunkIndexForSample(sample);
+      void this.ensureChunkLoaded(this.loopAnchorChunk);
     }
   }
 
@@ -155,7 +158,7 @@ export class ChunkedStemMixBuffer implements SoundTouchBufferLike {
       if (idx >= 0 && idx < this.totalChunks) targets.add(idx);
     }
     if (this.loopEnabled) {
-      targets.add(0);
+      targets.add(this.loopAnchorChunk);
     }
     await Promise.all(Array.from(targets, (idx) => this.ensureChunkLoaded(idx)));
     this.evictExcessChunks(center);
@@ -225,7 +228,7 @@ export class ChunkedStemMixBuffer implements SoundTouchBufferLike {
       anchorChunk + 1,
       anchorChunk + 2,
     ]);
-    if (this.loopEnabled) protectedSet.add(0);
+    if (this.loopEnabled) protectedSet.add(this.loopAnchorChunk);
 
     while (this.resident.size > this.maxResidentChunks) {
       let victimKey: number | null = null;
@@ -309,8 +312,8 @@ export class ChunkedStemMixBuffer implements SoundTouchBufferLike {
         void this.ensureChunkLoaded(c);
       }
     }
-    if (this.loopEnabled && !this.resident.has(0)) {
-      void this.ensureChunkLoaded(0);
+    if (this.loopEnabled && !this.resident.has(this.loopAnchorChunk)) {
+      void this.ensureChunkLoaded(this.loopAnchorChunk);
     }
 
     for (let c = startChunk; c <= endChunk; c++) {

@@ -13,7 +13,7 @@
  */
 
 import { FastRateAdapter } from "./FastRateAdapter";
-import type { AdapterPlaybackMode, PlayOptions, TrackPlaybackAdapter } from "./types";
+import type { AdapterPlaybackMode, PlaybackLoopRange, PlayOptions, TrackPlaybackAdapter } from "./types";
 
 export class PitchPreserveStubAdapter implements TrackPlaybackAdapter {
   readonly playbackMode: AdapterPlaybackMode = "pitch-preserve";
@@ -58,9 +58,9 @@ export class PitchPreserveStubAdapter implements TrackPlaybackAdapter {
     this.inner.setPitchSemitones(semitones, ctx);
   }
 
-  setLoop(loop: boolean, onEnded: (() => void) | null): void {
+  setLoop(loop: boolean, onEnded: (() => void) | null, loopRange?: PlaybackLoopRange | null): void {
     // M2C: postMessage({ type: "setLoop", loop }) 給 worklet
-    this.inner.setLoop(loop, onEnded);
+    this.inner.setLoop(loop, onEnded, loopRange);
   }
 
   dispose(): void {

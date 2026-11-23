@@ -93,6 +93,8 @@ export interface DriveSongSessionPayload {
   masterVolume: number;
   muted: boolean;
   loop: boolean;
+  loopStartSec?: number;
+  loopEndSec?: number | null;
   playbackSource: SongPlaybackSource;
   separationMode: StemSeparationMode | null;
   stemChannels: DriveSongSessionStemChannel[];
@@ -128,6 +130,8 @@ export function buildDriveSongSessionPayload(song: BandSong): DriveSongSessionPa
     masterVolume: song.masterVolume,
     muted: Boolean(song.muted),
     loop: Boolean(song.loop),
+    loopStartSec: song.loopStartSec,
+    loopEndSec: song.loopEndSec,
     playbackSource: song.playbackSource,
     separationMode: song.separationMode,
     stemChannels: song.stemChannels.map((ch) => ({

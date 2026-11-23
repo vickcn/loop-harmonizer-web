@@ -386,7 +386,9 @@ test("1 & 2 & 10. ProjectToolbar renders strictly 3 actions, ProjectManagerDialo
   const guardSrc = fs.readFileSync(path.resolve("components/band/ResourceGuardModal.tsx"), "utf8");
   assert.equal(guardSrc.includes("mixer-primary"), false);
   const songCardSrc = fs.readFileSync(path.resolve("components/band/SongCard.tsx"), "utf8");
-  assert.equal(songCardSrc.includes("onPointerDown={(event) => event.stopPropagation()}"), true);
+  const songCardHeaderSrc = fs.readFileSync(path.resolve("components/band/SongCardHeader.tsx"), "utf8");
+  assert.equal(songCardSrc.includes("SongCardHeader"), true);
+  assert.equal(songCardHeaderSrc.includes("onPointerDown={(event) => event.stopPropagation()}"), true);
   const bandMixerSrc = fs.readFileSync(path.resolve("components/band/BandMixer.tsx"), "utf8");
   assert.equal(bandMixerSrc.includes("清除選取"), true);
   assert.equal(bandMixerSrc.includes("全選"), true);
@@ -422,6 +424,10 @@ test("1 & 2 & 10. ProjectToolbar renders strictly 3 actions, ProjectManagerDialo
     path.resolve("components/band/StemMixer.tsx"),
     "utf8",
   );
+  const stemChannelStripSrc = fs.readFileSync(
+    path.resolve("components/band/StemChannelStrip.tsx"),
+    "utf8",
+  );
   assert.equal(cssSrc.includes(".grid { display: grid; grid-template-columns: minmax(0, 1fr);"), true);
   assert.equal(cssSrc.includes(".grid > * { min-width: 0; }"), true);
   assert.equal(cssSrc.includes(".adaptive-measure-clip"), true);
@@ -429,18 +435,19 @@ test("1 & 2 & 10. ProjectToolbar renders strictly 3 actions, ProjectManagerDialo
   assert.equal(cssSrc.includes("@media (max-width: 540px)"), true);
   assert.equal(cssSrc.includes(".stem-row-slider"), true);
   assert.equal(adaptiveRowSrc.includes("adaptive-measure-clip"), true);
-  assert.equal(stemMixerSrc.includes("stem-row-label"), true);
-  assert.equal(stemMixerSrc.includes("stem-row-slider"), true);
-  assert.equal(stemMixerSrc.includes("stem-row-actions"), true);
+  assert.equal(stemMixerSrc.includes("StemChannelStrip"), true);
+  assert.equal(stemChannelStripSrc.includes("stem-row-label"), true);
+  assert.equal(stemChannelStripSrc.includes("stem-row-slider"), true);
+  assert.equal(stemChannelStripSrc.includes("stem-row-actions"), true);
   assert.equal(songCardSrc.includes("song-separation-status-text"), true);
-  assert.equal(songCardSrc.includes("song-card-header-meta"), true);
+  assert.equal(songCardHeaderSrc.includes("song-card-header-meta"), true);
 
   // 14. 歌曲狀態過多濃縮為彩色光點（Hover / 長按浮動詳情）契約
   const statusIndicatorsSrc = fs.readFileSync(
     path.resolve("components/band/SongStatusIndicators.tsx"),
     "utf8",
   );
-  assert.equal(songCardSrc.includes("SongStatusIndicators"), true);
+  assert.equal(songCardHeaderSrc.includes("SongStatusIndicators"), true);
   assert.equal(songCardSrc.includes("buildSongStatusIndicators"), true);
   assert.equal(statusIndicatorsSrc.includes("onMouseEnter"), true);
   assert.equal(statusIndicatorsSrc.includes("onTouchStart"), true);

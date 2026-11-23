@@ -84,6 +84,8 @@ export type SongOperationSnapshot = {
   keyShiftSemitones: number;
   masterVolume: number;
   playheadSec: number;
+  loopStartSec: number;
+  loopEndSec: number | null;
   stemChannels: StemChannel[];
 };
 
@@ -122,6 +124,9 @@ export type BandSong = {
   durationSec: number;
   status: TrackStatus;
   loop: boolean;
+  /** A/B 循環範圍；沒有有效 B 點時維持整首循環。 */
+  loopStartSec: number;
+  loopEndSec: number | null;
   muted?: boolean;
   selected: boolean;
   sourceAudioId: string;

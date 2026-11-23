@@ -18,7 +18,18 @@ export interface PlayOptions {
   offsetSec: number;
   playbackRate: number;
   loop: boolean;
+  /**
+   * 可選的絕對時間循環範圍。省略時維持整首循環；僅在 loop=true 時生效。
+   * Adapter 仍以原始音訊時間軸回報播放位置。
+   */
+  loopStartSec?: number;
+  loopEndSec?: number;
 }
+
+export type PlaybackLoopRange = {
+  startSec: number;
+  endSec: number;
+};
 
 export interface TrackPlaybackAdapter {
   readonly playbackMode: AdapterPlaybackMode;
@@ -53,8 +64,12 @@ export interface TrackPlaybackAdapter {
   /** 設定升降 Key 半音數；不支援的 adapter 維持原音高。 */
   setPitchSemitones(semitones: number, ctx: AudioContext): void;
 
-  /** 即時切換 loop；播放中生效。 */
-  setLoop(loop: boolean, onEnded: (() => void) | null): void;
+  /** 即時切換 loop 與其範圍；播放中生效。 */
+  setLoop(
+    loop: boolean,
+    onEnded: (() => void) | null,
+    loopRange?: PlaybackLoopRange | null,
+  ): void;
 
   /** 釋放所有資源。 */
   dispose(): void;

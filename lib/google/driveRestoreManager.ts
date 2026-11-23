@@ -9,7 +9,7 @@ import {
 } from "../audio/chunkedWavExporter.ts";
 import type { BandSong } from "../band/bandTypes.ts";
 import type { DeviceCapabilitiesSnapshot } from "../band/resourceGuard.ts";
-import { clampBpmValue, createBandSong, sanitizeSongSavedRates } from "../band/songModel.ts";
+import { clampBpmValue, createBandSong, normalizeSongLoopRange, sanitizeSongSavedRates } from "../band/songModel.ts";
 import type { FourStemPcm, StemSeparationMode } from "../separation/stemTypes.ts";
 import { validateAndPrepareResume } from "../separation/separationResumeController.ts";
 import { isValidationCompleted } from "../separation/separationStateRecovery.ts";
@@ -396,6 +396,7 @@ function buildRestoredBandSongFromManifest(params: {
     masterVolume: Math.max(0, Math.min(1, sessionPayload?.masterVolume ?? 1)),
     muted: Boolean(sessionPayload?.muted),
     loop: Boolean(sessionPayload?.loop),
+    ...normalizeSongLoopRange(base, sessionPayload?.loopStartSec, sessionPayload?.loopEndSec),
     // 無原曲時強制使用 stems，絕不切到無法播放的原曲
     playbackSource: params.sourceAudioMissing
       ? "stems"
@@ -676,6 +677,8 @@ export async function restoreSongFromDrive(params: {
       masterVolume: p.masterVolume,
       muted: p.muted,
       loop: p.loop,
+      loopStartSec: p.loopStartSec,
+      loopEndSec: p.loopEndSec,
       playbackSource: p.playbackSource,
       separationMode: p.separationMode,
       stemChannels: p.stemChannels.map((c) => ({ ...c })),

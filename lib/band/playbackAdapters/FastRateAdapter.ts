@@ -8,7 +8,7 @@
  * M2C 將新增 PitchPreserveAdapter 取代佔位版本。
  */
 
-import type { AdapterPlaybackMode, PlayOptions, TrackPlaybackAdapter } from "./types";
+import type { AdapterPlaybackMode, PlaybackLoopRange, PlayOptions, TrackPlaybackAdapter } from "./types";
 
 export class FastRateAdapter implements TrackPlaybackAdapter {
   readonly playbackMode: AdapterPlaybackMode = "fast-rate";
@@ -23,6 +23,8 @@ export class FastRateAdapter implements TrackPlaybackAdapter {
   private _pausedAt = 0;
   private _playbackRate = 1;
   private _loop = false;
+  private _loopStartSec = 0;
+  private _loopEndSec = 0;
   private _isPlaying = false;
 
   load(buffer: AudioBuffer, gainNode: GainNode, _ctx: AudioContext): void {
@@ -41,11 +43,16 @@ export class FastRateAdapter implements TrackPlaybackAdapter {
     this._loop = options.loop;
 
     const dur = this.buffer.duration;
-    const offset = dur > 0 ? ((options.offsetSec % dur) + dur) % dur : 0;
+    this._setLoopRange(options.loopStartSec, options.loopEndSec, dur);
+    const offset = this._normalizeOffset(options.offsetSec, dur);
 
     const src = (this.gainNode.context as AudioContext).createBufferSource();
     src.buffer = this.buffer;
     src.loop = this._loop;
+    if (this._loop && this._loopEndSec > this._loopStartSec) {
+      src.loopStart = this._loopStartSec;
+      src.loopEnd = this._loopEndSec;
+    }
     src.playbackRate.value = this._playbackRate;
     src.connect(this.gainNode);
     src.start(scheduleTime, offset);
@@ -72,7 +79,14 @@ export class FastRateAdapter implements TrackPlaybackAdapter {
     const raw = this.startAudioOffset + elapsed;
     const dur = this.buffer.duration;
     if (dur <= 0) return 0;
-    if (this._loop) return ((raw % dur) + dur) % dur;
+    if (this._loop) {
+      const loopStart = this._loopStartSec;
+      const loopEnd = this._loopEndSec > loopStart ? this._loopEndSec : dur;
+      const loopDuration = loopEnd - loopStart;
+      if (loopDuration > 0) {
+        return loopStart + (((raw - loopStart) % loopDuration) + loopDuration) % loopDuration;
+      }
+    }
     return Math.min(raw, dur);
   }
 
@@ -102,11 +116,16 @@ export class FastRateAdapter implements TrackPlaybackAdapter {
     // AudioBufferSourceNode 無法獨立變調；維持既有 fast-rate 行為。
   }
 
-  setLoop(loop: boolean, onEnded: (() => void) | null): void {
+  setLoop(loop: boolean, onEnded: (() => void) | null, loopRange?: PlaybackLoopRange | null): void {
     this._loop = loop;
     this.onEnded = onEnded;
+    this._setLoopRange(loopRange?.startSec, loopRange?.endSec, this.buffer?.duration ?? 0);
     if (this.source) {
       this.source.loop = loop;
+      if (loop && this._loopEndSec > this._loopStartSec) {
+        this.source.loopStart = this._loopStartSec;
+        this.source.loopEnd = this._loopEndSec;
+      }
       if (!loop) {
         const src = this.source;
         src.onended = () => {
@@ -136,5 +155,22 @@ export class FastRateAdapter implements TrackPlaybackAdapter {
     try { this.source.stop(); } catch { /* already stopped */ }
     try { this.source.disconnect(); } catch { /* already disconnected */ }
     this.source = null;
+  }
+
+  private _setLoopRange(startSec: number | undefined, endSec: number | undefined, duration: number): void {
+    const safeDuration = Math.max(0, duration);
+    const start = Number.isFinite(startSec) ? Math.max(0, Math.min(safeDuration, startSec!)) : 0;
+    const end = Number.isFinite(endSec) ? Math.max(start, Math.min(safeDuration, endSec!)) : safeDuration;
+    this._loopStartSec = start;
+    this._loopEndSec = end > start ? end : safeDuration;
+  }
+
+  private _normalizeOffset(offsetSec: number, duration: number): number {
+    if (duration <= 0) return 0;
+    if (this._loop && this._loopEndSec > this._loopStartSec) {
+      if (offsetSec < this._loopStartSec || offsetSec >= this._loopEndSec) return this._loopStartSec;
+      return offsetSec;
+    }
+    return ((offsetSec % duration) + duration) % duration;
   }
 }

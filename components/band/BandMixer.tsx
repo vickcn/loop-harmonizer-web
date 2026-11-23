@@ -10,8 +10,10 @@ import {
   createSeparationFocusSessionSnapshot,
   createSongOperationSnapshot,
   getEffectivePlaybackRate,
+  getSongLoopRange,
   getSongPlaybackTrackIds,
   getStemAudibility,
+  normalizeSongLoopRange,
   reorderSongList,
   restoreBandSongFromRecord,
   restoreSongsAfterSeparationFocus,
@@ -295,6 +297,8 @@ const FOCUS_BLOCKED_SONG_KEYS: ReadonlyArray<keyof BandSong> = [
   "keyShiftSemitones",
   "playbackSource",
   "loop",
+  "loopStartSec",
+  "loopEndSec",
   "masterVolume",
   "muted",
   "stemChannels",
@@ -979,12 +983,13 @@ export function BandMixer() {
     const engine = getEngine();
     const allIds = [song.sourceAudioId, ...song.stemIds];
     const rate = getEffectivePlaybackRate(song);
+    const loopRange = getSongLoopRange(song);
     allIds.forEach((id) => {
       engine.setPlaybackRate(id, rate);
       engine.setPitchSemitones(id, song.keyShiftSemitones);
     });
-    engine.setLoop(song.sourceAudioId, song.loop);
-    engine.setLoopGroup(song.stemIds, song.loop);
+    engine.setLoop(song.sourceAudioId, song.loop, loopRange);
+    engine.setLoopGroup(song.stemIds, song.loop, loopRange);
     const isSongMuted = Boolean(song.muted);
     engine.setVolume(song.sourceAudioId, song.masterVolume);
     engine.setMuted(song.sourceAudioId, isSongMuted);
@@ -1013,9 +1018,14 @@ export function BandMixer() {
       });
     }
 
-    if (prevSong.loop !== nextSong.loop) {
-      engine.setLoop(nextSong.sourceAudioId, nextSong.loop);
-      engine.setLoopGroup(nextSong.stemIds, nextSong.loop);
+    const previousLoopRange = getSongLoopRange(prevSong);
+    const nextLoopRange = getSongLoopRange(nextSong);
+    const loopRangeChanged =
+      previousLoopRange?.startSec !== nextLoopRange?.startSec ||
+      previousLoopRange?.endSec !== nextLoopRange?.endSec;
+    if (prevSong.loop !== nextSong.loop || loopRangeChanged) {
+      engine.setLoop(nextSong.sourceAudioId, nextSong.loop, nextLoopRange);
+      engine.setLoopGroup(nextSong.stemIds, nextSong.loop, nextLoopRange);
     }
 
     if (prevSong.masterVolume !== nextSong.masterVolume) {
@@ -2688,6 +2698,8 @@ export function BandMixer() {
             savedRates: syncedBase.savedRates,
             muted: syncedBase.muted,
             loop: syncedBase.loop,
+            loopStartSec: syncedBase.loopStartSec,
+            loopEndSec: syncedBase.loopEndSec,
             playheadSec:
               latestLocal.status === "playing"
                 ? latestLocal.playheadSec
@@ -3011,7 +3023,13 @@ export function BandMixer() {
       if ("originalBpm" in normalized) normalized.originalBpm = clampBpm(normalized.originalBpm ?? song.originalBpm);
       if ("targetBpm" in normalized) normalized.targetBpm = clampBpm(normalized.targetBpm ?? song.targetBpm);
       if ("keyShiftSemitones" in normalized) normalized.keyShiftSemitones = Math.max(-12, Math.min(12, Math.round(normalized.keyShiftSemitones ?? 0)));
-      const next = { ...song, ...normalized };
+      let next: BandSong = { ...song, ...normalized };
+      if ("loopStartSec" in normalized || "loopEndSec" in normalized || "durationSec" in normalized) {
+        next = {
+          ...next,
+          ...normalizeSongLoopRange(next, next.loopStartSec, next.loopEndSec),
+        };
+      }
       applySongAudioPatch(song, next);
       shouldPersist = activeProjectRecordRef.current
         ? !isTransientPlaybackOnlyPatch
@@ -3180,6 +3198,7 @@ export function BandMixer() {
             fineRateOffset: Math.max(-0.05, Math.min(0.05, saved.fineRateOffset)),
             savedRates: restoredRates,
             loop: saved.loop,
+            ...normalizeSongLoopRange(baseSong, saved.loopStartSec, saved.loopEndSec),
             separationMode: saved.separationMode ?? null,
           }
         : baseSong;
@@ -7739,7 +7758,7 @@ export function BandMixer() {
         onOpenConflict={() => openProjectModal("conflict")}
         onReauthorizeSync={() => void handleReauthorizeAndSync()}
       />
-      <div className="card row mixer-upload">
+      <section className="card row mixer-upload" aria-label="載入歌曲與工作區工具">
         <button
           type="button"
           className={`btn mixer-button primary${loading ? " is-loading" : ""}`}
@@ -7910,7 +7929,7 @@ export function BandMixer() {
             <span>{uploadError}</span>
           </div>
         )}
-      </div>
+      </section>
 
       {restoringSession && (
         <div role="status" aria-live="polite" className="card mixer-restore-banner">
@@ -8213,7 +8232,7 @@ export function BandMixer() {
       )}
 
       {session.songs.length > 0 && (
-        <div className={`card row mixer-bulk-controls${hasSelectedSongs ? " is-selected" : ""}`} style={{ gap: 8, flexWrap: "wrap", alignItems: "center", paddingBlock: 10 }}>
+        <section className={`card row mixer-bulk-controls${hasSelectedSongs ? " is-selected" : ""}`} aria-label="批次播放控制" style={{ gap: 8, flexWrap: "wrap", alignItems: "center", paddingBlock: 10 }}>
           <strong style={{ fontSize: 13 }}>批次播放</strong>
           <span className="small selected-song-count" style={{ opacity: selectedSongs.length ? 0.9 : 0.65 }}>已選 {selectedSongs.length} 首</span>
           <IconActionButton
@@ -8305,7 +8324,7 @@ export function BandMixer() {
           >
             清除選取
           </button>
-        </div>
+        </section>
       )}
 
       {session.songs.length === 0 ? (
@@ -8337,6 +8356,7 @@ export function BandMixer() {
             >
               <SongCard
                 song={song}
+                waveformPeaks={engineRef.current?.getTrackWaveformPeaks(song.sourceAudioId, 128) ?? undefined}
                 collapsed={collapsedIds.has(song.id)}
                 isDragging={draggingId === song.id}
                 isActive={selection.songId === song.id}

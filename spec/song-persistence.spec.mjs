@@ -36,6 +36,8 @@ test("serializePersistedSong and restoreBandSongFromRecord round-trip settings w
   song.masterVolume = 0.72;
   song.muted = true;
   song.loop = true;
+  song.loopStartSec = 42;
+  song.loopEndSec = 68;
   song.status = "playing";
   song.playheadSec = 65.4;
   song.playbackSource = "stems";
@@ -74,6 +76,8 @@ test("serializePersistedSong and restoreBandSongFromRecord round-trip settings w
   assert.equal(restored.masterVolume, 0.72);
   assert.equal(restored.muted, true);
   assert.equal(restored.loop, true);
+  assert.equal(restored.loopStartSec, 42);
+  assert.equal(restored.loopEndSec, 68);
   assert.equal(restored.playheadSec, 65.4);
   assert.equal(restored.separationMode, "four_stem");
   assert.equal(restored.cacheKey, record.cacheKey);

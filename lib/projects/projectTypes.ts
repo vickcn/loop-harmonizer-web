@@ -116,6 +116,9 @@ export type ProjectSongSettings = {
   masterVolume: number;
   muted: boolean;
   loop: boolean;
+  /** 舊版專案未設定時沿用整首循環。 */
+  loopStartSec?: number;
+  loopEndSec?: number | null;
   playbackSource: SongPlaybackSource;
   separationMode: StemSeparationMode | null;
   stemChannels: Array<{

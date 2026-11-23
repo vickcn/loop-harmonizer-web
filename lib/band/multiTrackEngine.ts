@@ -20,7 +20,7 @@ import {
   type ChunkMixStemRole,
   type ChunkMixTrackEntry,
 } from "./playbackAdapters/ChunkPlaybackAdapter";
-import type { TrackPlaybackAdapter } from "./playbackAdapters/types";
+import type { PlaybackLoopRange, TrackPlaybackAdapter } from "./playbackAdapters/types";
 import { createAudioBufferFromStem } from "@/lib/separation/audioBuffer";
 import type { StereoPcm } from "@/lib/separation/stemTypes";
 
@@ -96,6 +96,7 @@ type StemMixBus = {
   playbackRate: number;
   keyShiftSemitones: number;
   loop: boolean;
+  loopRange: PlaybackLoopRange | null;
 };
 
 type InternalTrack = {
@@ -108,9 +109,31 @@ type InternalTrack = {
   volume: number;
   muted: boolean;
   loop: boolean;
+  loopRange: PlaybackLoopRange | null;
   playbackMode: EnginePlaybackMode;
   keyShiftSemitones: number;
 };
+
+function normalizeLoopRange(
+  range: PlaybackLoopRange | null | undefined,
+  duration: number,
+): PlaybackLoopRange | null {
+  if (!range || !Number.isFinite(range.startSec) || !Number.isFinite(range.endSec) || duration <= 0) {
+    return null;
+  }
+  const startSec = Math.max(0, Math.min(duration, range.startSec));
+  const endSec = Math.max(startSec, Math.min(duration, range.endSec));
+  return endSec - startSec >= 0.05 ? { startSec, endSec } : null;
+}
+
+function sameLoopRange(a: PlaybackLoopRange | null, b: PlaybackLoopRange | null): boolean {
+  return a?.startSec === b?.startSec && a?.endSec === b?.endSec;
+}
+
+function clampLoopPosition(position: number, range: PlaybackLoopRange | null): number {
+  if (!range) return Math.max(0, position);
+  return position < range.startSec || position >= range.endSec ? range.startSec : position;
+}
 
 function createAdapter(mode: EnginePlaybackMode): TrackPlaybackAdapter {
   if (mode === "pitch-preserve") {
@@ -125,6 +148,7 @@ function createAdapter(mode: EnginePlaybackMode): TrackPlaybackAdapter {
 export class MultiTrackEngine {
   private ctx: AudioContext | null = null;
   private tracks = new Map<string, InternalTrack>();
+  private waveformPeaksCache = new Map<string, Map<number, readonly number[]>>();
   private loopGroups = new Map<string, string[]>();
   private stemMixBuses = new Map<string, StemMixBus>();
   private trackToMixGroup = new Map<string, string>();
@@ -179,6 +203,7 @@ export class MultiTrackEngine {
       existing.adapter.dispose();
       try { existing.gainNode.disconnect(); } catch { /* ok */ }
     }
+    this.waveformPeaksCache.delete(trackId);
 
     const gainNode = ctx.createGain();
     gainNode.gain.value = 1;
@@ -197,6 +222,7 @@ export class MultiTrackEngine {
       volume: 1,
       muted: false,
       loop: false,
+      loopRange: null,
       playbackMode,
       keyShiftSemitones: 0,
     });
@@ -262,6 +288,7 @@ export class MultiTrackEngine {
       playbackRate: firstTrack.playbackRate,
       keyShiftSemitones: firstTrack.keyShiftSemitones,
       loop: false,
+      loopRange: null,
     };
     this.stemMixBuses.set(groupId, bus);
   }
@@ -326,6 +353,7 @@ export class MultiTrackEngine {
         volume: entry.gain,
         muted: entry.muted,
         loop: Boolean(params.loop),
+        loopRange: null,
         playbackMode: "soundtouch",
         keyShiftSemitones: initialPitch,
       });
@@ -362,6 +390,7 @@ export class MultiTrackEngine {
       playbackRate: initialRate,
       keyShiftSemitones: initialPitch,
       loop: Boolean(params.loop),
+      loopRange: null,
     };
     this.stemMixBuses.set(params.groupId, bus);
     return chunkedBuffer.duration;
@@ -377,6 +406,40 @@ export class MultiTrackEngine {
 
   hasTrack(trackId: string): boolean {
     return this.tracks.has(trackId);
+  }
+
+  /**
+   * 從引擎已持有的 AudioBuffer 產生輕量波形峰值。
+   * 每個桶只抽樣固定數量的 PCM，不複製整份音訊；結果依 trackId / bucketCount 快取。
+   */
+  getTrackWaveformPeaks(trackId: string, bucketCount = 128): readonly number[] | null {
+    const track = this.tracks.get(trackId);
+    const buffer = track?.buffer;
+    if (!buffer || buffer.length <= 0) return null;
+    const buckets = Math.max(32, Math.min(256, Math.round(bucketCount)));
+    const cached = this.waveformPeaksCache.get(trackId)?.get(buckets);
+    if (cached) return cached;
+
+    const channelCount = Math.max(1, Math.min(2, buffer.numberOfChannels));
+    const channels = Array.from({ length: channelCount }, (_, index) => buffer.getChannelData(index));
+    const framesPerBucket = Math.max(1, Math.ceil(buffer.length / buckets));
+    const peaks = Array.from({ length: buckets }, (_, bucketIndex) => {
+      const start = bucketIndex * framesPerBucket;
+      const end = Math.min(buffer.length, start + framesPerBucket);
+      const sampleStep = Math.max(1, Math.floor((end - start) / 48));
+      let peak = 0;
+      for (let frame = start; frame < end; frame += sampleStep) {
+        for (const channel of channels) {
+          const value = Math.abs(channel[frame] ?? 0);
+          if (value > peak) peak = value;
+        }
+      }
+      return Math.max(0.035, Math.min(1, Math.sqrt(peak)));
+    });
+    const byBucket = this.waveformPeaksCache.get(trackId) ?? new Map<number, readonly number[]>();
+    byBucket.set(buckets, peaks);
+    this.waveformPeaksCache.set(trackId, byBucket);
+    return peaks;
   }
 
   hasHealthyStemMixBus(groupId: string): boolean {
@@ -599,6 +662,7 @@ export class MultiTrackEngine {
     track.adapter.dispose();
     try { track.gainNode.disconnect(); } catch { /* already disconnected */ }
     this.tracks.delete(trackId);
+    this.waveformPeaksCache.delete(trackId);
     this.loopGroups.delete(trackId);
   }
 
@@ -625,10 +689,10 @@ export class MultiTrackEngine {
     const { buses, standalone } = this._resolvePlaybackTargets(trackIds);
 
     for (const bus of buses) {
-      bus.pausedAt = offset;
+      bus.pausedAt = clampLoopPosition(offset, bus.loop ? bus.loopRange : null);
       for (const id of bus.trackIds) {
         const member = this.tracks.get(id);
-        if (member) member.pausedAt = offset;
+        if (member) member.pausedAt = bus.pausedAt;
       }
       if (bus.chunkedBuffer) {
         void bus.chunkedBuffer.warmUpAroundSample(
@@ -638,7 +702,9 @@ export class MultiTrackEngine {
       if (bus.isPlaying) this._startMixBusAt(bus, ctx.currentTime);
     }
 
-    for (const { track } of standalone) track.pausedAt = offset;
+    for (const { track } of standalone) {
+      track.pausedAt = clampLoopPosition(offset, track.loop ? track.loopRange : null);
+    }
     const scheduleTime = standalone.every(({ track }) => track.playbackMode === "soundtouch")
       ? ctx.currentTime
       : ctx.currentTime + 0.02;
@@ -655,10 +721,10 @@ export class MultiTrackEngine {
       ...buses.map(async (bus) => {
         const duration = bus.chunkedBuffer?.duration ?? this.tracks.get(bus.trackIds[0])?.buffer?.duration ?? 0;
         if (duration > 0.5 && bus.pausedAt >= duration - 0.4) {
-          bus.pausedAt = 0;
+          bus.pausedAt = bus.loop ? (bus.loopRange?.startSec ?? 0) : 0;
           for (const id of bus.trackIds) {
             const member = this.tracks.get(id);
-            if (member) member.pausedAt = 0;
+            if (member) member.pausedAt = bus.pausedAt;
           }
         }
         if (bus.chunkedBuffer) {
@@ -758,16 +824,25 @@ export class MultiTrackEngine {
     }
   }
 
-  setLoop(trackId: string, loop: boolean): void {
+  setLoop(trackId: string, loop: boolean, loopRange?: PlaybackLoopRange | null): void {
     const t = this.tracks.get(trackId);
     if (!t) return;
+    const nextRange = normalizeLoopRange(loopRange, t.buffer?.duration ?? 0);
+    const rangeChanged = !sameLoopRange(t.loopRange, nextRange);
+    const loopChanged = t.loop !== loop;
+    const currentPosition = t.isPlaying && this.ctx ? t.adapter.getPosition(this.ctx) : t.pausedAt;
     t.loop = loop;
+    t.loopRange = nextRange;
     const onEnded = loop ? null : () => this._handleTrackEnded(trackId);
-    t.adapter.setLoop(loop, onEnded);
+    t.adapter.setLoop(loop, onEnded, nextRange);
+    if ((rangeChanged || (loopChanged && loop && nextRange !== null)) && t.isPlaying && this.ctx) {
+      t.pausedAt = clampLoopPosition(currentPosition, loop ? nextRange : null);
+      this._startAt(t, trackId, this.ctx.currentTime + 0.01);
+    }
   }
 
   /** Stem 群組改用單一 StemMixBus 原生循環，無跨軌漂移；若未綁定 mixBus 則保留舊有群組重播機制。 */
-  setLoopGroup(trackIds: string[], loop: boolean): void {
+  setLoopGroup(trackIds: string[], loop: boolean, loopRange?: PlaybackLoopRange | null): void {
     const handledGroups = new Set<string>();
     for (const trackId of trackIds) {
       const groupId = this.trackToMixGroup.get(trackId);
@@ -776,9 +851,19 @@ export class MultiTrackEngine {
           handledGroups.add(groupId);
           const bus = this.stemMixBuses.get(groupId);
           if (bus) {
+            const duration = bus.chunkedBuffer?.duration ?? this.tracks.get(bus.trackIds[0])?.buffer?.duration ?? 0;
+            const nextRange = normalizeLoopRange(loopRange, duration);
+            const rangeChanged = !sameLoopRange(bus.loopRange, nextRange);
+            const loopChanged = bus.loop !== loop;
+            const currentPosition = bus.isPlaying && this.ctx ? bus.adapter.getPosition(this.ctx) : bus.pausedAt;
             bus.loop = loop;
-            bus.chunkedBuffer?.setLoopEnabled(loop);
-            bus.adapter.setLoop(loop, loop ? null : () => this._handleMixBusEnded(bus));
+            bus.loopRange = nextRange;
+            bus.chunkedBuffer?.setLoopEnabled(loop, nextRange?.startSec);
+            bus.adapter.setLoop(loop, loop ? null : () => this._handleMixBusEnded(bus), nextRange);
+            if ((rangeChanged || (loopChanged && loop && nextRange !== null)) && bus.isPlaying && this.ctx) {
+              bus.pausedAt = clampLoopPosition(currentPosition, loop ? nextRange : null);
+              this._startMixBusAt(bus, this.ctx.currentTime + 0.01);
+            }
           }
         }
         continue;
@@ -788,7 +873,8 @@ export class MultiTrackEngine {
       const track = this.tracks.get(trackId);
       if (!track) continue;
       track.loop = false;
-      track.adapter.setLoop(false, () => this._handleTrackEnded(trackId));
+      track.loopRange = normalizeLoopRange(loopRange, track.buffer?.duration ?? 0);
+      track.adapter.setLoop(false, () => this._handleTrackEnded(trackId), track.loopRange);
     }
   }
 
@@ -938,6 +1024,7 @@ export class MultiTrackEngine {
       try { t.gainNode.disconnect(); } catch { /* ok */ }
     }
     this.tracks.clear();
+    this.waveformPeaksCache.clear();
     this.loopGroups.clear();
     this.trackToMixGroup.clear();
     if (this.ctx && this.ctx.state !== "closed") {
@@ -989,13 +1076,15 @@ export class MultiTrackEngine {
     const ctx = this.ctx;
     const duration = bus.chunkedBuffer?.duration ?? this.tracks.get(bus.trackIds[0])?.buffer?.duration ?? 0;
     if (duration > 0.5 && bus.pausedAt >= duration - 0.4) {
-      bus.pausedAt = 0;
+      bus.pausedAt = bus.loop ? (bus.loopRange?.startSec ?? 0) : 0;
       for (const id of bus.trackIds) {
         const member = this.tracks.get(id);
-        if (member) member.pausedAt = 0;
+        if (member) member.pausedAt = bus.pausedAt;
       }
       if (bus.chunkedBuffer) {
-        void bus.chunkedBuffer.warmUpAroundSample(0);
+        void bus.chunkedBuffer.warmUpAroundSample(
+          Math.floor(bus.pausedAt * bus.chunkedBuffer.sampleRate),
+        );
       }
     }
     if (ctx) {
@@ -1008,6 +1097,8 @@ export class MultiTrackEngine {
       offsetSec: bus.pausedAt,
       playbackRate: bus.playbackRate,
       loop: bus.loop,
+      loopStartSec: bus.loopRange?.startSec,
+      loopEndSec: bus.loopRange?.endSec,
     });
     bus.isPlaying = true;
     for (const id of bus.trackIds) {
@@ -1035,8 +1126,9 @@ export class MultiTrackEngine {
     const ctx = this.ctx;
     const duration = t.buffer?.duration ?? 0;
     if (duration > 0.5 && t.pausedAt >= duration - 0.4) {
-      t.pausedAt = 0;
+      t.pausedAt = t.loop ? (t.loopRange?.startSec ?? 0) : 0;
     }
+    t.pausedAt = clampLoopPosition(t.pausedAt, t.loop ? t.loopRange : null);
     const targetGain = t.muted ? 0 : t.volume;
     if (ctx) {
       t.gainNode.gain.cancelScheduledValues(ctx.currentTime);
@@ -1048,6 +1140,8 @@ export class MultiTrackEngine {
       offsetSec: t.pausedAt,
       playbackRate: t.playbackRate,
       loop: t.loop,
+      loopStartSec: t.loopRange?.startSec,
+      loopEndSec: t.loopRange?.endSec,
     });
     t.isPlaying = true;
   }

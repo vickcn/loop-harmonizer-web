@@ -49,6 +49,8 @@ export type PersistedSongRecord = {
   masterVolume: number;
   muted: boolean;
   loop: boolean;
+  loopStartSec?: number;
+  loopEndSec?: number | null;
   selected: boolean;
   playheadSec: number;
   playbackSource: SongPlaybackSource;
@@ -128,6 +130,8 @@ export function createBandSong(input: CreateBandSongInput): BandSong {
     durationSec: input.durationSec ?? 0,
     status: "stopped",
     loop: false,
+    loopStartSec: 0,
+    loopEndSec: null,
     muted: false,
     selected: false,
     sourceAudioId: input.sourceAudioId,
@@ -170,6 +174,41 @@ export function getEffectivePlaybackRate(song: Pick<BandSong,
   return Math.max(0.25, Math.min(4, coarse + song.fineRateOffset));
 }
 
+export type SongLoopRange = {
+  startSec: number;
+  endSec: number;
+};
+
+export const MIN_LOOP_REGION_SECONDS = 0.25;
+
+/**
+ * 將使用者設定的 A/B 點限制在歌曲實際長度內。沒有有效 B 點時回傳 null，
+ * 呼叫端應保留既有的整首循環語意。
+ */
+export function getSongLoopRange(
+  song: Pick<BandSong, "durationSec" | "loopStartSec" | "loopEndSec">,
+): SongLoopRange | null {
+  const duration = Math.max(0, Number.isFinite(song.durationSec) ? song.durationSec : 0);
+  if (!Number.isFinite(song.loopEndSec) || duration <= 0) return null;
+  const startSec = Math.max(0, Math.min(duration, Number.isFinite(song.loopStartSec) ? song.loopStartSec : 0));
+  const endSec = Math.max(startSec, Math.min(duration, song.loopEndSec!));
+  return endSec - startSec >= MIN_LOOP_REGION_SECONDS ? { startSec, endSec } : null;
+}
+
+export function normalizeSongLoopRange(
+  song: Pick<BandSong, "durationSec">,
+  loopStartSec: number | null | undefined,
+  loopEndSec: number | null | undefined,
+): Pick<BandSong, "loopStartSec" | "loopEndSec"> {
+  const duration = Math.max(0, Number.isFinite(song.durationSec) ? song.durationSec : 0);
+  const startSec = Math.max(0, Math.min(duration || Number.MAX_SAFE_INTEGER, Number.isFinite(loopStartSec) ? loopStartSec! : 0));
+  if (!Number.isFinite(loopEndSec)) return { loopStartSec: startSec, loopEndSec: null };
+  const endSec = Math.max(startSec, Math.min(duration || Number.MAX_SAFE_INTEGER, loopEndSec!));
+  return endSec - startSec >= MIN_LOOP_REGION_SECONDS
+    ? { loopStartSec: startSec, loopEndSec: endSec }
+    : { loopStartSec: startSec, loopEndSec: null };
+}
+
 export function getSongPlaybackTrackIds(song: Pick<BandSong, "playbackSource" | "sourceAudioId" | "stemIds">): string[] {
   return song.playbackSource === "stems" && song.stemIds.length > 0
     ? [...song.stemIds]
@@ -195,6 +234,8 @@ export function serializeSongSettings(song: BandSong) {
     fineRateOffset: song.fineRateOffset,
     savedRates: [...song.savedRates],
     loop: song.loop,
+    loopStartSec: song.loopStartSec,
+    loopEndSec: song.loopEndSec,
     separationMode: song.separationMode,
     stemVolumes: Object.fromEntries(song.stemChannels.map((channel) => [channel.stemType, channel.volume])),
     stemMuted: Object.fromEntries(song.stemChannels.map((channel) => [channel.stemType, channel.muted])),
@@ -260,6 +301,7 @@ export function serializePersistedSong(
     masterVolume: Math.max(0, Math.min(1, Number.isFinite(song.masterVolume) ? song.masterVolume : 1)),
     muted: Boolean(song.muted),
     loop: Boolean(song.loop),
+    ...normalizeSongLoopRange(song, song.loopStartSec, song.loopEndSec),
     selected: Boolean(song.selected),
     playheadSec: Math.max(0, Number.isFinite(song.playheadSec) ? song.playheadSec : 0),
     playbackSource: song.playbackSource === "stems" ? "stems" : "original",
@@ -306,6 +348,11 @@ export function restoreBandSongFromRecord(
   const duration = options?.durationSec ?? record.durationSec ?? 0;
   const maxPlayhead = duration > 0 ? duration : Math.max(0, record.playheadSec || 0);
   const clampedPlayhead = Math.max(0, Math.min(maxPlayhead, Number.isFinite(record.playheadSec) ? record.playheadSec : 0));
+  const loopRange = normalizeSongLoopRange(
+    { durationSec: duration },
+    record.loopStartSec,
+    record.loopEndSec,
+  );
   const song = createBandSong({
     id: record.songId,
     name: record.name,
@@ -350,6 +397,7 @@ export function restoreBandSongFromRecord(
     masterVolume: Math.max(0, Math.min(1, Number.isFinite(record.masterVolume) ? record.masterVolume : 1)),
     muted: Boolean(record.muted),
     loop: Boolean(record.loop),
+    ...loopRange,
     selected: Boolean(record.selected),
     playheadSec: clampedPlayhead,
     // 恢復工作階段後絕不自動播放
@@ -424,6 +472,8 @@ export function createSongOperationSnapshot(
     keyShiftSemitones: song.keyShiftSemitones,
     masterVolume: song.masterVolume,
     playheadSec: song.playheadSec,
+    loopStartSec: song.loopStartSec,
+    loopEndSec: song.loopEndSec,
     stemChannels: song.stemChannels.map((ch) => ({ ...ch })),
   };
 }
@@ -448,6 +498,8 @@ export function applySongOperationSnapshot(
     keyShiftSemitones: snapshot.keyShiftSemitones,
     masterVolume: snapshot.masterVolume,
     playheadSec: snapshot.playheadSec,
+    loopStartSec: snapshot.loopStartSec,
+    loopEndSec: snapshot.loopEndSec,
     stemChannels: snapshot.stemChannels.map((ch) => ({ ...ch })),
     separationProgress: 0,
     separationStage: "idle",
