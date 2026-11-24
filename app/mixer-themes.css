@@ -1,5 +1,10 @@
 html[data-mixer-theme] {
   color-scheme: dark;
+  --font-cjk: "PingFang TC", "Microsoft JhengHei", "Noto Sans TC", sans-serif;
+  --font-brand: var(--font-space-grotesk), var(--font-cjk);
+  --font-heading: var(--font-space-grotesk), var(--font-cjk);
+  --font-interface: var(--font-manrope), var(--font-cjk);
+  --font-numeric: var(--font-manrope), var(--font-cjk);
   --surface-page: #151719;
   --surface-section: #1b1e22;
   --surface-card: #22262b;
@@ -20,6 +25,46 @@ html[data-mixer-theme] {
   --waveform-loop-label-background: #253142;
   --waveform-focus-ring: #5cbcff;
 }
+.band-mixer-page {
+  --font-cjk: "PingFang TC", "Microsoft JhengHei", "Noto Sans TC", sans-serif;
+  --font-brand: var(--font-space-grotesk), var(--font-cjk);
+  --font-heading: var(--font-space-grotesk), var(--font-cjk);
+  --font-interface: var(--font-manrope), var(--font-cjk);
+  --font-numeric: var(--font-manrope), var(--font-cjk);
+  font-family: var(--font-interface);
+}
+.mixer-brand-name {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--accent);
+  font-family: var(--font-brand);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.band-mixer-page .title,
+html[data-mixer-theme] :is(.project-name-text, .song-card-title-copy strong, .mixer-modal-header h2, .song-separation-panel-heading strong) {
+  font-family: var(--font-heading);
+  font-weight: 650;
+}
+.band-mixer-page :is(button, input, select, .action-tooltip),
+html[data-mixer-theme] :is(.mixer-modal-panel, .google-account-menu, .action-tooltip) {
+  font-family: var(--font-interface);
+}
+.band-mixer-page :is(.track-playhead-time-row, .track-loop-time-summary, .song-performance-summary-value, .manual-rate-input, .song-advanced-tempo, .stem-row-pct, .project-meta-line, .selected-song-count, .song-volume),
+html[data-mixer-theme] :is(.mixer-modal-panel input[type="number"], .background-separation-copy) {
+  font-family: var(--font-numeric);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+.band-mixer-page :is(.section-kicker, .project-identity::before) {
+  font-family: var(--font-brand);
+  font-weight: 700;
+}
+.band-mixer-page .project-name-text { min-width: 0; }
+.band-mixer-page .song-card-title-copy strong { font-weight: 600; }
+.band-mixer-page :is(.manual-rate-input .input, .key-stepper + .input) { font-variant-numeric: tabular-nums; }
 html[data-mixer-theme="daylight"] {
   color-scheme: light;
   --surface-page: #f3f2ee;

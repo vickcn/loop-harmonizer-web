@@ -6,15 +6,20 @@ import { readMixerTheme, saveMixerTheme, type MixerTheme } from "@/lib/band/mixe
 type Theme = MixerTheme;
 
 /** Device preference only: deliberately independent of song/project stores. */
-export function MixerAppearance() {
+export function MixerAppearance({ fontVariableClasses = "" }: { fontVariableClasses?: string }) {
   const [theme, setTheme] = useState<Theme>("graphite");
   useLayoutEffect(() => {
+    const fontClasses = fontVariableClasses.split(/\s+/).filter(Boolean);
+    document.documentElement.classList.add(...fontClasses);
     let saved: Theme = "graphite";
     try { saved = readMixerTheme(localStorage); } catch {}
     document.documentElement.dataset.mixerTheme = saved;
     setTheme(saved);
-    return () => { delete document.documentElement.dataset.mixerTheme; };
-  }, []);
+    return () => {
+      delete document.documentElement.dataset.mixerTheme;
+      document.documentElement.classList.remove(...fontClasses);
+    };
+  }, [fontVariableClasses]);
   const select = (next: Theme) => {
     document.documentElement.dataset.mixerTheme = next;
     setTheme(next);

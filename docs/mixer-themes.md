@@ -1,5 +1,7 @@
 # Band Mixer 雙主題
 
+英文字型層級與資源量測另見 `docs/mixer-fonts.md`。
+
 外觀控制由 MixerAppearance 獨立管理，裝置偏好儲存於 localStorage 的
 `loop.band-mixer.appearance`。預設 graphite，無效值與儲存讀取錯誤回退 graphite。
 元件離開路由時移除 html 的 data-mixer-theme；CSS 均以該屬性限定作用域，

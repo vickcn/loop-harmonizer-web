@@ -16,7 +16,7 @@
   2. 目的
   3. 風險
 - 保持可部署（零雲端音訊成本，所有音訊運算均在瀏覽器本機端執行）
-- 測試驗證：修改核心邏輯前後必須執行 `npm test`，確保 192 項單元測試全數通過；同時執行 `npx tsc --noEmit` 確保型別零錯誤
+- 測試驗證：修改核心邏輯前後必須執行 `npm test`，以實際測試總數全數通過為準；同時執行 `npx tsc --noEmit` 確保型別零錯誤
 - 開發防護：嚴禁在 `npm run dev` 啟動期間執行 `npm run build`，以避免 Webpack runtime 與 `.next` 快取衝突產生 `a[d] is not a function` 錯誤
 
 ## 腳本與環境注意
@@ -120,4 +120,4 @@
 - 測試指令：`npm test`
   （實質執行：`spec/` 下包含 demucs、stem-sync、song-mixer、project-manager、project-drive-sync、project-toolbar 等完整測試集）
 - 型別檢查：`npx tsc --noEmit`
-- 驗證標準：每次修改核心資料模型、混音邏輯、專案協調器或 UI 核心元件後，必須確保 **192 項單元測試全數通過** 且 **TypeScript 零型別錯誤**。
+- 驗證標準：每次修改核心資料模型、混音邏輯、專案協調器或 UI 核心元件後，必須確保 **實際 npm test 所列全部測試通過** 且 **TypeScript 零型別錯誤**。
