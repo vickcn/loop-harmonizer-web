@@ -204,7 +204,7 @@ export function StemSeparationDialog({ open, onClose, onAddStems }: Props) {
         <div className="grid" style={{ gap: 6, padding: 12, border: "1px solid var(--line)", borderRadius: 10 }}>
           <strong style={{ fontSize: 14 }}>執行環境</strong>
           <span className="small" style={{ opacity: 0.72 }}>{runtimeHint}</span>
-          <span className="small" style={{ color: "#f59e0b", opacity: 0.9 }}>
+          <span className="small" style={{ color: "var(--warning)", opacity: 0.9 }}>
             {isMobile ? "行動裝置通常不適合執行大型模型，建議改在桌面版瀏覽器處理。" : "分離時會占用較多記憶體與 GPU／CPU；請保持此分頁開啟。"}
           </span>
         </div>
@@ -217,7 +217,7 @@ export function StemSeparationDialog({ open, onClose, onAddStems }: Props) {
           <progress value={separationProgress} max={1} style={{ width: "100%" }} />
         </div>
 
-        {error && <div role="alert" style={{ color: "#f87171", fontSize: 14 }}>{error}</div>}
+        {error && <div role="alert" style={{ color: "var(--danger)", fontSize: 14 }}>{error}</div>}
 
         {resultSummary && result && (
           <div className="grid" style={{ gap: 10, padding: 12, border: "1px solid var(--accent)", borderRadius: 10 }}>

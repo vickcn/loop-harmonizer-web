@@ -13,6 +13,12 @@ type LoopPreview = { startSec: number; endSec: number };
 type DragMode = "playhead" | "loop-start" | "loop-end";
 type ActiveDrag = { pointerId: number; mode: DragMode };
 
+export const WaveformBars = memo(function WaveformBars({ peaks }: { peaks: readonly number[] }) {
+  return <div className="track-waveform-bars" aria-hidden="true">
+    {peaks.map((peak, index) => <span key={index} className="track-waveform-bar" style={{ height: `${Math.max(8, Math.min(100, peak * 100))}%` }} />)}
+  </div>;
+});
+
 type Props = {
   playheadSec: number;
   durationSec: number;
@@ -154,6 +160,7 @@ export const TrackPlayhead = memo(function TrackPlayhead({
         : 0;
     if (direction === 0) return;
     event.preventDefault();
+    event.stopPropagation();
     if (boundary === "start") {
       onSetLoopStart?.(Math.max(0, Math.min(persistedEnd - MIN_LOOP_RANGE_SECONDS, persistedStart + direction * step)));
     } else {
@@ -188,11 +195,7 @@ export const TrackPlayhead = memo(function TrackPlayhead({
         onFocus={() => onSelect?.()}
         onKeyDown={handlePlayheadKeyDown}
       >
-        <div className="track-waveform-bars" aria-hidden="true">
-          {displayedPeaks.map((peak, index) => (
-            <span key={index} className="track-waveform-bar" style={{ height: `${Math.max(8, Math.min(100, peak * 100))}%` }} />
-          ))}
-        </div>
+        <WaveformBars peaks={displayedPeaks} />
 
         {canConfigureLoop && <>
           <div className="track-loop-selection" style={{ left: `${loopStartPct}%`, right: `${100 - loopEndPct}%` }} aria-hidden="true" />

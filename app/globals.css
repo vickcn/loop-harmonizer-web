@@ -4,6 +4,7 @@
   --surface-section: #141824;
   --surface-card: #191d29;
   --surface-control: #222839;
+  --surface-2: var(--surface-control);
   --surface-elevated: #2a3144;
   --text-primary: #f4f4f5;
   --text-secondary: #cbd5e1;

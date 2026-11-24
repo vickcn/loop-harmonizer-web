@@ -13,8 +13,8 @@ type Props = {
 
 const STATUS_COLOR: Record<string, string> = {
   stopped: "var(--muted)",
-  playing: "#22c55e",
-  paused: "#f59e0b",
+  playing: "var(--success)",
+  paused: "var(--warning)",
 };
 
 const STATUS_LABEL: Record<string, string> = {
@@ -269,12 +269,12 @@ export function TrackCard({ track, onChange, collapsed = false, onToggleCollapse
           {track.loop ? "⟳ 循環" : "⟳ 單次"}
         </button>
         {track.playbackMode === "pitch-preserve" && (
-          <span className="small" style={{ color: "#f59e0b", opacity: 0.9 }}>
+          <span className="small" style={{ color: "var(--warning)", opacity: 0.9 }}>
             ⚠ 實驗功能：保音高變速（WSOLA），倍率限 0.5–1.8×；多軌不保證同步
           </span>
         )}
         {track.playbackMode === "soundtouch" && (
-          <span className="small" style={{ color: "#f59e0b", opacity: 0.9 }}>
+          <span className="small" style={{ color: "var(--warning)", opacity: 0.9 }}>
             ⚠ SoundTouch 使用舊式 ScriptProcessorNode；可同時變速與變調，但多軌無法保證樣本級同步
           </span>
         )}

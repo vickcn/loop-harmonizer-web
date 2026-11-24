@@ -284,7 +284,7 @@ export function ProjectManagerDialog(props: Props) {
         {busyMessage && (
           <div role="status" aria-live="polite" className="row mixer-modal-section" style={{ gap: 8, alignItems: "center" }}>
             <span className="mixer-spinner" aria-hidden="true" />
-            <span className="small" style={{ color: "#bae6fd", fontWeight: 600 }}>{busyMessage}</span>
+            <span className="small" style={{ color: "var(--cloud)", fontWeight: 600 }}>{busyMessage}</span>
           </div>
         )}
 
@@ -376,7 +376,7 @@ export function ProjectManagerDialog(props: Props) {
                   </div>
                 ) : props.projects.length === 0 && Boolean(props.cloudError) ? (
                   <>
-                    <p className="small" style={{ margin: 0, color: "#fde68a" }}>
+                    <p className="small" style={{ margin: 0, color: "var(--warning)" }}>
                       雲端專案清單讀取失敗，且目前沒有本機專案。
                     </p>
                     <button
@@ -473,7 +473,7 @@ export function ProjectManagerDialog(props: Props) {
                           type="button"
                           className="btn mixer-button"
                           disabled={isBusy}
-                          style={{ padding: "6px 10px", fontSize: 12, color: "#fca5a5" }}
+                          style={{ padding: "6px 10px", fontSize: 12, color: "var(--danger)" }}
                           onClick={() => props.onDeleteProjectEntry(entry)}
                         >
                           刪除
@@ -563,7 +563,7 @@ export function ProjectManagerDialog(props: Props) {
             {deleteActiveMeta?.visible && activeProject && (
               <div className="project-danger-section">
                 <div className="grid" style={{ gap: 2, minWidth: 0 }}>
-                  <strong style={{ fontSize: 13, color: "#fca5a5" }}>危險操作</strong>
+                  <strong style={{ fontSize: 13, color: "var(--danger)" }}>危險操作</strong>
                   <span className="small" style={{ opacity: 0.8 }}>
                     刪除「{activeProject.project.name}」將先開啟確認視窗，保留所有歌曲原曲與共用分軌成果。
                   </span>
@@ -572,7 +572,7 @@ export function ProjectManagerDialog(props: Props) {
                   type="button"
                   className="btn mixer-button"
                   disabled={deleteActiveMeta.disabled}
-                  style={{ color: "#fca5a5", borderColor: "rgba(248, 113, 113, 0.45)" }}
+                  style={{ color: "var(--danger)", borderColor: "rgba(248, 113, 113, 0.45)" }}
                   onClick={props.onDeleteActiveProject}
                 >
                   刪除目前專案
@@ -659,7 +659,7 @@ export function ProjectManagerDialog(props: Props) {
                   </span>
                   {(!props.isGoogleConfigured || !props.account) && (
                     <div className="row" style={{ gap: 8, marginTop: 4 }}>
-                      <span className="small" style={{ color: "#fde68a" }}>
+                      <span className="small" style={{ color: "var(--warning)" }}>
                         {!props.isGoogleConfigured ? "未設定 Google OAuth 環境變數" : "尚未登入 Google 帳號"}
                       </span>
                       {props.isGoogleConfigured && !props.account && (
@@ -793,7 +793,7 @@ export function ProjectManagerDialog(props: Props) {
                 <div className="row" style={{ justifyContent: "space-between", gap: 8 }}>
                   <div className="row" style={{ gap: 8, alignItems: "center" }}>
                     <span className="mixer-spinner" aria-hidden="true" />
-                    <span className="small" style={{ color: "#bae6fd" }}>{props.promoteProgress.message}</span>
+                    <span className="small" style={{ color: "var(--cloud)" }}>{props.promoteProgress.message}</span>
                   </div>
                   <button type="button" className="btn mixer-abort-button" style={{ minHeight: 32, padding: "4px 10px", fontSize: 12 }} onClick={props.onCancelPromote}>
                     取消
@@ -870,7 +870,7 @@ export function ProjectManagerDialog(props: Props) {
                 <div className="row" style={{ justifyContent: "space-between", gap: 8 }}>
                   <div className="row" style={{ gap: 8, alignItems: "center" }}>
                     <span className="mixer-spinner" aria-hidden="true" />
-                    <span className="small" style={{ color: "#bae6fd" }}>
+                    <span className="small" style={{ color: "var(--cloud)" }}>
                       ({props.offlineDownloadProgress.completedSongs}/{props.offlineDownloadProgress.totalSongs}) {props.offlineDownloadProgress.stageMessage}
                     </span>
                   </div>
@@ -952,7 +952,7 @@ export function ProjectManagerDialog(props: Props) {
               <div className="mixer-modal-section grid" style={{ gap: 4 }}>
                 <strong style={{ fontSize: 13 }}>Google Drive（雲端版本）</strong>
                 {activeProject.conflictInfo.kind === "remote_deleted" || !activeProject.conflictInfo.remoteProjectSnapshot ? (
-                  <span className="small" style={{ color: "#fca5a5" }}>遠端專案檔案已刪除或移至垃圾桶（不會自動重建）。</span>
+                  <span className="small" style={{ color: "var(--danger)" }}>遠端專案檔案已刪除或移至垃圾桶（不會自動重建）。</span>
                 ) : (
                   <>
                     <span className="small">雲端版本：v{activeProject.conflictInfo.remoteRevision}</span>

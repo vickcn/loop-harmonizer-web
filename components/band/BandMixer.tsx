@@ -7885,7 +7885,7 @@ export function BandMixer() {
           }}
         />
         {uploadStatus && (
-          <span role="status" aria-live="polite" className="small" style={{ color: "#38bdf8", width: "100%" }}>
+          <span role="status" aria-live="polite" className="small" style={{ color: "var(--focus-color)", width: "100%" }}>
             {uploadStatus}
           </span>
         )}
@@ -7905,7 +7905,7 @@ export function BandMixer() {
               <div className="row" style={{ justifyContent: "space-between", gap: 8 }}>
                 <div className="row" style={{ gap: 8, alignItems: "center" }}>
                   <span className="mixer-spinner" aria-hidden="true" />
-                  <span className="small" style={{ color: "#bae6fd" }}>
+                  <span className="small" style={{ color: "var(--cloud)" }}>
                     {`${stageLabel} (${driveImportProgress.fileIndex + 1}/${driveImportProgress.totalFiles})：${driveImportProgress.fileName}${pct !== null ? ` · ${pct}%` : ""}`}
                   </span>
                 </div>
@@ -7971,7 +7971,7 @@ export function BandMixer() {
                   <strong style={{ fontSize: 14 }}>
                     分離專注模式｜{separationFocus.songName}
                   </strong>
-                  <span className="small" style={{ color: "#e2e8f0" }}>
+                  <span className="small" style={{ color: "var(--text-secondary)" }}>
                     目前階段：{formatSeparationFocusStageLabel(separationFocus.stage)}
                     {pct !== null ? `（${pct}%）` : ""}
                   </span>
@@ -8018,12 +8018,12 @@ export function BandMixer() {
               </div>
             )}
 
-            <p className="small" style={{ margin: 0, color: "#cbd5e1" }}>
+            <p className="small" style={{ margin: 0, color: "var(--text-secondary)" }}>
               {separationFocus.message}
             </p>
 
             {isRunning && (
-              <p className="small" style={{ margin: 0, color: "#bae6fd" }}>
+              <p className="small" style={{ margin: 0, color: "var(--cloud)" }}>
                 已暫停音訊播放以降低資源負擔，並鎖定變速、升降 Key、匯出 WAV 與啟動新播放；原有設定與播放位置將於結束後完整保留（維持暫停，不會自動發聲）。
                 {separationFocus.pausedSongNames.length > 0
                   ? ` 已暫停：${separationFocus.pausedSongNames.join("、")}。`
@@ -8032,7 +8032,7 @@ export function BandMixer() {
             )}
 
             {separationFocus.diagnosticsSummary && (
-              <p className="small" style={{ margin: 0, color: "#94a3b8" }}>
+              <p className="small" style={{ margin: 0, color: "var(--text-muted)" }}>
                 效能診斷：{separationFocus.diagnosticsSummary}
               </p>
             )}
@@ -8064,7 +8064,7 @@ export function BandMixer() {
       )}
 
       {idleCleanupReport && (
-        <div role="status" aria-live="polite" className="card card-warning-banner" style={{ borderColor: "rgba(56, 189, 248, 0.35)", background: "rgba(56, 189, 248, 0.08)", color: "#e0f2fe" }}>
+        <div role="status" aria-live="polite" className="card card-warning-banner" style={{ borderColor: "rgba(56, 189, 248, 0.35)", background: "rgba(56, 189, 248, 0.08)", color: "var(--cloud)" }}>
           <span>{idleCleanupReport}</span>
           <button type="button" className="btn mixer-button" style={{ padding: "4px 10px", fontSize: 12 }} onClick={() => setIdleCleanupReport("")}>
             關閉
@@ -8223,7 +8223,7 @@ export function BandMixer() {
             </div>
           )}
           {storageActionMsg && (
-            <p role="status" className="small" style={{ color: "#38bdf8", marginTop: 8, marginBottom: 0 }}>
+            <p role="status" className="small" style={{ color: "var(--focus-color)", marginTop: 8, marginBottom: 0 }}>
               {storageActionMsg}
             </p>
           )}

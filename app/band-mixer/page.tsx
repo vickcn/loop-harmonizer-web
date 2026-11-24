@@ -1,4 +1,6 @@
 import Link from "next/link";
+import "../mixer-themes.css";
+import { MixerAppearance } from "@/components/band/MixerAppearance";
 import { BandMixer } from "@/components/band/BandMixer";
 
 export default function BandMixerPage() {
@@ -15,6 +17,7 @@ export default function BandMixerPage() {
         <p className="subtitle">每首歌獨立控制 BPM、Key、Loop 與分軌混音；音軌分離和播放處理都留在瀏覽器。</p>
       </header>
 
+      <MixerAppearance />
       <div className="col-full">
         <BandMixer />
       </div>

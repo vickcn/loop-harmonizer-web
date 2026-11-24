@@ -195,7 +195,7 @@ function DriveCloudUploadIcon() {
   );
 }
 
-const STATUS_COLOR = { stopped: "var(--muted)", playing: "#22c55e", paused: "#f59e0b" };
+const STATUS_COLOR = { stopped: "var(--muted)", playing: "var(--success)", paused: "var(--warning)" };
 const STATUS_LABEL = { stopped: "停止", playing: "播放中", paused: "暫停" };
 const MANUAL_RATE_MIN = 0.25;
 const MANUAL_RATE_MAX = 4;
@@ -367,7 +367,7 @@ export const SongCard = memo(function SongCard(props: Props) {
           role="status"
           aria-live="polite"
           className="card-warning-banner"
-          style={{ borderColor: "rgba(56, 189, 248, 0.45)", background: "rgba(56, 189, 248, 0.08)", color: "#bae6fd" }}
+          style={{ borderColor: "rgba(56, 189, 248, 0.45)", background: "rgba(56, 189, 248, 0.08)", color: "var(--cloud)" }}
         >
           <div className="row" style={{ gap: 8, alignItems: "center" }}>
             <span className="mixer-spinner" aria-hidden="true" />
@@ -960,7 +960,7 @@ export const SongCard = memo(function SongCard(props: Props) {
           {props.isStartingSeparation && !isSeparating && (
             <div className="row" role="status" aria-live="polite" style={{ gap: 8, alignItems: "center" }}>
               <span className="mixer-spinner" aria-hidden="true" />
-              <span className="small" style={{ color: "#38bdf8" }}>
+              <span className="small" style={{ color: "var(--focus-color)" }}>
                 正在準備音軌分離…
               </span>
             </div>
@@ -1001,15 +1001,15 @@ export const SongCard = memo(function SongCard(props: Props) {
                       {isCancelling ? "正在安全停止…" : (song.separationMessage || "處理中…")}
                     </span>
                     {totalChunks > 0 && (
-                      <span className="small" style={{ color: "#cbd5e1", fontVariantNumeric: "tabular-nums" }}>
+                      <span className="small" style={{ color: "var(--text-secondary)", fontVariantNumeric: "tabular-nums" }}>
                         {`第 ${completedChunks} / ${totalChunks} 段${pct !== null ? `（${pct}%）` : ""}｜本機已保存 ${committedMiB} MiB`}
                       </span>
                     )}
-                    <span className="small" style={{ color: "#94a3b8" }}>
+                    <span className="small" style={{ color: "var(--text-muted)" }}>
                       切換 App 或鎖定螢幕時將自動暫停，返回頁面後可從最近完成的段落接續。
                     </span>
                     {focusLocked && (
-                      <span className="small" style={{ color: "#bae6fd" }}>
+                      <span className="small" style={{ color: "var(--cloud)" }}>
                         音訊播放已暫停並鎖定高負載操作，以降低裝置資源負擔。
                       </span>
                     )}
@@ -1225,7 +1225,7 @@ export const SongCard = memo(function SongCard(props: Props) {
             <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap", minWidth: 0 }}>
               <span
                 className="small song-separation-status-text"
-                style={{ color: "#34d399" }}
+                style={{ color: "var(--volume)" }}
                 title={song.separationMessage || undefined}
               >
                 ✓ {song.separationMessage || "音軌分離已完成"}
@@ -1238,7 +1238,7 @@ export const SongCard = memo(function SongCard(props: Props) {
               <div className="row" style={{ justifyContent: "space-between", gap: 8 }}>
                 <div className="row" style={{ gap: 8, alignItems: "center" }}>
                   <span className="mixer-spinner" aria-hidden="true" />
-                  <span className="small" style={{ color: "#bae6fd" }}>{props.driveExportProgress.message}</span>
+                  <span className="small" style={{ color: "var(--cloud)" }}>{props.driveExportProgress.message}</span>
                 </div>
                 {props.driveExportProgress.totalBytes > 0 && (
                   <span className="small" style={{ fontVariantNumeric: "tabular-nums" }}>

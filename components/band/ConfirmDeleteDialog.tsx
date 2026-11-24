@@ -185,7 +185,7 @@ export function ConfirmDeleteDialog({
             className="badge"
             style={{
               background: danger ? "rgba(239, 68, 68, 0.18)" : "rgba(245, 158, 11, 0.2)",
-              color: danger ? "#fecaca" : "#fde68a",
+              color: danger ? "var(--danger)" : "var(--warning)",
               borderColor: danger ? "rgba(248, 113, 113, 0.55)" : "rgba(251, 191, 36, 0.55)",
               flexShrink: 0,
             }}
@@ -196,7 +196,7 @@ export function ConfirmDeleteDialog({
 
         <div className="grid mixer-modal-section" style={{ gap: 8 }}>
           <div className="grid" style={{ gap: 4 }}>
-            <strong className="small" style={{ color: danger ? "#fca5a5" : "#bae6fd" }}>
+            <strong className="small" style={{ color: danger ? "var(--danger)" : "var(--cloud)" }}>
               {changeHeading ?? "將刪除以下資料"}
             </strong>
             <ul className="mixer-modal-list">
@@ -209,7 +209,7 @@ export function ConfirmDeleteDialog({
           </div>
 
           <div className="grid" style={{ gap: 4, paddingTop: 6, borderTop: "1px solid rgba(148, 163, 184, 0.14)" }}>
-            <strong className="small" style={{ color: "#6ee7b7" }}>
+            <strong className="small" style={{ color: "var(--success)" }}>
               {preserveHeading ?? "以下資料會完整保留"}
             </strong>
             <ul className="mixer-modal-list">
@@ -222,7 +222,7 @@ export function ConfirmDeleteDialog({
           </div>
 
           <div className="grid" style={{ gap: 2, paddingTop: 6, borderTop: "1px solid rgba(148, 163, 184, 0.14)" }}>
-            <strong className="small" style={{ color: "#bae6fd" }}>
+            <strong className="small" style={{ color: "var(--cloud)" }}>
               是否可恢復
             </strong>
             <span className="small" style={{ opacity: 0.92 }}>
@@ -237,7 +237,7 @@ export function ConfirmDeleteDialog({
             className="mixer-modal-section"
             style={{ borderColor: "rgba(56, 189, 248, 0.35)", background: "rgba(14, 116, 144, 0.16)" }}
           >
-            <span className="small" style={{ color: "#bae6fd" }}>
+            <span className="small" style={{ color: "var(--cloud)" }}>
               {safetyNote}
             </span>
           </div>

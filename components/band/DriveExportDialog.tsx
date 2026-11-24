@@ -162,7 +162,7 @@ export function DriveExportDialog({
               {song.name}（{mode === "two_stem" ? "2 Stem" : "4 Stem"}）
             </span>
           </div>
-          <span className="badge" style={{ background: "rgba(56, 189, 248, 0.16)", color: "#bae6fd", borderColor: "rgba(56, 189, 248, 0.4)" }}>
+          <span className="badge" style={{ background: "rgba(56, 189, 248, 0.16)", color: "var(--cloud)", borderColor: "rgba(56, 189, 248, 0.4)" }}>
             純前端直傳
           </span>
         </div>
@@ -176,7 +176,7 @@ export function DriveExportDialog({
             目標資料夾：<code>.loopHarmonizer / songs / &lt;song-hash&gt; / revisions / &lt;revision&gt;</code>
           </div>
           {song.driveExport && account && song.driveExport.ownerAccountId === account.accountId && (
-            <div className="small" style={{ color: "#fde68a" }}>
+            <div className="small" style={{ color: "var(--warning)" }}>
               此歌曲曾輸出過版本（{song.driveExport.revisionId}）；本次將建立新 Revision，保留既有雲端成果不覆寫。
             </div>
           )}
@@ -269,7 +269,7 @@ export function DriveExportDialog({
             </span>
           </label>
 
-          <div className="small" style={{ color: "#bae6fd", fontWeight: 600 }}>
+          <div className="small" style={{ color: "var(--cloud)", fontWeight: 600 }}>
             預估上傳總容量：約 {formatMiB(estimate.totalEstimatedBytes)}（分段按需讀取 IndexedDB，不載入整首四軌進入記憶體）
           </div>
         </div>
@@ -277,7 +277,7 @@ export function DriveExportDialog({
         {activeProgress && (
           <div className="grid mixer-modal-section" style={{ gap: 6 }}>
             <div className="row" style={{ justifyContent: "space-between" }}>
-              <span className="small" style={{ color: "#bae6fd", fontWeight: 600 }}>
+              <span className="small" style={{ color: "var(--cloud)", fontWeight: 600 }}>
                 {activeProgress.message}
               </span>
               {pct !== null && (

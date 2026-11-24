@@ -28,13 +28,13 @@ function formatMiBExact(bytes: number): string {
 function riskBadgeText(level: ResourceRiskAssessment["riskLevel"]): { label: string; color: string; bg: string } {
   switch (level) {
     case "critical":
-      return { label: "極高風險 (Critical)", color: "#fecaca", bg: "rgba(239, 68, 68, 0.22)" };
+      return { label: "極高風險 (Critical)", color: "var(--danger)", bg: "rgba(239, 68, 68, 0.22)" };
     case "high":
-      return { label: "高風險 (High)", color: "#fde68a", bg: "rgba(245, 158, 11, 0.22)" };
+      return { label: "高風險 (High)", color: "var(--warning)", bg: "rgba(245, 158, 11, 0.22)" };
     case "medium":
-      return { label: "中等負載 (Medium)", color: "#bae6fd", bg: "rgba(56, 189, 248, 0.18)" };
+      return { label: "中等負載 (Medium)", color: "var(--cloud)", bg: "rgba(56, 189, 248, 0.18)" };
     default:
-      return { label: "低風險 (Low)", color: "#a7f3d0", bg: "rgba(52, 211, 153, 0.18)" };
+      return { label: "低風險 (Low)", color: "var(--success)", bg: "rgba(52, 211, 153, 0.18)" };
   }
 }
 
@@ -159,7 +159,7 @@ export function ResourceGuardModal({
               預估處理時間：{assessment.estimatedDurationLabel}
             </div>
             {assessment.admission.hardRejected && (
-              <div className="small" style={{ color: "#fecaca", fontWeight: 600 }}>
+              <div className="small" style={{ color: "var(--danger)", fontWeight: 600 }}>
                 准入拒絕：{assessment.admission.message}
               </div>
             )}
@@ -175,7 +175,7 @@ export function ResourceGuardModal({
               <span>儲存空間：{assessment.capabilitiesSummary.storageLabel}</span>
             </div>
             {assessment.honestModeNote && (
-              <p className="small" style={{ color: "#fde68a", margin: "4px 0 0" }}>
+              <p className="small" style={{ color: "var(--warning)", margin: "4px 0 0" }}>
                 {assessment.honestModeNote}
               </p>
             )}
@@ -184,7 +184,7 @@ export function ResourceGuardModal({
 
         {networkEvaluation && (!networkEvaluation.allowed || networkEvaluation.requiresExternalDownloadConfirmation) && (
           <div className="grid mixer-modal-section is-network" style={{ gap: 6 }}>
-            <strong style={{ fontSize: 13, color: networkEvaluation.allowed ? "#fde68a" : "#fca5a5" }}>
+            <strong style={{ fontSize: 13, color: networkEvaluation.allowed ? "var(--warning)" : "var(--danger)" }}>
               {networkEvaluation.allowed
                 ? "首次載入或外部資源下載確認（與本機快取明確區分）"
                 : `網路傳輸預算保護（Vercel 上限 ${formatMiBExact(networkEvaluation.vercelStaticBudgetBytes)}，無強制繞過）`}

@@ -128,7 +128,7 @@ export function DriveLibraryDialog({
         {restoreProgress && (
           <div className="grid mixer-modal-section" style={{ gap: 6 }}>
             <div className="row" style={{ justifyContent: "space-between", gap: 8 }}>
-              <span className="small" style={{ color: "#bae6fd", fontWeight: 600 }}>
+              <span className="small" style={{ color: "var(--cloud)", fontWeight: 600 }}>
                 {restoreProgress.message}
               </span>
               {isRestoring && (
@@ -273,7 +273,7 @@ export function DriveLibraryDialog({
 
         {invalidEntries.length > 0 && (
           <details className="mixer-modal-section">
-            <summary className="small" style={{ cursor: "pointer", color: "#fde68a" }}>
+            <summary className="small" style={{ cursor: "pointer", color: "var(--warning)" }}>
               略過 {invalidEntries.length} 筆不完整或版本不相容的雲端項目
             </summary>
             <ul className="mixer-modal-list" style={{ marginTop: 6 }}>
