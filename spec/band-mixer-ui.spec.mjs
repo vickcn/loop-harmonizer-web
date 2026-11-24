@@ -61,3 +61,22 @@ test("Project and bulk controls retain their labelled landmarks", () => {
   assert.match(mixer, /aria-label="批次播放控制"/);
   assert.match(toolbar, /aria-label="專案主要操作"/);
 });
+
+test("theme controls stay compact while Google account remains directly accessible", () => {
+  const page = read("app/band-mixer/page.tsx");
+  const appearance = read("components/band/MixerAppearance.tsx");
+  const mixer = read("components/band/BandMixer.tsx");
+  const accountBarIndex = mixer.indexOf('className="mixer-account-bar"');
+  const projectToolbarIndex = mixer.indexOf("<ProjectToolbar");
+  const overflowMenuIndex = mixer.indexOf('className="mixer-upload-more-menu"');
+  const accountButtonIndex = mixer.indexOf("<GoogleAccountButton");
+
+  assert.match(page, /mixer-page-header/);
+  assert.match(page, /<MixerAppearance/);
+  assert.match(appearance, /aria-label="使用 Graphite Pro 深色主題"/);
+  assert.match(appearance, /aria-label="使用 Daylight Studio 淺色主題"/);
+  assert.match(appearance, /aria-pressed=\{theme === "graphite"\}/);
+  assert.ok(accountBarIndex >= 0 && accountBarIndex < projectToolbarIndex);
+  assert.ok(accountButtonIndex >= 0 && accountButtonIndex < overflowMenuIndex);
+  assert.equal((mixer.match(/<GoogleAccountButton/g) ?? []).length, 1);
+});

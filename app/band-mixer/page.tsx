@@ -13,13 +13,15 @@ export default function BandMixerPage() {
         </Link>
       </div>
 
-      <header className="col-full">
-        <span className="mixer-brand-name">Loop Harmonizer</span>
-        <h1 className="title">歌曲混音器</h1>
-        <p className="subtitle">每首歌獨立控制 BPM、Key、Loop 與分軌混音；音軌分離和播放處理都留在瀏覽器。</p>
+      <header className="col-full mixer-page-header">
+        <div className="mixer-page-heading">
+          <span className="mixer-brand-name">Loop Harmonizer</span>
+          <h1 className="title">歌曲混音器</h1>
+          <p className="subtitle">每首歌獨立控制 BPM、Key、Loop 與分軌混音；音軌分離和播放處理都留在瀏覽器。</p>
+        </div>
+        <MixerAppearance fontVariableClasses={mixerFontVariableClasses} />
       </header>
 
-      <MixerAppearance fontVariableClasses={mixerFontVariableClasses} />
       <div className="col-full">
         <BandMixer />
       </div>

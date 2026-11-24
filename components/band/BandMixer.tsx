@@ -7741,6 +7741,17 @@ export function BandMixer() {
 
   return (
     <div className={`grid mixer-shell${hasSelectedSongs ? " has-selected" : ""}`} style={{ gap: 16 }}>
+      <section className="mixer-account-bar" aria-label="Google 帳號與雲端同步">
+        <div className="mixer-account-context">
+          <strong>Google 帳號</strong>
+          <span>雲端專案與成果同步</span>
+        </div>
+        <GoogleAccountButton
+          disabled={focusLocked}
+          onRequestRevoke={requestRevokeGoogleAuth}
+          onError={(msg) => showShortcutHint(msg)}
+        />
+      </section>
       <ProjectToolbar
         activeProject={activeProjectRecord}
         songCount={session.songs.length}
@@ -7819,11 +7830,6 @@ export function BandMixer() {
                 </button>
               )}
               <span className="mixer-upload-menu-divider" aria-hidden="true" />
-              <GoogleAccountButton
-                disabled={focusLocked}
-                onRequestRevoke={requestRevokeGoogleAuth}
-                onError={(msg) => showShortcutHint(msg)}
-              />
               <button
                 type="button"
                 className="btn mixer-button mixer-upload-menu-action"

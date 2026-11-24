@@ -25,12 +25,32 @@ export function MixerAppearance({ fontVariableClasses = "" }: { fontVariableClas
     setTheme(next);
     try { saveMixerTheme(localStorage, next); } catch {}
   };
-  return <fieldset className="mixer-appearance col-full">
-    <legend>外觀設定</legend>
-    {(["graphite", "daylight"] as const).map(value => <button key={value} type="button" aria-pressed={theme === value} onClick={() => select(value)}>
-      <span className={`theme-preview ${value}`} aria-hidden="true" />
-      {value === "graphite" ? "Graphite Pro" : "Daylight Studio"}
-      {theme === value && <span aria-hidden="true"> ✓</span>}
-    </button>)}
-  </fieldset>;
+  return (
+    <fieldset className="mixer-appearance" aria-label="外觀主題">
+      <legend className="mixer-visually-hidden">外觀主題</legend>
+      <button
+        type="button"
+        aria-label="使用 Graphite Pro 深色主題"
+        aria-pressed={theme === "graphite"}
+        title="Graphite Pro"
+        onClick={() => select("graphite")}
+      >
+        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+          <path d="M20.4 15.2A8.5 8.5 0 0 1 8.8 3.6 9 9 0 1 0 20.4 15.2Z" fill="currentColor" />
+        </svg>
+      </button>
+      <button
+        type="button"
+        aria-label="使用 Daylight Studio 淺色主題"
+        aria-pressed={theme === "daylight"}
+        title="Daylight Studio"
+        onClick={() => select("daylight")}
+      >
+        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+          <circle cx="12" cy="12" r="4" fill="currentColor" />
+          <path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.65 17.65l1.42 1.42M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.65 6.35l1.42-1.42" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+        </svg>
+      </button>
+    </fieldset>
+  );
 }

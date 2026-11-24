@@ -1260,6 +1260,56 @@ li.status-dot-tooltip-row.is-row-highlighted {
   max-width: 100%;
 }
 
+.mixer-account-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-width: 0;
+  padding: 10px 14px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-panel);
+  background: var(--surface-section);
+}
+
+.mixer-account-context {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.mixer-account-context strong {
+  font-size: 13px;
+  line-height: 1.25;
+}
+
+.mixer-account-context span {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.25;
+}
+
+.mixer-account-bar > .google-account-wrap,
+.mixer-account-bar > .google-account-btn {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+@media (max-width: 480px) {
+  .mixer-account-bar {
+    gap: 10px;
+    padding: 8px 10px;
+  }
+
+  .mixer-account-context span {
+    display: none;
+  }
+
+  .mixer-account-bar .google-account-btn {
+    max-width: min(210px, 62vw);
+  }
+}
+
 .google-account-btn {
   max-width: 240px;
 }
