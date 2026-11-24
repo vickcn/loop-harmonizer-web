@@ -608,6 +608,7 @@ export async function restoreSongFromDrive(params: {
   accessToken: string;
   generation: number;
   isGenerationValid: (generation: number, accountId: string) => boolean;
+  expectedManifestOwnerAccountId?: string;
   includeOriginalAudio?: boolean;
   originalBackupDriveFileId?: string;
   expectedRevisionId?: string;
@@ -631,7 +632,7 @@ export async function restoreSongFromDrive(params: {
   });
 
   const manifestValidation = validateDriveSongManifest(entry.manifest, {
-    expectedAccountId: accountId,
+    expectedAccountId: params.expectedManifestOwnerAccountId ?? accountId,
   });
   if (!manifestValidation.valid || !manifestValidation.manifest) {
     throw new Error(`雲端成果 Manifest 不完整或損壞：${manifestValidation.reasons.join("；")}`);

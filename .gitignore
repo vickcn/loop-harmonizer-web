@@ -146,6 +146,9 @@ uploads/
 log*.txt
 log*/
 issues*/
+!issues/
+issues/*
+!issues/todo-project-sharing.md
 output*/
 sds_studio*/
 storage*/

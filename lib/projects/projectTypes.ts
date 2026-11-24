@@ -5,6 +5,16 @@ export const PROJECT_SCHEMA_VERSION = 1;
 
 export type ProjectStorageProvider = "local" | "google_drive";
 
+export type ImportedFromShare = {
+  shareId: string;
+  sourceProjectId: string;
+  publishedRevisionId: string;
+  importedAt: string;
+  ownerAccountId: string;
+  shareManifestFileId: string;
+  dependsOnSourceDrive: boolean;
+};
+
 export type ProjectSyncStatus =
   | "local_only"
   | "synced"
@@ -175,6 +185,7 @@ export type BandProject = {
   masterSettings: ProjectMasterSettings;
   songs: ProjectSongEntry[];
   backupSummary?: ProjectBackupSummary;
+  importedFromShare?: ImportedFromShare;
 };
 
 export type ProjectConflictInfo = {

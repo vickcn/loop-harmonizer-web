@@ -1,5 +1,5 @@
 const DB_NAME = "loop-harmonizer-audio-cache";
-const DB_VERSION = 6;
+const DB_VERSION = 7;
 
 export const INDEXEDDB_VERSION = DB_VERSION;
 export const SEPARATION_CHECKPOINT_HASH_INDEX = "by_sourceAudioHash";
@@ -10,6 +10,8 @@ export const IMPORTED_STEM_HASH_INDEX = "by_sourceAudioHash";
 export const PROJECT_OWNER_ACCOUNT_INDEX = "by_ownerAccountId";
 export const PROJECT_PROVIDER_INDEX = "by_storageProvider";
 export const PROJECT_SYNC_ACCOUNT_INDEX = "by_ownerAccountId";
+export const PROJECT_SHARE_SOURCE_INDEX = "by_sourceProjectId";
+export const PROJECT_SHARE_ACCOUNT_INDEX = "by_ownerAccountId";
 
 export type AudioCacheStore =
   | "separations"
@@ -25,7 +27,8 @@ export type AudioCacheStore =
   | "importedStems"
   | "projects"
   | "projectPreferences"
-  | "projectSyncJobs";
+  | "projectSyncJobs"
+  | "projectShares";
 
 const ALL_STORES: readonly AudioCacheStore[] = [
   "separations",
@@ -42,6 +45,7 @@ const ALL_STORES: readonly AudioCacheStore[] = [
   "projects",
   "projectPreferences",
   "projectSyncJobs",
+  "projectShares",
 ];
 
 export interface InMemoryIdbHooks {
@@ -247,6 +251,18 @@ export function applyIndexedDbSchemaUpgrade(
         unique: false,
       });
     }
+    if (
+      storeName === "projectShares" &&
+      !store.indexNames.contains(PROJECT_SHARE_SOURCE_INDEX)
+    ) {
+      store.createIndex(PROJECT_SHARE_SOURCE_INDEX, "sourceProjectId", { unique: false });
+    }
+    if (
+      storeName === "projectShares" &&
+      !store.indexNames.contains(PROJECT_SHARE_ACCOUNT_INDEX)
+    ) {
+      store.createIndex(PROJECT_SHARE_ACCOUNT_INDEX, "ownerAccountId", { unique: false });
+    }
   }
 }
 
@@ -412,6 +428,18 @@ async function runInMemoryTransaction<T>(
               if (
                 storeName === "projectSyncJobs" &&
                 indexName === PROJECT_SYNC_ACCOUNT_INDEX
+              ) {
+                return obj.ownerAccountId;
+              }
+              if (
+                storeName === "projectShares" &&
+                indexName === PROJECT_SHARE_SOURCE_INDEX
+              ) {
+                return obj.sourceProjectId;
+              }
+              if (
+                storeName === "projectShares" &&
+                indexName === PROJECT_SHARE_ACCOUNT_INDEX
               ) {
                 return obj.ownerAccountId;
               }

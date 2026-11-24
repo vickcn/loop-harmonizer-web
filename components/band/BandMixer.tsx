@@ -137,6 +137,7 @@ import {
 import { SongCard } from "./SongCard";
 import { ProjectToolbar, type ProjectBusyState } from "./ProjectToolbar";
 import { ProjectManagerDialog, type ProjectDialogMode } from "./ProjectManagerDialog";
+import { ProjectShareDialog } from "./ProjectShareDialog";
 import { IconActionButton } from "./IconActionButton";
 import { GoogleDrivePickerButton } from "./GoogleDrivePickerButton";
 import { GoogleAccountButton } from "@/components/google/GoogleAccountButton";
@@ -488,6 +489,7 @@ export function BandMixer() {
     setProjectBusyState(next);
   }, []);
   const [projectDialogMode, setProjectDialogMode] = useState<ProjectDialogMode>(null);
+  const [projectShareOpen, setProjectShareOpen] = useState(false);
   const [projectRenameTarget, setProjectRenameTarget] = useState<{ projectId: string; name: string } | null>(null);
   const [projectDialogError, setProjectDialogError] = useState<string | null>(null);
   const [projectListEntries, setProjectListEntries] = useState<ProjectListEntrySummary[]>([]);
@@ -8574,6 +8576,16 @@ export function BandMixer() {
             if (!/已取消/.test(msg)) setProjectDialogError(msg);
           }
         }}
+        onShareProject={() => {
+          setProjectDialogMode(null);
+          setProjectShareOpen(true);
+        }}
+      />
+      <ProjectShareDialog
+        open={projectShareOpen}
+        project={activeProjectRecord}
+        onClose={() => setProjectShareOpen(false)}
+        onMessage={(message) => showShortcutHint(message)}
       />
       {deleteDialog && (
         <ConfirmDeleteDialog

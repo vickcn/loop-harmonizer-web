@@ -820,6 +820,67 @@ export async function createDriveFolder(params: {
   return (await response.json()) as DriveRawFileResource;
 }
 
+/** Google Drive 伺服端複製；避免將大型 WAV 經過瀏覽器記憶體或 Vercel。 */
+export async function copyDriveFile(params: {
+  fileId: string;
+  accessToken: string;
+  name: string;
+  parentId: string;
+  appProperties?: Record<string, string>;
+  signal?: AbortSignal;
+  fetchImpl?: typeof fetch;
+}): Promise<DriveRawFileResource> {
+  const response = await (params.fetchImpl ?? globalThis.fetch)(
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(params.fileId)}/copy?supportsAllDrives=true&fields=id,name,mimeType,size,md5Checksum,modifiedTime,parents,appProperties`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${params.accessToken}`,
+        "Content-Type": "application/json; charset=UTF-8",
+      },
+      body: JSON.stringify({
+        name: params.name,
+        parents: [params.parentId],
+        ...(params.appProperties ? { appProperties: params.appProperties } : {}),
+      }),
+      signal: params.signal,
+    },
+  );
+  if (!response.ok) throw await mapResponseToDriveError(response, params.name);
+  return (await response.json()) as DriveRawFileResource;
+}
+
+export async function moveDriveFile(params: {
+  fileId: string;
+  accessToken: string;
+  addParentId: string;
+  removeParentId?: string;
+  appProperties?: Record<string, string>;
+  signal?: AbortSignal;
+  fetchImpl?: typeof fetch;
+}): Promise<DriveRawFileResource> {
+  const query = new URLSearchParams({
+    supportsAllDrives: "true",
+    addParents: params.addParentId,
+    fields: "id,name,mimeType,parents,appProperties",
+  });
+  if (params.removeParentId) query.set("removeParents", params.removeParentId);
+  const response = await (params.fetchImpl ?? globalThis.fetch)(
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(params.fileId)}?${query}`,
+    {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${params.accessToken}`,
+        "Content-Type": "application/json; charset=UTF-8",
+      },
+      body: JSON.stringify(params.appProperties ? { appProperties: params.appProperties } : {}),
+      signal: params.signal,
+    },
+  );
+  if (!response.ok) throw await mapResponseToDriveError(response, params.fileId);
+  return (await response.json()) as DriveRawFileResource;
+}
+
 export async function uploadDriveMultipartJson(params: {
   accessToken: string;
   name: string;
@@ -896,6 +957,44 @@ export async function downloadDriveJson<T>(params: {
   const text = await response.text();
   sharedNetworkBudgetLedger.recordDriveTransfer("download", text.length, params.fileId);
   return JSON.parse(text) as T;
+}
+
+/** 僅讀取 Drive 二進位檔案開頭，供 WAV header 等輕量完整性檢查。 */
+export async function downloadDriveFilePrefix(params: {
+  fileId: string;
+  accessToken: string;
+  byteLength: number;
+  fileName?: string;
+  signal?: AbortSignal;
+  fetchImpl?: typeof fetch;
+}): Promise<ArrayBuffer> {
+  const fetchFn = params.fetchImpl ?? globalThis.fetch;
+  const byteLength = Math.max(1, Math.min(64 * 1024, Math.floor(params.byteLength)));
+  const response = await fetchFn(
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(params.fileId)}?alt=media&supportsAllDrives=true`,
+    {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${params.accessToken}`,
+        Range: `bytes=0-${byteLength - 1}`,
+      },
+      signal: params.signal,
+    },
+  );
+  if (!response.ok) {
+    throw await mapResponseToDriveError(response, params.fileName);
+  }
+  const buffer = await response.arrayBuffer();
+  if (buffer.byteLength < byteLength) {
+    throw new DriveApiError(`「${params.fileName ?? "Drive 檔案"}」內容過短或不完整。`, {
+      status: 422,
+      code: "network",
+      fileName: params.fileName,
+      retryable: false,
+    });
+  }
+  sharedNetworkBudgetLedger.recordDriveTransfer("download", buffer.byteLength, params.fileId);
+  return buffer.slice(0, byteLength);
 }
 
 export async function downloadDriveBinaryWithProgress(params: {

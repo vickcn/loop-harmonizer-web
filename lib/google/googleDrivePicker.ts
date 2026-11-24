@@ -610,6 +610,8 @@ export function openGoogleDrivePicker(params: {
   apiKey: string;
   appId?: string;
   multiple?: boolean;
+  mimeTypes?: string;
+  title?: string;
 }): Promise<PickedDriveFile[]> {
   if (activePickerPromise) {
     return activePickerPromise;
@@ -621,11 +623,12 @@ export function openGoogleDrivePicker(params: {
 
   const promise = new Promise<PickedDriveFile[]>((resolve, reject) => {
     try {
+      const mimeTypes = params.mimeTypes || DRIVE_AUDIO_MIME_TYPES;
       const myDriveView = new pickerApi.DocsView(pickerApi.ViewId.DOCS)
         .setIncludeFolders(true)
         .setSelectFolderEnabled(false)
         .setEnableDrives(true)
-        .setMimeTypes(DRIVE_AUDIO_MIME_TYPES)
+        .setMimeTypes(mimeTypes)
         .setLabel("我的雲端硬碟");
 
       const sharedView = new pickerApi.DocsView(pickerApi.ViewId.DOCS)
@@ -633,11 +636,11 @@ export function openGoogleDrivePicker(params: {
         .setIncludeFolders(true)
         .setSelectFolderEnabled(false)
         .setEnableDrives(true)
-        .setMimeTypes(DRIVE_AUDIO_MIME_TYPES)
+        .setMimeTypes(mimeTypes)
         .setLabel("與我共用");
 
       const builder = new pickerApi.PickerBuilder()
-        .setTitle("選擇 Google 雲端硬碟音檔（含共享檔案）")
+        .setTitle(params.title || "選擇 Google 雲端硬碟音檔（含共享檔案）")
         .setOAuthToken(params.accessToken)
         .setDeveloperKey(params.apiKey)
         .setOrigin(window.location.origin)

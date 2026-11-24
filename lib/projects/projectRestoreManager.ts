@@ -597,7 +597,7 @@ export async function restoreSingleProjectSongOnDemand(params: {
     reusedLocal = false;
     const manifestEntry: DriveLibraryEntry = await fetchDriveManifestByFileId({
       manifestFileId: entry.artifactRef.manifestFileId,
-      expectedAccountId: params.accountId,
+      expectedAccountId: project.importedFromShare?.ownerAccountId ?? params.accountId,
       accessToken: params.accessToken,
       signal: params.signal,
       fetchImpl: params.fetchImpl,
@@ -609,6 +609,7 @@ export async function restoreSingleProjectSongOnDemand(params: {
       accessToken: params.accessToken,
       generation: params.generation,
       isGenerationValid: params.isGenerationValid,
+      expectedManifestOwnerAccountId: project.importedFromShare?.ownerAccountId,
       includeOriginalAudio: needOriginalFromCloud,
       originalBackupDriveFileId: needOriginalFromCloud ? originalDriveFileId : undefined,
       expectedRevisionId: entry.artifactRef.revisionId,

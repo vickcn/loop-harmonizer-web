@@ -76,6 +76,18 @@ export interface SongOriginalsFolders {
   originalsFolderId: string;
 }
 
+export interface ShareFolderLayout {
+  accountId: string;
+  shareId: string;
+  rootFolderId: string;
+  sharedFolderId: string;
+  shareFolderId: string;
+  revisionsFolderId: string;
+  revisionFolderId: string;
+  revisionStagingParentId: string;
+  duplicateFolderIds: string[];
+}
+
 export class MultipleManagedAppFoldersError extends Error {
   readonly candidates: DriveRawFileResource[];
 
@@ -524,6 +536,122 @@ export async function ensureProjectsFolder(params: {
     },
     params.lockAdapter,
   );
+}
+
+export function buildStableShareFolderName(shareId: string): string {
+  const clean = shareId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64);
+  return clean ? `share_${clean}` : "share_unknown";
+}
+
+/** 建立與私人 projects/songs 完全隔離的共享快照目錄。 */
+export async function ensureShareRevisionFolder(params: {
+  accountId: string;
+  shareId: string;
+  sourceProjectId: string;
+  publishedRevisionId: string;
+  accessToken: string;
+  signal?: AbortSignal;
+  fetchImpl?: typeof fetch;
+}): Promise<ShareFolderLayout> {
+  const app = await ensureAppFolder({
+    accountId: params.accountId,
+    accessToken: params.accessToken,
+    signal: params.signal,
+    fetchImpl: params.fetchImpl,
+  });
+  const sharedFolderId = await ensureChildManagedFolder({
+    parentId: app.rootFolderId,
+    name: "shared",
+    role: "shared",
+    accessToken: params.accessToken,
+    signal: params.signal,
+    fetchImpl: params.fetchImpl,
+  });
+  const shareProps = {
+    lhShareId: params.shareId,
+    lhSourceProjectId: params.sourceProjectId,
+    lhAccountId: params.accountId,
+  };
+  const candidates = await findManagedSubfolder({
+    parentId: sharedFolderId,
+    role: "shared_project",
+    extraAppProps: shareProps,
+    accessToken: params.accessToken,
+    signal: params.signal,
+    fetchImpl: params.fetchImpl,
+  });
+  let shareFolderId: string;
+  let duplicateFolderIds: string[] = [];
+  if (candidates.length > 0) {
+    const picked = selectCanonicalFolder(candidates);
+    shareFolderId = picked.canonical.id;
+    duplicateFolderIds = picked.duplicateIds;
+  } else {
+    const created = await createDriveFolder({
+      accessToken: params.accessToken,
+      name: buildStableShareFolderName(params.shareId),
+      parentId: sharedFolderId,
+      appProperties: {
+        lhApp: LOOP_HARMONIZER_APP_TAG,
+        lhRole: "shared_project",
+        ...shareProps,
+      },
+      signal: params.signal,
+      fetchImpl: params.fetchImpl,
+    });
+    shareFolderId = created.id;
+  }
+  const revisionsFolderId = await ensureChildManagedFolder({
+    parentId: shareFolderId,
+    name: "revisions",
+    role: "share_revisions",
+    extraAppProps: { lhShareId: params.shareId },
+    accessToken: params.accessToken,
+    signal: params.signal,
+    fetchImpl: params.fetchImpl,
+  });
+  const revisionFolderId = await ensureChildManagedFolder({
+    parentId: sharedFolderId,
+    name: params.publishedRevisionId,
+    role: "share_revision_staging",
+    extraAppProps: {
+      lhShareId: params.shareId,
+      lhPublishedRevisionId: params.publishedRevisionId,
+    },
+    accessToken: params.accessToken,
+    signal: params.signal,
+    fetchImpl: params.fetchImpl,
+  });
+  return {
+    accountId: params.accountId,
+    shareId: params.shareId,
+    rootFolderId: app.rootFolderId,
+    sharedFolderId,
+    shareFolderId,
+    revisionsFolderId,
+    revisionFolderId,
+    revisionStagingParentId: sharedFolderId,
+    duplicateFolderIds,
+  };
+}
+
+export async function ensureShareSongArtifactFolder(params: {
+  revisionFolderId: string;
+  shareId: string;
+  entryId: string;
+  accessToken: string;
+  signal?: AbortSignal;
+  fetchImpl?: typeof fetch;
+}): Promise<string> {
+  return ensureChildManagedFolder({
+    parentId: params.revisionFolderId,
+    name: `artifacts_${params.entryId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 48)}`,
+    role: "share_song_artifacts",
+    extraAppProps: { lhShareId: params.shareId, lhEntryId: params.entryId },
+    accessToken: params.accessToken,
+    signal: params.signal,
+    fetchImpl: params.fetchImpl,
+  });
 }
 
 export async function findProjectFolder(params: {

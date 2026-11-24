@@ -88,6 +88,7 @@ type Props = {
   onMigrateLegacyWorkspace: () => void | Promise<void>;
   onReturnToLegacyWorkspace?: () => void;
   onSignInGoogle: () => void | Promise<void>;
+  onShareProject: () => void;
 };
 
 const BACKUP_LABELS: Record<ProjectSongBackupStatus, { label: string; toneClass: string }> = {
@@ -550,6 +551,24 @@ export function ProjectManagerDialog(props: Props) {
                     onClick={props.onReturnToLegacyWorkspace}
                   >
                     返回預設工作空間
+                  </button>
+                )}
+                {activeProject && (
+                  <button
+                    type="button"
+                    className="btn mixer-button"
+                    disabled={isBusy || activeProject.storageProvider !== "google_drive" || !props.account}
+                    title={
+                      activeProject.storageProvider !== "google_drive"
+                        ? "請先將專案連結至 Google Drive"
+                        : !props.account
+                          ? "請先登入 Google 帳號"
+                          : "發布或管理專案唯讀共享版本"
+                    }
+                    onClick={props.onShareProject}
+                  >
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="m8.6 10.5 6.8-4M8.6 13.5l6.8 4"/></svg>
+                    分享專案
                   </button>
                 )}
               </div>

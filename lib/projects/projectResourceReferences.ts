@@ -2,6 +2,7 @@ import { getAllProjectRecords, listCloudCachedProjectRecordsByAccount } from "..
 import { loadPersistedBandSession } from "../storage/songSessionStore.ts";
 import { listCloudProjectsDetailed } from "./projectDriveSync.ts";
 import type { PersistedProjectRecord, ProjectSongArtifactRef } from "./projectTypes.ts";
+import { canGarbageCollectShareFolder, getProjectShareRecord } from "../sharing/shareManager.ts";
 
 export interface LocalProjectResourceReferenceSummary {
   referencedSourceAudioHashes: Set<string>;
@@ -81,6 +82,20 @@ export interface CloudArtifactReferenceCheckResult {
   referencingProjectIds: string[];
   referencingProjectNames: string[];
   reason?: string;
+}
+
+export async function checkShareFolderGcSafety(params: {
+  shareId: string;
+  explicitUserConfirmation: boolean;
+  referencedByOtherShare?: boolean;
+}): Promise<{ safeToDelete: boolean; reason?: string }> {
+  const share = await getProjectShareRecord(params.shareId).catch(() => null);
+  if (!share) return { safeToDelete: false, reason: "無法取得完整分享紀錄，已採 Fail Closed。" };
+  const result = canGarbageCollectShareFolder(share, {
+    explicitUserConfirmation: params.explicitUserConfirmation,
+    referencedByOtherShare: params.referencedByOtherShare,
+  });
+  return { safeToDelete: result.allowed, reason: result.reason };
 }
 
 function matchesTargetCloudArtifactRevision(
