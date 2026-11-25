@@ -30,7 +30,9 @@ export function createImportedProjectFromShare(params: {
           ? {
               ...entry.artifactRef,
               manifestFileId: shared.manifestFileId,
-              artifactChecksums: Object.fromEntries(shared.artifacts.map((a) => [a.role, a.checksum])),
+              artifactChecksums: Object.fromEntries(shared.artifacts
+                .filter((artifact) => (artifact.checksumDescriptor?.algorithm ?? artifact.checksumAlgorithm ?? "sha256") === "sha256")
+                .map((artifact) => [artifact.role, artifact.checksum])),
               localTaskId: null,
               localSourceType: null,
             }

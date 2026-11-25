@@ -5930,11 +5930,11 @@ export function BandMixer() {
     setDriveExportModalSongId(song.id);
   };
 
-  const startDriveExport = async (selectionInput: DriveExportSelection) => {
-    const targetSong = driveExportModalSongId
+  const startDriveExport = async (selectionInput: DriveExportSelection, songOverride?: BandSong): Promise<boolean> => {
+    const targetSong = songOverride ?? (driveExportModalSongId
       ? sessionRef.current.songs.find((item) => item.id === driveExportModalSongId)
-      : null;
-    if (!targetSong) return;
+      : null);
+    if (!targetSong) return false;
 
     lastDriveExportSelectionRef.current = selectionInput;
     setDriveExportError(null);
@@ -5949,12 +5949,12 @@ export function BandMixer() {
       } catch (err) {
         const msg = err instanceof Error ? err.message : "尚未完成 Google 授權。";
         if (!/已取消/.test(msg)) setDriveExportError(msg);
-        return;
+        return false;
       }
     }
     if (!token || !snap.account) {
       setDriveExportError("尚未取得有效 Google 帳號授權，無法輸出。");
-      return;
+      return false;
     }
 
     const controller = new AbortController();
@@ -5962,6 +5962,7 @@ export function BandMixer() {
     driveExportPauseRequestedRef.current = false;
     setDriveExportSubmitting(true);
 
+    let completed = false;
     try {
       const cap = await collectDeviceCapabilities();
       const profileEval = sharedResourceProfileManager.evaluate(cap, sharedPerfTelemetry.getSignals());
@@ -5995,6 +5996,7 @@ export function BandMixer() {
       });
 
       if (result.status === "completed") {
+        completed = true;
         if (result.manifestFileId && result.manifest) {
           const nextDriveExport = {
             ownerAccountId: snap.account.accountId,
@@ -6087,6 +6089,7 @@ export function BandMixer() {
         return next;
       });
     }
+    return completed;
   };
 
   const pauseDriveExport = () => {
@@ -8595,15 +8598,30 @@ export function BandMixer() {
           applyActiveProjectRecordMonotonically(saved.record);
           return saved.record;
         }}
-        onCompleteShareArtifacts={() => {
-          const missing = sessionRef.current.songs.find((song) => song.separationStatus === "completed" && !song.artifactRef?.manifestFileId);
-          if (!missing) {
-            showShortcutHint("目前沒有可由本機補齊的已完成分軌；請先完成分軌或檢查雲端成果。");
-            return;
+        onCompleteShareArtifacts={async (entryIds, onProgress, signal) => {
+          const targets = entryIds.map((entryId) => sessionRef.current.songs.find((song) => (song.projectEntryId ?? song.id) === entryId)).filter((song): song is BandSong => Boolean(song));
+          if (targets.length !== entryIds.length) throw new Error("部分歌曲已從目前專案移除或無法取得，已停止批次補齊。");
+          let completed = 0;
+          for (const song of targets) {
+            if (signal.aborted) throw new DOMException("已取消批次補齊。", "AbortError");
+            if (song.separationStatus !== "completed" || !song.separationMode) throw new Error(`「${song.name}」尚未完成可分享分軌。`);
+            onProgress(completed, targets.length, song.name);
+            const selectedStemRoles = song.separationMode === "four_stem"
+              ? ["vocals", "drums", "bass", "other"] as const
+              : ["vocals", "instrumental"] as const;
+            const abortCurrent = () => driveExportAbortRef.current?.abort();
+            signal.addEventListener("abort", abortCurrent, { once: true });
+            let ok = false;
+            try {
+              ok = await startDriveExport({ format: "wav-float32", includeStems: true, selectedStemRoles: [...selectedStemRoles], includeSessionJson: true, includeCustomMix: false, forceNewRevision: Boolean(song.driveExport) }, song);
+            } finally {
+              signal.removeEventListener("abort", abortCurrent);
+            }
+            if (!ok) throw new Error(`「${song.name}」尚未完成上傳；已完成的 ${completed} 首會保留，下次可接續。`);
+            completed += 1;
           }
-          setProjectShareOpen(false);
-          openDriveExportForSong(missing);
-          showShortcutHint("請確認輸出完整分軌至 Google Drive；完成後可重新開啟分享並發布。");
+          captureLatestProjectSnapshot(activeProjectIdRef.current ?? undefined);
+          return { completed, total: targets.length };
         }}
         onClose={() => setProjectShareOpen(false)}
         onMessage={(message) => showShortcutHint(message)}

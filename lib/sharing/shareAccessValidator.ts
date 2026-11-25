@@ -37,6 +37,7 @@ export async function loadAndValidateSharedProject(params: {
   }
   const pointer = validateProjectSharePointer(rawPointer);
   if (pointer.shareId !== params.shareId) throw new Error("分享連結與 Drive 檔案識別不一致。");
+  if ((pointer.lifecycle ?? "published") !== "published") throw new Error("此分享已停止或正在撤銷，無法再匯入。");
   const manifest = validateProjectShareManifest(
     await downloadDriveJson<unknown>({
       fileId: pointer.revisionManifestFileId,
@@ -71,6 +72,9 @@ export async function loadAndValidateSharedProject(params: {
         (artifact.md5Checksum && metadata.md5Checksum !== artifact.md5Checksum)
       ) {
         throw new Error(`你目前無法讀取或驗證歌曲「${song.entry.displayName}」的 ${artifact.role} 分軌；選取 share.json 不代表所有引用檔案皆已授權。`);
+      }
+      if ((artifact.checksumDescriptor?.algorithm ?? artifact.checksumAlgorithm) === "md5" && metadata.md5Checksum !== artifact.checksum) {
+        throw new Error(`歌曲「${song.entry.displayName}」的 ${artifact.role} MD5 與 Drive Metadata 不一致。`);
       }
     }
   }

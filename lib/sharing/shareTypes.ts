@@ -19,6 +19,12 @@ export type ProjectShareStatus =
 
 export type ShareAclVerification = "verified" | "mismatch" | "incomplete" | "unknown";
 export type ShareOperationKind = "publish" | "update_revision" | "update_acl" | "repair" | "revoke";
+export type RemoteShareLifecycle = "published" | "revoking" | "revoked";
+
+export type ArtifactChecksum = {
+  algorithm: "sha256" | "md5";
+  value: string;
+};
 
 export type ProjectShareRecipient = {
   email: string;
@@ -73,6 +79,7 @@ export type SharedArtifactDescriptor = {
   sizeBytes: number;
   checksum: string;
   checksumAlgorithm?: "sha256" | "md5";
+  checksumDescriptor?: ArtifactChecksum;
   md5Checksum?: string;
   sourceAudioHash: string;
   separationMode: "two_stem" | "four_stem";
@@ -115,6 +122,10 @@ export type ProjectSharePointer = {
   sourceProjectId: string;
   ownerAccountId: string;
   visibility: Exclude<ProjectShareVisibility, "private">;
+  lifecycle?: RemoteShareLifecycle;
+  operationId?: string;
+  revocationGeneration?: number;
+  revokedAt?: string;
   publishedRevisionId: string;
   revisionManifestFileId: string;
   projectName: string;
@@ -170,5 +181,7 @@ export type ShareAclReconciliationResult = {
 export type ProjectShareDiscoveryResult = {
   shares: ProjectShareRecord[];
   complete: boolean;
+  skippedCount: number;
+  errors: Array<{ shareId?: string; folderId?: string; reason: string }>;
   errorMessage?: string;
 };

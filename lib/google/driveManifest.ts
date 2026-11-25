@@ -16,6 +16,8 @@ export interface DriveArtifactDescriptor {
   fileName: string;
   sizeBytes: number;
   checksum?: string;
+  checksumAlgorithm?: "sha256" | "md5";
+  checksumDescriptor?: { algorithm: "sha256" | "md5"; value: string };
   md5Checksum?: string;
   mimeType: string;
 }
@@ -281,6 +283,17 @@ export function validateDriveSongManifest(
       const artifact = m.artifacts?.[role];
       if (!artifact || !artifact.fileId || !Number.isFinite(artifact.sizeBytes) || artifact.sizeBytes <= 44) {
         reasons.push(`缺少必要分軌檔案或大小無效：${role}`);
+      } else {
+        const descriptor = artifact.checksumDescriptor;
+        const legacySha = artifact.checksum;
+        const legacyMd5 = artifact.md5Checksum;
+        if (descriptor) {
+          if ((descriptor.algorithm !== "sha256" && descriptor.algorithm !== "md5") || !descriptor.value) {
+            reasons.push(`分軌 Checksum Descriptor 無效：${role}`);
+          }
+        } else if (!legacySha && !legacyMd5) {
+          reasons.push(`分軌缺少可驗證 Checksum：${role}`);
+        }
       }
     }
   }

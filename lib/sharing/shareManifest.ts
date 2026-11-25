@@ -87,6 +87,10 @@ export function buildProjectShareManifest(params: {
       artifacts: song.artifacts.map((artifact) => ({
         ...structuredClone(artifact),
         checksumAlgorithm: artifact.checksumAlgorithm ?? (artifact.md5Checksum === artifact.checksum ? "md5" : "sha256"),
+        checksumDescriptor: artifact.checksumDescriptor ?? {
+          algorithm: artifact.checksumAlgorithm ?? (artifact.md5Checksum === artifact.checksum ? "md5" : "sha256"),
+          value: artifact.checksum,
+        },
         sourceAudioHash: artifact.sourceAudioHash ?? song.entry.sourceAudioHash,
         separationMode: artifact.separationMode ?? song.entry.artifactRef!.separationMode,
         modelVersion: artifact.modelVersion ?? song.entry.artifactRef!.modelVersion,
@@ -108,6 +112,10 @@ export function buildProjectSharePointer(params: {
   revisionManifestFileId: string;
   visibility: "restricted" | "link";
   nowIso?: string;
+  lifecycle?: "published" | "revoking" | "revoked";
+  operationId?: string;
+  revocationGeneration?: number;
+  revokedAt?: string;
 }): ProjectSharePointer {
   return {
     schemaVersion: PROJECT_SHARE_SCHEMA_VERSION,
@@ -117,6 +125,10 @@ export function buildProjectSharePointer(params: {
     sourceProjectId: params.manifest.sourceProjectId,
     ownerAccountId: params.manifest.ownerAccountId,
     visibility: params.visibility,
+    lifecycle: params.lifecycle ?? "published",
+    operationId: params.operationId,
+    revocationGeneration: params.revocationGeneration,
+    revokedAt: params.revokedAt,
     publishedRevisionId: params.manifest.publishedRevisionId,
     revisionManifestFileId: params.revisionManifestFileId,
     projectName: params.manifest.project.name,
@@ -151,6 +163,9 @@ export function validateProjectSharePointer(value: unknown): ProjectSharePointer
     (row.visibility !== "restricted" && row.visibility !== "link")
   ) {
     throw new Error("分享描述檔格式無效或缺少必要欄位。");
+  }
+  if (row.lifecycle && !["published", "revoking", "revoked"].includes(row.lifecycle)) {
+    throw new Error("分享描述檔生命週期無效。");
   }
   return row as ProjectSharePointer;
 }
@@ -256,6 +271,10 @@ export function validateProjectShareManifest(
         !required.includes(artifact.role as never) ||
         !SAFE_ID.test(artifact.fileId) ||
         !SAFE_CHECKSUM.test(artifact.checksum) ||
+        (artifact.checksumAlgorithm !== undefined && artifact.checksumAlgorithm !== "sha256" && artifact.checksumAlgorithm !== "md5") ||
+        (artifact.checksumDescriptor !== undefined &&
+          (artifact.checksumDescriptor.algorithm !== "sha256" && artifact.checksumDescriptor.algorithm !== "md5" ||
+            artifact.checksumDescriptor.value !== artifact.checksum)) ||
         !finiteBetween(artifact.sizeBytes, 45, 16 * 1024 * 1024 * 1024) ||
         (artifact.sourceAudioHash !== undefined && artifact.sourceAudioHash !== ref.sourceAudioHash) ||
         (artifact.separationMode !== undefined && artifact.separationMode !== ref.separationMode) ||

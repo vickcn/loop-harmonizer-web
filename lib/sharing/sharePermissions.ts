@@ -125,6 +125,8 @@ export function evaluateShareAcl(params: {
     }));
   const actualEmails = new Set(recipients.map((recipient) => recipient.email));
   const exactRestricted = params.visibility === "restricted"
+    && desiredEmails.size > 0
+    && actualEmails.size > 0
     && anyone.length === 0
     && direct.every((permission) => (permission.type === "user" || permission.type === "group") && permission.role === "reader" && Boolean(permission.emailAddress))
     && desiredEmails.size === actualEmails.size

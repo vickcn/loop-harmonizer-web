@@ -150,6 +150,7 @@ issues*/
 issues/*
 !issues/todo-project-sharing.md
 !issues/todo-project-sharing-hardening.md
+!issues/todo-project-sharing-hardening-phase2.md
 output*/
 sds_studio*/
 storage*/

@@ -3,9 +3,10 @@ import {
   downloadDriveFilePrefix,
   downloadDriveJson,
   getDriveFileMetadata,
-  listDriveFiles,
+  listDriveFilesPaginated,
   uploadDriveMultipartJson,
 } from "../google/driveClient.ts";
+import { computeSha256HexSync } from "../audio/chunkedWavExporter.ts";
 import {
   getManifestTotalStemBytes,
   requiredStemRolesForMode,
@@ -33,16 +34,30 @@ export function buildShareArtifactIdentity(params: {
   artifactRevision: string;
   role: string;
   checksum: string;
+  md5Checksum?: string;
   sizeBytes: number;
   pcmFormat: string;
 }): string {
-  const input = [params.sourceAudioHash, params.separationMode, params.modelVersion, params.processingVersion, params.artifactRevision, params.role, params.checksum, String(params.sizeBytes), params.pcmFormat].join("|");
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < input.length; index += 1) {
-    hash ^= input.charCodeAt(index);
-    hash = Math.imul(hash, 0x01000193) >>> 0;
+  const input = JSON.stringify([
+    params.sourceAudioHash, params.separationMode, params.modelVersion,
+    params.processingVersion, params.artifactRevision, params.role,
+    params.checksum, params.sizeBytes, params.pcmFormat,
+  ]);
+  return computeSha256HexSync(new TextEncoder().encode(input));
+}
+
+export function getArtifactChecksumDescriptor(artifact: {
+  checksum?: string;
+  checksumAlgorithm?: "sha256" | "md5";
+  checksumDescriptor?: { algorithm: "sha256" | "md5"; value: string };
+  md5Checksum?: string;
+}): { algorithm: "sha256" | "md5"; value: string } | null {
+  if (artifact.checksumDescriptor?.value) return artifact.checksumDescriptor;
+  if (artifact.checksum) {
+    return { algorithm: artifact.checksumAlgorithm ?? "sha256", value: artifact.checksum };
   }
-  return hash.toString(16).padStart(8, "0");
+  if (artifact.md5Checksum) return { algorithm: "md5", value: artifact.md5Checksum };
+  return null;
 }
 
 export function buildSharedDriveSongManifest(params: {
@@ -232,6 +247,7 @@ async function findReusableCopiedFile(params: {
   shareId: string;
   role: string;
   checksum: string;
+  md5Checksum?: string;
   sourceAudioHash: string;
   separationMode: string;
   modelVersion: string;
@@ -243,9 +259,10 @@ async function findReusableCopiedFile(params: {
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
 }) {
+  if (!params.md5Checksum) return null;
   const safe = (v: string) => v.replace(/'/g, "");
   const identity = buildShareArtifactIdentity(params);
-  const result = await listDriveFiles({
+  const result = await listDriveFilesPaginated({
     accessToken: params.accessToken,
     q: [
       `'${safe(params.parentId)}' in parents`,
@@ -264,11 +281,29 @@ async function findReusableCopiedFile(params: {
       `appProperties has { key='lhPcmFormat' and value='${safe(params.pcmFormat)}' }`,
       `appProperties has { key='lhArtifactIdentity' and value='${safe(identity)}' }`,
     ].join(" and "),
-    pageSize: 10,
+    fields: "nextPageToken,files(id,name,mimeType,size,md5Checksum,trashed,parents,appProperties,capabilities(canDownload,canCopy))",
+    pageSize: 100,
+    throwOnError: false,
     signal: params.signal,
     fetchImpl: params.fetchImpl,
   });
-  return result.files[0] ?? null;
+  if (!result.complete) return null;
+  for (const candidate of result.files) {
+    if (candidate.trashed || candidate.capabilities?.canDownload === false || candidate.capabilities?.canCopy === false) continue;
+    if (Number(candidate.size) !== params.sizeBytes) continue;
+    if (candidate.md5Checksum !== params.md5Checksum) continue;
+    const props = candidate.appProperties ?? {};
+    if (
+      props.lhShareId !== params.shareId || props.lhStemRole !== params.role ||
+      props.lhChecksum !== params.checksum || props.lhSourceAudioHash !== params.sourceAudioHash ||
+      props.lhSeparationMode !== params.separationMode || props.lhModelVersion !== params.modelVersion ||
+      props.lhProcessingVersion !== params.processingVersion || props.lhArtifactRevision !== params.artifactRevision ||
+      props.lhSizeBytes !== String(params.sizeBytes) || props.lhPcmFormat !== params.pcmFormat ||
+      props.lhArtifactIdentity !== identity
+    ) continue;
+    return candidate;
+  }
+  return null;
 }
 
 export async function copyPreparedShareSong(params: {
@@ -296,7 +331,9 @@ export async function copyPreparedShareSong(params: {
 
   for (const role of requiredStemRolesForMode(sourceManifest.separation.mode)) {
     const source = sourceManifest.artifacts[role]!;
-    const checksum = source.checksum || source.md5Checksum!;
+    const checksumDescriptor = getArtifactChecksumDescriptor(source);
+    if (!checksumDescriptor) throw new Error(`分軌「${source.fileName}」缺少可驗證 Checksum。`);
+    const checksum = checksumDescriptor.value;
     const artifactIdentity = buildShareArtifactIdentity({
       sourceAudioHash: sourceManifest.source.sourceAudioHash,
       separationMode: sourceManifest.separation.mode,
@@ -305,6 +342,7 @@ export async function copyPreparedShareSong(params: {
       artifactRevision: sourceManifest.revisionId,
       role,
       checksum,
+      md5Checksum: source.md5Checksum,
       sizeBytes: source.sizeBytes,
       pcmFormat: sourceManifest.separation.format,
     });
@@ -313,6 +351,7 @@ export async function copyPreparedShareSong(params: {
       shareId: params.shareId,
       role,
       checksum,
+      md5Checksum: source.md5Checksum,
       sourceAudioHash: sourceManifest.source.sourceAudioHash,
       separationMode: sourceManifest.separation.mode,
       modelVersion: sourceManifest.separation.modelVersion,
@@ -355,6 +394,8 @@ export async function copyPreparedShareSong(params: {
       mimeType: copied.mimeType || "audio/wav",
       sizeBytes: Number(copied.size) || source.sizeBytes,
       checksum: source.checksum,
+      checksumAlgorithm: checksumDescriptor.algorithm,
+      checksumDescriptor,
       md5Checksum: copied.md5Checksum ?? source.md5Checksum,
     };
     copiedArtifacts[role] = copiedDescriptor;
@@ -388,7 +429,8 @@ export async function copyPreparedShareSong(params: {
       mimeType: copied.mimeType || source.mimeType,
       sizeBytes: Number(copied.size) || source.sizeBytes,
       checksum,
-      checksumAlgorithm: source.checksum ? "sha256" : "md5",
+      checksumAlgorithm: checksumDescriptor.algorithm,
+      checksumDescriptor,
       md5Checksum: copied.md5Checksum ?? source.md5Checksum,
       sourceAudioHash: sourceManifest.source.sourceAudioHash,
       separationMode: sourceManifest.separation.mode,
