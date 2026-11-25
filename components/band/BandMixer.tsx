@@ -8584,6 +8584,27 @@ export function BandMixer() {
       <ProjectShareDialog
         open={projectShareOpen}
         project={activeProjectRecord}
+        prepareProjectSnapshot={async (projectId) => {
+          if (activeProjectIdRef.current !== projectId) throw new Error("目前專案已切換，無法發布舊快照。");
+          captureLatestProjectSnapshot(projectId);
+          const latest = activeProjectRecordRef.current;
+          if (!latest || latest.projectId !== projectId) throw new Error("找不到目前專案的最新本機快照。");
+          const saved = await autoSyncControllerRef.current?.saveProjectLocallyNow(projectId, latest);
+          if (!saved?.ok || !saved.record) throw new Error(saved && !saved.ok ? saved.errorMessage : "本機專案保存失敗，未開始分享發布。");
+          if (activeProjectIdRef.current !== projectId) throw new Error("保存期間專案已切換，未開始分享發布。");
+          applyActiveProjectRecordMonotonically(saved.record);
+          return saved.record;
+        }}
+        onCompleteShareArtifacts={() => {
+          const missing = sessionRef.current.songs.find((song) => song.separationStatus === "completed" && !song.artifactRef?.manifestFileId);
+          if (!missing) {
+            showShortcutHint("目前沒有可由本機補齊的已完成分軌；請先完成分軌或檢查雲端成果。");
+            return;
+          }
+          setProjectShareOpen(false);
+          openDriveExportForSong(missing);
+          showShortcutHint("請確認輸出完整分軌至 Google Drive；完成後可重新開啟分享並發布。");
+        }}
         onClose={() => setProjectShareOpen(false)}
         onMessage={(message) => showShortcutHint(message)}
       />

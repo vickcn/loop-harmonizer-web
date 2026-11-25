@@ -25,6 +25,68 @@ export type PreparedShareSong = {
   sourceManifest: DriveSongManifest;
 };
 
+export function buildShareArtifactIdentity(params: {
+  sourceAudioHash: string;
+  separationMode: string;
+  modelVersion: string;
+  processingVersion: string;
+  artifactRevision: string;
+  role: string;
+  checksum: string;
+  sizeBytes: number;
+  pcmFormat: string;
+}): string {
+  const input = [params.sourceAudioHash, params.separationMode, params.modelVersion, params.processingVersion, params.artifactRevision, params.role, params.checksum, String(params.sizeBytes), params.pcmFormat].join("|");
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+
+export function buildSharedDriveSongManifest(params: {
+  entry: ProjectSongEntry;
+  sourceManifest: DriveSongManifest;
+  copiedArtifacts: DriveSongManifest["artifacts"];
+  shareId: string;
+  ownerAccountId: string;
+  nowIso?: string;
+}): DriveSongManifest {
+  const nowIso = params.nowIso ?? new Date().toISOString();
+  return {
+    schemaVersion: 1,
+    application: "loop-harmonizer",
+    songId: params.entry.entryId,
+    songName: params.entry.displayName,
+    stableSongKey: `shared-${params.shareId}-${params.entry.entryId}`,
+    revisionId: params.sourceManifest.revisionId,
+    ownerAccountId: params.ownerAccountId,
+    source: { provider: "local", fileName: "shared-stems", sourceAudioHash: params.sourceManifest.source.sourceAudioHash },
+    separation: {
+      mode: params.sourceManifest.separation.mode,
+      modelVersion: params.sourceManifest.separation.modelVersion,
+      processingVersion: params.sourceManifest.separation.processingVersion,
+      sampleRate: params.sourceManifest.separation.sampleRate,
+      channelCount: 2,
+      totalSamples: params.sourceManifest.separation.totalSamples,
+      format: params.sourceManifest.separation.format,
+      derivedFrom: params.sourceManifest.separation.derivedFrom
+        ? {
+            sourceMode: params.sourceManifest.separation.derivedFrom.sourceMode,
+            sourceRevisionId: params.sourceManifest.separation.derivedFrom.sourceRevisionId,
+            modelVersion: params.sourceManifest.separation.derivedFrom.modelVersion,
+            processingVersion: params.sourceManifest.separation.derivedFrom.processingVersion,
+          }
+        : null,
+    },
+    artifacts: params.copiedArtifacts,
+    status: "completed",
+    createdAt: nowIso,
+    updatedAt: nowIso,
+  };
+}
+
 function validateStandardWavHeader(
   buffer: ArrayBuffer,
   expected: DriveSongManifest["separation"],
@@ -168,15 +230,21 @@ export async function runProjectSharePreflight(params: {
 async function findReusableCopiedFile(params: {
   parentId: string;
   shareId: string;
-  publishedRevisionId: string;
-  entryId: string;
   role: string;
   checksum: string;
+  sourceAudioHash: string;
+  separationMode: string;
+  modelVersion: string;
+  processingVersion: string;
+  artifactRevision: string;
+  sizeBytes: number;
+  pcmFormat: string;
   accessToken: string;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
 }) {
   const safe = (v: string) => v.replace(/'/g, "");
+  const identity = buildShareArtifactIdentity(params);
   const result = await listDriveFiles({
     accessToken: params.accessToken,
     q: [
@@ -185,10 +253,16 @@ async function findReusableCopiedFile(params: {
       `appProperties has { key='lhApp' and value='loop-harmonizer' }`,
       `appProperties has { key='lhRole' and value='share_artifact' }`,
       `appProperties has { key='lhShareId' and value='${safe(params.shareId)}' }`,
-      `appProperties has { key='lhPublishedRevisionId' and value='${safe(params.publishedRevisionId)}' }`,
-      `appProperties has { key='lhEntryId' and value='${safe(params.entryId)}' }`,
       `appProperties has { key='lhStemRole' and value='${safe(params.role)}' }`,
       `appProperties has { key='lhChecksum' and value='${safe(params.checksum)}' }`,
+      `appProperties has { key='lhSourceAudioHash' and value='${safe(params.sourceAudioHash)}' }`,
+      `appProperties has { key='lhSeparationMode' and value='${safe(params.separationMode)}' }`,
+      `appProperties has { key='lhModelVersion' and value='${safe(params.modelVersion)}' }`,
+      `appProperties has { key='lhProcessingVersion' and value='${safe(params.processingVersion)}' }`,
+      `appProperties has { key='lhArtifactRevision' and value='${safe(params.artifactRevision)}' }`,
+      `appProperties has { key='lhSizeBytes' and value='${safe(String(params.sizeBytes))}' }`,
+      `appProperties has { key='lhPcmFormat' and value='${safe(params.pcmFormat)}' }`,
+      `appProperties has { key='lhArtifactIdentity' and value='${safe(identity)}' }`,
     ].join(" and "),
     pageSize: 10,
     signal: params.signal,
@@ -200,6 +274,7 @@ async function findReusableCopiedFile(params: {
 export async function copyPreparedShareSong(params: {
   prepared: PreparedShareSong;
   revisionFolderId: string;
+  artifactPoolFolderId?: string;
   shareId: string;
   publishedRevisionId: string;
   ownerAccountId: string;
@@ -209,7 +284,7 @@ export async function copyPreparedShareSong(params: {
 }): Promise<SharedProjectSong> {
   const { entry, sourceManifest } = params.prepared;
   const artifactFolderId = await ensureShareSongArtifactFolder({
-    revisionFolderId: params.revisionFolderId,
+    revisionFolderId: params.artifactPoolFolderId ?? params.revisionFolderId,
     shareId: params.shareId,
     entryId: entry.entryId,
     accessToken: params.accessToken,
@@ -217,18 +292,34 @@ export async function copyPreparedShareSong(params: {
     fetchImpl: params.fetchImpl,
   });
   const artifacts: SharedProjectSong["artifacts"] = [];
-  const copiedManifest = structuredClone(sourceManifest);
+  const copiedArtifacts: DriveSongManifest["artifacts"] = {};
 
   for (const role of requiredStemRolesForMode(sourceManifest.separation.mode)) {
     const source = sourceManifest.artifacts[role]!;
     const checksum = source.checksum || source.md5Checksum!;
+    const artifactIdentity = buildShareArtifactIdentity({
+      sourceAudioHash: sourceManifest.source.sourceAudioHash,
+      separationMode: sourceManifest.separation.mode,
+      modelVersion: sourceManifest.separation.modelVersion,
+      processingVersion: sourceManifest.separation.processingVersion,
+      artifactRevision: sourceManifest.revisionId,
+      role,
+      checksum,
+      sizeBytes: source.sizeBytes,
+      pcmFormat: sourceManifest.separation.format,
+    });
     const reusable = await findReusableCopiedFile({
       parentId: artifactFolderId,
       shareId: params.shareId,
-      publishedRevisionId: params.publishedRevisionId,
-      entryId: entry.entryId,
       role,
       checksum,
+      sourceAudioHash: sourceManifest.source.sourceAudioHash,
+      separationMode: sourceManifest.separation.mode,
+      modelVersion: sourceManifest.separation.modelVersion,
+      processingVersion: sourceManifest.separation.processingVersion,
+      artifactRevision: sourceManifest.revisionId,
+      sizeBytes: source.sizeBytes,
+      pcmFormat: sourceManifest.separation.format,
       accessToken: params.accessToken,
       signal: params.signal,
       fetchImpl: params.fetchImpl,
@@ -246,11 +337,50 @@ export async function copyPreparedShareSong(params: {
         lhEntryId: entry.entryId,
         lhStemRole: role,
         lhChecksum: checksum,
+        lhSourceAudioHash: sourceManifest.source.sourceAudioHash,
+        lhSeparationMode: sourceManifest.separation.mode,
+        lhModelVersion: sourceManifest.separation.modelVersion,
+        lhProcessingVersion: sourceManifest.separation.processingVersion,
+        lhArtifactRevision: sourceManifest.revisionId,
+        lhSizeBytes: String(source.sizeBytes),
+        lhPcmFormat: sourceManifest.separation.format,
+        lhArtifactIdentity: artifactIdentity,
       },
       signal: params.signal,
       fetchImpl: params.fetchImpl,
     });
-    copiedManifest.artifacts[role] = { ...source, fileId: copied.id, md5Checksum: copied.md5Checksum ?? source.md5Checksum };
+    const copiedDescriptor = {
+      fileId: copied.id,
+      fileName: copied.name || `${role}.wav`,
+      mimeType: copied.mimeType || "audio/wav",
+      sizeBytes: Number(copied.size) || source.sizeBytes,
+      checksum: source.checksum,
+      md5Checksum: copied.md5Checksum ?? source.md5Checksum,
+    };
+    copiedArtifacts[role] = copiedDescriptor;
+    const copiedMetadata = await getDriveFileMetadata(copied.id, {
+      accessToken: params.accessToken,
+      fields: "id,name,mimeType,size,md5Checksum,trashed,capabilities(canDownload)",
+      fileName: copiedDescriptor.fileName,
+      signal: params.signal,
+      fetchImpl: params.fetchImpl,
+    });
+    if (
+      copiedMetadata.trashed ||
+      copiedMetadata.capabilities?.canDownload === false ||
+      Number(copiedMetadata.size) !== source.sizeBytes ||
+      (source.md5Checksum && copiedMetadata.md5Checksum !== source.md5Checksum)
+    ) {
+      throw new Error(`共享副本「${copiedDescriptor.fileName}」的大小或 Drive MD5 驗證失敗。`);
+    }
+    validateStandardWavHeader(await downloadDriveFilePrefix({
+      fileId: copied.id,
+      accessToken: params.accessToken,
+      byteLength: 44,
+      fileName: copiedDescriptor.fileName,
+      signal: params.signal,
+      fetchImpl: params.fetchImpl,
+    }), sourceManifest.separation, copiedDescriptor.fileName);
     artifacts.push({
       role,
       fileId: copied.id,
@@ -258,11 +388,21 @@ export async function copyPreparedShareSong(params: {
       mimeType: copied.mimeType || source.mimeType,
       sizeBytes: Number(copied.size) || source.sizeBytes,
       checksum,
+      checksumAlgorithm: source.checksum ? "sha256" : "md5",
+      md5Checksum: copied.md5Checksum ?? source.md5Checksum,
+      sourceAudioHash: sourceManifest.source.sourceAudioHash,
+      separationMode: sourceManifest.separation.mode,
+      modelVersion: sourceManifest.separation.modelVersion,
+      processingVersion: sourceManifest.separation.processingVersion,
+      pcmFormat: sourceManifest.separation.format,
+      sampleRate: sourceManifest.separation.sampleRate,
+      channelCount: 2,
+      totalSamples: sourceManifest.separation.totalSamples,
+      artifactRevision: sourceManifest.revisionId,
     });
   }
 
-  copiedManifest.ownerAccountId = params.ownerAccountId;
-  copiedManifest.updatedAt = new Date().toISOString();
+  const copiedManifest = buildSharedDriveSongManifest({ entry, sourceManifest, copiedArtifacts, shareId: params.shareId, ownerAccountId: params.ownerAccountId });
   const uploadedManifest = await uploadDriveMultipartJson({
     accessToken: params.accessToken,
     name: "song-manifest.json",

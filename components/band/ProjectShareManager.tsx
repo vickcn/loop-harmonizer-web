@@ -28,6 +28,8 @@ export function ProjectShareManager({ share }: { share: ProjectShareRecord | nul
         {STATUS_LABELS[share.status]}
       </span>
       <span className="small">{visibility} · 發布 v{share.sourceProjectRevision}</span>
+      <span className="small">ACL：{share.aclVerification === "verified" ? "已核對" : share.aclVerification === "mismatch" ? "不一致" : share.aclVerification === "incomplete" ? "清單不完整" : "尚未確認"}</span>
+      {share.recoveredFromDriveAt && <span className="small">已由 Google Drive 重建紀錄</span>}
       {share.lastError && <span className="small project-share-error">{share.lastError}</span>}
     </div>
   );

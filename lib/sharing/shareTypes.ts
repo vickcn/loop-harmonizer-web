@@ -17,6 +17,9 @@ export type ProjectShareStatus =
   | "revoked"
   | "error";
 
+export type ShareAclVerification = "verified" | "mismatch" | "incomplete" | "unknown";
+export type ShareOperationKind = "publish" | "update_revision" | "update_acl" | "repair" | "revoke";
+
 export type ProjectShareRecipient = {
   email: string;
   permissionId: string;
@@ -48,6 +51,18 @@ export type ProjectShareRecord = {
   revokedAt?: string;
   lastError?: string;
   requiresPermissionRepair?: boolean;
+  aclVerification?: ShareAclVerification;
+  operationId?: string;
+  operationKind?: ShareOperationKind;
+  operationStartedAt?: string;
+  operationStage?: ProjectShareStatus;
+  pointerUpdatedInOperation?: boolean;
+  targetPublishedRevisionId?: string;
+  remotePointerVersion?: string;
+  revocationGeneration?: number;
+  revokedOperationId?: string;
+  recoveredFromDriveAt?: string;
+  discoveryComplete?: boolean;
 };
 
 export type SharedArtifactDescriptor = {
@@ -57,6 +72,17 @@ export type SharedArtifactDescriptor = {
   mimeType: string;
   sizeBytes: number;
   checksum: string;
+  checksumAlgorithm?: "sha256" | "md5";
+  md5Checksum?: string;
+  sourceAudioHash: string;
+  separationMode: "two_stem" | "four_stem";
+  modelVersion: string;
+  processingVersion: string;
+  pcmFormat: "wav-float32" | "wav-pcm16";
+  sampleRate: number;
+  channelCount: 2;
+  totalSamples: number;
+  artifactRevision: string;
 };
 
 export type SharedProjectSong = {
@@ -124,4 +150,25 @@ export type ShareRevokeResult = {
     emailAddress?: string;
     inherited: boolean;
   }>;
+};
+
+export type ShareAclReconciliationResult = {
+  verification: ShareAclVerification;
+  recipients: ProjectShareRecipient[];
+  anyonePermissionId?: string;
+  permissions: Array<{
+    id: string;
+    type: string;
+    role: string;
+    emailAddress?: string;
+    inherited: boolean;
+  }>;
+  addedPermissionIds: string[];
+  removedPermissionIds: string[];
+};
+
+export type ProjectShareDiscoveryResult = {
+  shares: ProjectShareRecord[];
+  complete: boolean;
+  errorMessage?: string;
 };

@@ -10,7 +10,7 @@ test("published or unconfirmed share artifacts are protected from GC", () => {
   assert.equal(canGarbageCollectShareFolder(base, { explicitUserConfirmation: true }).allowed, false);
   assert.equal(canGarbageCollectShareFolder({ ...base, status: "revoked", visibility: "private" }).allowed, false);
   assert.equal(canGarbageCollectShareFolder({ ...base, status: "revoked", visibility: "private" }, { explicitUserConfirmation: true, referencedByOtherShare: true }).allowed, false);
-  assert.equal(canGarbageCollectShareFolder({ ...base, status: "revoked", visibility: "private" }, { explicitUserConfirmation: true }).allowed, true);
+  assert.equal(canGarbageCollectShareFolder({ ...base, status: "revoked", visibility: "private", aclVerification: "verified" }, { explicitUserConfirmation: true, inventoryComplete: true }).allowed, true);
 });
 
 test("GC lookup fails closed when share record is absent or still published", async () => {

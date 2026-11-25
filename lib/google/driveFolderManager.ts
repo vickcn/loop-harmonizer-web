@@ -83,6 +83,7 @@ export interface ShareFolderLayout {
   sharedFolderId: string;
   shareFolderId: string;
   revisionsFolderId: string;
+  artifactPoolFolderId: string;
   revisionFolderId: string;
   revisionStagingParentId: string;
   duplicateFolderIds: string[];
@@ -610,6 +611,15 @@ export async function ensureShareRevisionFolder(params: {
     signal: params.signal,
     fetchImpl: params.fetchImpl,
   });
+  const artifactPoolFolderId = await ensureChildManagedFolder({
+    parentId: shareFolderId,
+    name: "artifacts",
+    role: "share_artifact_pool",
+    extraAppProps: { lhShareId: params.shareId },
+    accessToken: params.accessToken,
+    signal: params.signal,
+    fetchImpl: params.fetchImpl,
+  });
   const revisionFolderId = await ensureChildManagedFolder({
     parentId: sharedFolderId,
     name: params.publishedRevisionId,
@@ -629,6 +639,7 @@ export async function ensureShareRevisionFolder(params: {
     sharedFolderId,
     shareFolderId,
     revisionsFolderId,
+    artifactPoolFolderId,
     revisionFolderId,
     revisionStagingParentId: sharedFolderId,
     duplicateFolderIds,

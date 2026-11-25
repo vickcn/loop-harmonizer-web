@@ -2,6 +2,7 @@ import { createInitialPersistedProjectRecord, generateEntryId, generateProjectUu
 import type { BandProject, PersistedProjectRecord } from "../projects/projectTypes.ts";
 import { saveProjectRecord, setActiveProjectId } from "../storage/projectStore.ts";
 import type { ProjectShareManifest } from "./shareTypes.ts";
+import { validateProjectShareManifest } from "./shareManifest.ts";
 
 export function createImportedProjectFromShare(params: {
   manifest: ProjectShareManifest;
@@ -70,7 +71,11 @@ export async function importSharedProjectMetadata(params: {
   pointerFileId?: string;
   setActive?: boolean;
 }): Promise<PersistedProjectRecord> {
-  const project = createImportedProjectFromShare(params);
+  const validated = validateProjectShareManifest(params.manifest, {
+    shareId: params.manifest.shareId,
+    publishedRevisionId: params.manifest.publishedRevisionId,
+  });
+  const project = createImportedProjectFromShare({ ...params, manifest: validated });
   const initial = createInitialPersistedProjectRecord(project, { dirty: false, syncStatus: "local_only" });
   const saved = await saveProjectRecord(initial, { allowCreateIfDeleted: true });
   if (!saved.saved) throw new Error(saved.errorMessage || "無法保存匯入的共享專案。");

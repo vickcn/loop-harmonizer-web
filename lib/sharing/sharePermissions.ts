@@ -1,4 +1,5 @@
 import { mapResponseToDriveError } from "../google/driveClient.ts";
+import type { ProjectShareVisibility, ShareAclReconciliationResult } from "./shareTypes.ts";
 
 export type DrivePermission = {
   id: string;
@@ -98,4 +99,107 @@ export function isExternalSharePermission(permission: DrivePermission): boolean 
 
 export function isInheritedPermission(permission: DrivePermission): boolean {
   return Boolean(permission.permissionDetails?.some((detail) => detail.inherited));
+}
+
+function normalizeEmails(values: readonly string[]): string[] {
+  return Array.from(new Set(values.map((value) => value.trim().toLowerCase()).filter((value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value))));
+}
+
+export function evaluateShareAcl(params: {
+  permissions: readonly DrivePermission[];
+  visibility: Exclude<ProjectShareVisibility, "private">;
+  recipientEmails?: readonly string[];
+}): ShareAclReconciliationResult {
+  const desiredEmails = new Set(normalizeEmails(params.recipientEmails ?? []));
+  const direct = params.permissions.filter((permission) => isExternalSharePermission(permission) && !isInheritedPermission(permission));
+  const inherited = params.permissions.filter((permission) => isExternalSharePermission(permission) && isInheritedPermission(permission));
+  const anyone = direct.filter((permission) => permission.type === "anyone" && permission.role === "reader");
+  const recipients = direct
+    .filter((permission) => (permission.type === "user" || permission.type === "group") && permission.role === "reader" && permission.emailAddress)
+    .map((permission) => ({
+      email: permission.emailAddress!.trim().toLowerCase(),
+      permissionId: permission.id,
+      role: "reader" as const,
+      type: permission.type as "user" | "group",
+      createdAt: new Date().toISOString(),
+    }));
+  const actualEmails = new Set(recipients.map((recipient) => recipient.email));
+  const exactRestricted = params.visibility === "restricted"
+    && anyone.length === 0
+    && direct.every((permission) => (permission.type === "user" || permission.type === "group") && permission.role === "reader" && Boolean(permission.emailAddress))
+    && desiredEmails.size === actualEmails.size
+    && [...desiredEmails].every((email) => actualEmails.has(email));
+  const exactLink = params.visibility === "link"
+    && anyone.length === 1
+    && direct.length === 1
+    && anyone[0].allowFileDiscovery !== true;
+  return {
+    verification: inherited.length > 0 ? "incomplete" : exactRestricted || exactLink ? "verified" : "mismatch",
+    recipients,
+    anyonePermissionId: anyone[0]?.id,
+    permissions: params.permissions.filter(isExternalSharePermission).map((permission) => ({
+      id: permission.id,
+      type: permission.type,
+      role: permission.role,
+      emailAddress: permission.emailAddress,
+      inherited: isInheritedPermission(permission),
+    })),
+    addedPermissionIds: [],
+    removedPermissionIds: [],
+  };
+}
+
+/** 先新增並確認，再移除舊 ACL；任何部分成功都以重新讀取的遠端 ACL 為準。 */
+export async function reconcileSharePermissions(params: {
+  fileId: string;
+  accessToken: string;
+  visibility: Exclude<ProjectShareVisibility, "private">;
+  recipientEmails?: readonly string[];
+  signal?: AbortSignal;
+  fetchImpl?: typeof fetch;
+}): Promise<ShareAclReconciliationResult> {
+  const desiredEmails = normalizeEmails(params.recipientEmails ?? []);
+  if (params.visibility === "restricted" && desiredEmails.length === 0) {
+    throw new Error("指定對象分享至少需要一個有效的 Google 帳號 Email。");
+  }
+  const before = await listDrivePermissions(params);
+  const addedPermissionIds: string[] = [];
+  const currentDirect = before.filter((permission) => isExternalSharePermission(permission) && !isInheritedPermission(permission));
+  if (params.visibility === "link") {
+    if (!currentDirect.some((permission) => permission.type === "anyone" && permission.role === "reader" && permission.allowFileDiscovery !== true)) {
+      const created = await createDriveReaderPermission({ ...params, fileId: params.fileId, type: "anyone", sendNotificationEmail: false });
+      addedPermissionIds.push(created.id);
+    }
+  } else {
+    for (const email of desiredEmails) {
+      const existing = currentDirect.find((permission) => permission.role === "reader" && permission.emailAddress?.trim().toLowerCase() === email);
+      if (!existing) {
+        const created = await createDriveReaderPermission({ ...params, fileId: params.fileId, type: "user", emailAddress: email });
+        addedPermissionIds.push(created.id);
+      }
+    }
+  }
+  const afterAdds = await listDrivePermissions(params);
+  const addCheck = evaluateShareAcl({ permissions: afterAdds, visibility: params.visibility, recipientEmails: desiredEmails });
+  const additionsPresent = params.visibility === "link"
+    ? afterAdds.some((permission) => permission.type === "anyone" && permission.role === "reader")
+    : desiredEmails.every((email) => afterAdds.some((permission) => permission.role === "reader" && permission.emailAddress?.trim().toLowerCase() === email));
+  if (!additionsPresent) {
+    return { ...addCheck, verification: "incomplete", addedPermissionIds, removedPermissionIds: [] };
+  }
+  const desiredIds = new Set<string>();
+  for (const permission of afterAdds) {
+    if (isInheritedPermission(permission) || !isExternalSharePermission(permission)) continue;
+    if (params.visibility === "link" && permission.type === "anyone" && permission.role === "reader") desiredIds.add(permission.id);
+    if (params.visibility === "restricted" && permission.role === "reader" && permission.emailAddress && desiredEmails.includes(permission.emailAddress.trim().toLowerCase())) desiredIds.add(permission.id);
+  }
+  const removedPermissionIds: string[] = [];
+  for (const permission of afterAdds) {
+    if (!isExternalSharePermission(permission) || isInheritedPermission(permission) || desiredIds.has(permission.id)) continue;
+    await deleteDrivePermission({ ...params, fileId: params.fileId, permissionId: permission.id });
+    removedPermissionIds.push(permission.id);
+  }
+  const finalPermissions = await listDrivePermissions(params);
+  const evaluated = evaluateShareAcl({ permissions: finalPermissions, visibility: params.visibility, recipientEmails: desiredEmails });
+  return { ...evaluated, addedPermissionIds, removedPermissionIds };
 }

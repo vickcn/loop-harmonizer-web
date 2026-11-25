@@ -47,5 +47,32 @@ export async function loadAndValidateSharedProject(params: {
     }),
     { shareId: pointer.shareId, publishedRevisionId: pointer.publishedRevisionId },
   );
+  for (const song of manifest.songs) {
+    const songManifest = await getDriveFileMetadata(song.manifestFileId, {
+      accessToken: params.accessToken,
+      fields: "id,trashed,appProperties,capabilities(canDownload)",
+      signal: params.signal,
+      fetchImpl: params.fetchImpl,
+    });
+    if (songManifest.trashed || songManifest.capabilities?.canDownload === false) {
+      throw new Error(`你目前無法讀取歌曲「${song.entry.displayName}」的共享 Manifest；請由分享者檢查權限。`);
+    }
+    for (const artifact of song.artifacts) {
+      const metadata = await getDriveFileMetadata(artifact.fileId, {
+        accessToken: params.accessToken,
+        fields: "id,mimeType,size,md5Checksum,trashed,capabilities(canDownload)",
+        signal: params.signal,
+        fetchImpl: params.fetchImpl,
+      });
+      if (
+        metadata.trashed ||
+        metadata.capabilities?.canDownload === false ||
+        Number(metadata.size) !== artifact.sizeBytes ||
+        (artifact.md5Checksum && metadata.md5Checksum !== artifact.md5Checksum)
+      ) {
+        throw new Error(`你目前無法讀取或驗證歌曲「${song.entry.displayName}」的 ${artifact.role} 分軌；選取 share.json 不代表所有引用檔案皆已授權。`);
+      }
+    }
+  }
   return { pointer, manifest };
 }
