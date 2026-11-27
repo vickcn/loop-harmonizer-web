@@ -87,6 +87,7 @@ type PublishParams = {
   record: PersistedProjectRecord; accountId: string; accessToken: string;
   visibility: Exclude<ProjectShareVisibility, "private">; recipientEmails?: string[];
   existingShare?: ProjectShareRecord | null; authGeneration: number;
+  requestedShareId?: string;
   isGenerationValid: (generation: number, accountId: string) => boolean;
   signal?: AbortSignal; fetchImpl?: typeof fetch; onStage?: (stage: ProjectShareRecord["status"]) => void;
 };
@@ -186,7 +187,7 @@ async function publishUnlocked(params: PublishParams & { shareId: string; operat
 export async function publishProjectShare(params: PublishParams): Promise<ProjectShareRecord> {
   if (!params.accountId || !params.accessToken) throw new Error("請先登入 Google 帳號並完成授權。");
   validateProjectSharePublishOwnership(params.record, params.accountId);
-  const shareId = params.existingShare?.shareId ?? makeId("share");
+  const shareId = params.existingShare?.shareId ?? params.requestedShareId ?? makeId("share");
   return withProjectShareOperation({ lockKey: params.existingShare?.shareId ?? `source:${params.record.projectId}`, shareId, kind: params.existingShare?.status === "published" ? "update_revision" : "publish", expectedGeneration: params.existingShare?.operationGeneration, runner: (reservation) => publishUnlocked({ ...params, shareId, operationId: reservation.operationId, operationGeneration: reservation.generation }) });
 }
 

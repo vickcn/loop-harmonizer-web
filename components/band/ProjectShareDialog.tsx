@@ -2,6 +2,8 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { sharedGoogleAccountManager } from "@/lib/google/googleAccountManager";
+import { sharedCloudTaskManager } from "@/lib/cloudTasks/cloudTaskManager";
+import { getProjectRecord } from "@/lib/storage/projectStore";
 import type { PersistedProjectRecord } from "@/lib/projects/projectTypes";
 import {
   buildProjectShareUrl,
@@ -65,7 +67,8 @@ export function ProjectShareDialog({ open, project, prepareProjectSnapshot, onCo
 
   const emails = useMemo(() => parseEmails(emailText), [emailText]);
   const link = useMemo(() => share ? buildProjectShareUrl(share, typeof window !== "undefined" ? window.location.origin : undefined) : null, [share]);
-  if (!open) return null;
+  const onMessageRef = useRef(onMessage);
+  onMessageRef.current = onMessage;
 
   const requireAuth = async () => {
     let snapshot = sharedGoogleAccountManager.getSnapshot();
@@ -78,29 +81,57 @@ export function ProjectShareDialog({ open, project, prepareProjectSnapshot, onCo
     return { snapshot, token };
   };
 
+  useEffect(() => {
+    let active = true;
+    const unregister = sharedCloudTaskManager.registerExecutor("share_publish", async (task, context) => {
+      const descriptor = task.descriptor;
+      const current = await getProjectRecord(descriptor.projectId);
+      if (!current) return { status: "failed", stage: "專案不存在", errorCode: "project_missing", errorMessage: "來源專案已刪除，無法恢復分享發布。", retryable: false };
+      if (current.storageProvider === "google_drive" && current.ownerAccountId !== task.ownerAccountId) return { status: "failed", stage: "帳戶不一致", errorCode: "account_mismatch", errorMessage: "目前帳戶不是此雲端專案擁有者。", retryable: false };
+      const record = descriptor.projectSnapshot ?? (current.project.revisionToken === descriptor.snapshotRevision ? current : null);
+      if (!record || record.project.revisionToken !== descriptor.snapshotRevision) return { status: "failed", stage: "共享快照不存在", errorCode: "snapshot_missing", errorMessage: "無法重建使用者確認的共享版本，已安全停止。", retryable: false };
+      const existing = await getProjectShareRecord(descriptor.shareId);
+      if (existing?.status === "revoked") return { status: "failed", stage: "分享已撤銷", errorCode: "share_revoked", errorMessage: "已撤銷分享不得由背景續跑重新公開。", retryable: false };
+      const next = await publishProjectShare({
+        record, accountId: task.ownerAccountId, accessToken: context.accessToken,
+        visibility: descriptor.visibility, recipientEmails: descriptor.recipientEmails,
+        existingShare: existing, requestedShareId: descriptor.shareId,
+        authGeneration: context.accountGeneration,
+        isGenerationValid: (_generation, accountId) => accountId === task.ownerAccountId && context.isAccountGenerationValid(),
+        signal: context.signal,
+        onStage: (stage) => { void context.updateProgress({ stage: `分享發布：${stage}` }).catch(() => undefined); },
+      });
+      if (next.status !== "published") {
+        return { status: "failed", stage: "分享結果未通過驗證", errorCode: "share_validation_failed", errorMessage: "Share Pointer、Revision 或 ACL 未完成驗證。", retryable: false };
+      }
+      if (active) { setShare(next); onMessageRef.current("背景共享版本已發布並完成 ACL 驗證。"); }
+      return { status: "completed", stage: "Share Pointer、Revision、Lifecycle 與 ACL 已驗證" };
+    });
+    return () => { active = false; unregister(); };
+  }, []);
+
+  if (!open) return null;
+
   const publishRevision = async () => {
     if (!project || busy) return;
     setBusy(true); setError(null);
     try {
-      const { snapshot, token } = await requireAuth();
+      const { snapshot } = await requireAuth();
       const fresh = await prepareProjectSnapshot(project.projectId);
       if (fresh.projectId !== project.projectId) throw new Error("專案已切換，已停止發布。");
       if (fresh.storageProvider === "google_drive" && fresh.ownerAccountId !== snapshot.account!.accountId) {
         throw new Error("目前 Google 帳號不是此雲端專案擁有者。");
       }
-      const next = await publishProjectShare({
-        record: fresh,
-        accountId: snapshot.account!.accountId,
-        accessToken: token,
-        visibility,
-        recipientEmails: emails,
-        existingShare: share?.status === "revoked" ? null : share,
-        authGeneration: snapshot.generation,
-        isGenerationValid: sharedGoogleAccountManager.isGenerationValid,
-        onStage: (stage) => setShare((current) => current ? { ...current, status: stage } : current),
+      const shareId = share?.status !== "revoked" ? share?.shareId : undefined;
+      const requestedShareId = shareId ?? `share_${crypto.randomUUID()}`;
+      await sharedCloudTaskManager.enqueue({
+        kind: "share_publish", ownerAccountId: snapshot.account!.accountId,
+        projectId: fresh.projectId, projectName: fresh.project.name, shareId: requestedShareId,
+        snapshotRevision: fresh.project.revisionToken,
+        intentId: `share_publish:${snapshot.account!.accountId}:${requestedShareId}:${fresh.project.revisionToken}:${visibility}:${emails.slice().sort().join(",")}`,
+        descriptor: { projectId: fresh.projectId, shareId: requestedShareId, snapshotRevision: fresh.project.revisionToken, projectSnapshot: fresh, visibility, recipientEmails: emails.slice().sort() },
       });
-      setShare(next);
-      onMessage(share?.status === "published" ? "共享音樂版本已更新。" : "專案分享已發布。");
+      onMessage("已建立背景分享發布任務；關閉視窗不會取消，完成前不會提供可用分享連結。");
     } catch (err) { setError(err instanceof Error ? err.message : "專案分享失敗。"); }
     finally { setBusy(false); }
   };

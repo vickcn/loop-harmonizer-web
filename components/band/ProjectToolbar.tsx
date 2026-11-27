@@ -31,6 +31,7 @@ type Props = {
   onSyncProject: () => void;
   onOpenConflict: () => void;
   onReauthorizeSync: () => void;
+  onOpenCloudTasks: () => void;
 };
 
 function ProjectFolderIcon() {
@@ -57,6 +58,15 @@ function CloudSyncIcon() {
       <path d="M12 13v8" />
       <path d="m8 17 4-4 4 4" />
       <path d="M4 14.9A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242" />
+    </svg>
+  );
+}
+
+function CloudTaskIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M6.5 18H18a4 4 0 0 0 .7-7.94A7 7 0 0 0 5.1 8.3 5 5 0 0 0 6.5 18Z" />
+      <path d="M9 14h6M12 11v6" />
     </svg>
   );
 }
@@ -149,6 +159,13 @@ export function ProjectToolbar(props: Props) {
               onClick={handlerForAction(action.key)}
             />
           ))}
+          <IconActionButton
+            icon={<CloudTaskIcon />}
+            text="任務"
+            label="開啟背景雲端任務中心"
+            tooltipPlacement="bottom"
+            onClick={props.onOpenCloudTasks}
+          />
         </div>
       </div>
 

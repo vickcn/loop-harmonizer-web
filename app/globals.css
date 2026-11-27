@@ -2334,3 +2334,35 @@ li.status-dot-tooltip-row.is-row-highlighted {
   .mixer-shell .mixer-range::-webkit-slider-thumb { width: 22px; height: 22px; }
   .mixer-shell .mixer-range::-moz-range-thumb { width: 22px; height: 22px; }
 }
+.cloud-task-center-trigger {
+  position: fixed;
+  right: max(14px, env(safe-area-inset-right));
+  bottom: max(72px, calc(env(safe-area-inset-bottom) + 58px));
+  z-index: 80;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 13px;
+  border: 1px solid var(--mixer-border-strong, rgba(148, 163, 184, .38));
+  border-radius: 999px;
+  color: var(--mixer-text, #eef3ff);
+  background: var(--mixer-panel-raised, #202531);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, .28);
+  cursor: pointer;
+}
+.cloud-task-center-trigger b { min-width: 20px; height: 20px; display: inline-grid; place-items: center; border-radius: 999px; background: var(--mixer-accent, #82b1ff); color: #07111f; font-size: 11px; }
+.cloud-task-center { width: min(680px, calc(100vw - 28px)); max-height: min(78vh, 760px); overflow: auto; }
+.cloud-task-list { display: grid; gap: 10px; min-width: 0; }
+.cloud-task-item { display: grid; min-width: 0; gap: 8px; padding: 12px; border: 1px solid var(--mixer-border, rgba(148, 163, 184, .24)); border-radius: 14px; background: var(--mixer-panel-soft, rgba(255,255,255,.03)); }
+.cloud-task-item-head, .cloud-task-actions { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.cloud-task-progress { display: grid; gap: 5px; min-width: 0; }
+.cloud-task-progress progress { width: 100%; accent-color: var(--mixer-accent, #82b1ff); }
+.cloud-task-rolling { height: 5px; overflow: hidden; border-radius: 999px; background: rgba(148,163,184,.18); }
+.cloud-task-rolling span { display: block; width: 36%; height: 100%; border-radius: inherit; background: var(--mixer-accent, #82b1ff); animation: cloud-task-roll 1.2s ease-in-out infinite alternate; }
+@keyframes cloud-task-roll { from { transform: translateX(-20%); } to { transform: translateX(200%); } }
+@media (max-width: 640px) {
+  .cloud-task-center-trigger { right: 10px; bottom: max(68px, calc(env(safe-area-inset-bottom) + 58px)); }
+  .cloud-task-center { width: calc(100vw - 18px); max-height: 84vh; }
+  .cloud-task-actions .mixer-button { flex: 1 1 120px; min-width: 0; }
+}

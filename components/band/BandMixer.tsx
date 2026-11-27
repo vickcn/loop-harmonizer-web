@@ -149,6 +149,7 @@ import { idbPut } from "@/lib/storage/indexedDb";
 import {
   commitProjectSyncResultAtomically,
   getProjectRecord,
+  saveLocalProjectEditAtomically,
   setActiveProjectId,
   subscribeProjectSyncBroadcast,
 } from "@/lib/storage/projectStore";
@@ -160,6 +161,8 @@ import type {
 } from "@/lib/projects/projectTypes";
 import {
   buildProjectFromBandSongs,
+  computeProjectBackupSummary,
+  generateRevisionToken,
   isProjectContentEqual,
   computeEntryBackupStatus,
 } from "@/lib/projects/projectModel";
@@ -169,6 +172,8 @@ import {
 } from "@/lib/projects/projectToolbarModel";
 import {
   ProjectAutoSyncController,
+  backupLocalOriginalAudioToDrive,
+  saveProjectToDrive,
   type ProjectDriveSyncOutcome,
 } from "@/lib/projects/projectDriveSync";
 import {
@@ -222,6 +227,7 @@ import { clearCachedFolderLayoutForAccount } from "@/lib/google/driveFolderManag
 import { clearResumableSessionUrisForAccount } from "@/lib/google/driveResumableUpload";
 import {
   exportSongArtifactsToDrive,
+  estimateSongDriveExportBytes,
   type DriveExportProgress,
   type DriveExportSelection,
 } from "@/lib/google/driveExportManager";
@@ -234,6 +240,7 @@ import {
   type InvalidDriveLibraryEntry,
 } from "@/lib/google/driveRestoreManager";
 import { isTaskPinnedByDriveTransfer } from "@/lib/storage/driveTransferStore";
+import { sharedCloudTaskManager } from "@/lib/cloudTasks/cloudTaskManager";
 import {
   findImportedStemByHash,
   getImportedStemRecord,
@@ -5930,7 +5937,7 @@ export function BandMixer() {
     setDriveExportModalSongId(song.id);
   };
 
-  const startDriveExport = async (selectionInput: DriveExportSelection, songOverride?: BandSong): Promise<boolean> => {
+  const startDriveExport = async (selectionInput: DriveExportSelection, songOverride?: BandSong, cloudContext?: { signal: AbortSignal; updateProgress: (patch: { stage: string; completedBytes?: number; totalBytes?: number; completedFiles?: number; totalFiles?: number; currentFileName?: string }) => Promise<void> }): Promise<boolean> => {
     const targetSong = songOverride ?? (driveExportModalSongId
       ? sessionRef.current.songs.find((item) => item.id === driveExportModalSongId)
       : null);
@@ -5958,6 +5965,8 @@ export function BandMixer() {
     }
 
     const controller = new AbortController();
+    const abortFromCloud = () => controller.abort();
+    cloudContext?.signal.addEventListener("abort", abortFromCloud, { once: true });
     driveExportAbortRef.current = controller;
     driveExportPauseRequestedRef.current = false;
     setDriveExportSubmitting(true);
@@ -5992,6 +6001,7 @@ export function BandMixer() {
             ...prev,
             [targetSong.id]: progress,
           }));
+          if (cloudContext) void cloudContext.updateProgress({ stage: progress.message, completedBytes: progress.uploadedBytes, totalBytes: progress.totalBytes, completedFiles: Math.max(0, progress.fileIndex - 1), totalFiles: progress.totalFiles, currentFileName: progress.currentFileName }).catch(() => undefined);
         },
       });
 
@@ -6079,6 +6089,7 @@ export function BandMixer() {
         setDriveExportError(result.errorMessage ?? "上傳至 Google Drive 失敗。");
       }
     } finally {
+      cloudContext?.signal.removeEventListener("abort", abortFromCloud);
       driveExportAbortRef.current = null;
       driveExportPauseRequestedRef.current = false;
       setDriveExportSubmitting(false);
@@ -6090,6 +6101,50 @@ export function BandMixer() {
       });
     }
     return completed;
+  };
+
+  useEffect(() => sharedCloudTaskManager.registerExecutor("stem_export", async (task, context) => {
+    const descriptor = task.descriptor;
+    const liveSong = sessionRef.current.songs.find((item) => item.id === descriptor.songId || (item.projectEntryId ?? item.id) === descriptor.songId);
+    if (!liveSong) return { status: "waiting_resources", stage: "等待歌曲與持久化分軌載入" };
+    const song = descriptor.songSnapshot ? { ...liveSong, ...descriptor.songSnapshot } : liveSong;
+    if (song.sourceAudioHash !== descriptor.sourceAudioHash) return { status: "failed", stage: "來源已變更", errorCode: "source_mismatch", errorMessage: "歌曲來源已更換，禁止舊任務上傳。", retryable: false };
+    if (!song.artifactRef || song.artifactRef.revisionId !== descriptor.artifactRevision) return { status: "failed", stage: "分軌版本不一致", errorCode: "artifact_revision_mismatch", errorMessage: "正式分軌版本已變更，禁止舊任務輸出。", retryable: false };
+    const ok = await startDriveExport({ ...descriptor.selection, includeStems: true }, song, context);
+    if (ok) return { status: "completed", stage: "全部 WAV、Checksum 與 Manifest 已驗證" };
+    if (!sharedGoogleAccountManager.getValidAccessToken(task.ownerAccountId)) return { status: "waiting_auth", stage: "等待重新授權" };
+    if (context.signal.aborted) return { status: "paused", stage: "已保存已完成 Artifact" };
+    return { status: "failed", stage: "分軌輸出未完成", errorMessage: "Google Drive 輸出未完成，將依安全退避重試。", retryable: true };
+  }), []);
+
+  const createDriveExportTask = async (targetSong: BandSong, selection: DriveExportSelection) => {
+    if (!targetSong.artifactRef || !targetSong.sourceAudioHash) throw new Error("缺少已完成的分軌版本，無法建立背景輸出任務。");
+    let snapshot = sharedGoogleAccountManager.getSnapshot();
+    if (!snapshot.account) snapshot = await sharedGoogleAccountManager.signIn();
+    if (!snapshot.account) throw new Error("請先登入 Google 帳號。");
+    const totalSamples = Math.max(1, targetSong.artifactRef.totalSamples || Math.round(targetSong.durationSec * 44100));
+    const estimate = estimateSongDriveExportBytes({ totalSamples, mode: targetSong.artifactRef.separationMode, selection });
+    return sharedCloudTaskManager.enqueue({
+      kind: "stem_export", ownerAccountId: snapshot.account.accountId, projectId: activeProjectIdRef.current ?? undefined,
+      projectName: activeProjectRecordRef.current?.project.name, songId: targetSong.id, songName: targetSong.name,
+      snapshotRevision: targetSong.artifactRef.revisionId,
+      intentId: `stem_export:${snapshot.account.accountId}:${targetSong.id}:${targetSong.artifactRef.revisionId}:${selection.format}:${selection.selectedStemRoles?.join(",") ?? "all"}:${selection.includeSessionJson ? 1 : 0}:${selection.includeCustomMix ? 1 : 0}:${selection.forceNewRevision ? 1 : 0}`,
+      descriptor: { projectId: activeProjectIdRef.current ?? undefined, songId: targetSong.id, sourceAudioHash: targetSong.sourceAudioHash!, artifactRevision: targetSong.artifactRef.revisionId, checkpointTaskId: targetSong.separationTaskId ?? undefined, songSnapshot: targetSong, selection: { format: selection.format, selectedStemRoles: selection.selectedStemRoles ?? [], includeSessionJson: selection.includeSessionJson, includeCustomMix: selection.includeCustomMix, forceNewRevision: Boolean(selection.forceNewRevision) } },
+      totalBytes: estimate.totalEstimatedBytes, totalFiles: estimate.stemCount + (selection.includeCustomMix ? 1 : 0) + (selection.includeSessionJson ? 1 : 0) + 1,
+    });
+  };
+
+  const enqueueDriveExport = async (selection: DriveExportSelection) => {
+    const targetSong = driveExportModalSongId ? sessionRef.current.songs.find((item) => item.id === driveExportModalSongId) : null;
+    if (!targetSong) { setDriveExportError("找不到要輸出的歌曲。"); return; }
+    try {
+      await createDriveExportTask(targetSong, selection);
+    } catch (error) {
+      setDriveExportError(error instanceof Error ? error.message : "無法建立背景輸出任務。");
+      return;
+    }
+    setDriveExportModalSongId(null);
+    showShortcutHint("已建立背景分軌輸出任務；可關閉視窗並繼續播放。背景凍結後會從安全 Artifact 狀態恢復。");
   };
 
   const pauseDriveExport = () => {
@@ -7344,6 +7399,29 @@ export function BandMixer() {
     }
   };
 
+  useEffect(() => sharedCloudTaskManager.registerExecutor("project_sync", async (task, context) => {
+    const descriptor = task.descriptor;
+    const current = await getProjectRecord(descriptor.projectId);
+    if (!current) return { status: "failed", stage: "專案不存在", errorCode: "project_missing", errorMessage: "專案已被刪除，無法恢復同步。", retryable: false };
+    if (current.ownerAccountId !== task.ownerAccountId) return { status: "failed", stage: "帳戶不一致", errorCode: "account_mismatch", errorMessage: "專案擁有者與任務帳戶不一致。", retryable: false };
+    const record = descriptor.projectSnapshot ?? (current.project.revisionToken === descriptor.snapshotRevision ? current : null);
+    if (!record || record.project.revisionToken !== descriptor.snapshotRevision) return { status: "failed", stage: "同步快照不存在", errorCode: "snapshot_missing", errorMessage: "無法重建建立任務時的固定專案快照，已安全停止。", retryable: false };
+    if (!context.isAccountGenerationValid()) return { status: "waiting_auth", stage: "等待原帳戶重新授權" };
+    await context.updateProgress({ stage: "驗證固定 Project Revision 與遠端分支", completedBytes: 0 });
+    const outcome = await saveProjectToDrive({
+      record,
+      accountId: task.ownerAccountId,
+      accessToken: context.accessToken,
+      generation: context.accountGeneration,
+      isGenerationValid: () => context.isAccountGenerationValid(),
+      signal: context.signal,
+    });
+    if (outcome.status === "synced") return { status: "completed", stage: "遠端 Revision 已驗證" };
+    if (outcome.status === "error") return { status: "failed", stage: "專案同步失敗", errorMessage: outcome.errorMessage, retryable: outcome.retryable };
+    if (outcome.status === "cancelled" && !context.isAccountGenerationValid()) return { status: "waiting_auth", stage: "等待重新授權", errorMessage: outcome.reason };
+    return { status: "failed", stage: outcome.status === "conflict" ? "偵測到跨裝置衝突" : "同步已安全停止", errorCode: outcome.status, errorMessage: outcome.status === "cancelled" ? outcome.reason : "需要使用者處理遠端版本，未自動覆寫。", retryable: false };
+  }), []);
+
   /** 使用者點擊「重新授權並同步」後，走同一套授權優先 + 重入防護同步編排流程。 */
   const handleReauthorizeAndSync = async () => {
     const coordinator = manualSyncCoordinatorRef.current;
@@ -7361,12 +7439,107 @@ export function BandMixer() {
     const coordinator = manualSyncCoordinatorRef.current;
     if (!coordinator) return;
     try {
+      const active = activeProjectRecordRef.current;
+      if (active?.storageProvider === "google_drive") {
+        if (expectedProjectId && expectedProjectId !== active.projectId) return;
+        captureLatestProjectSnapshot(active.projectId);
+        const saved = await autoSyncControllerRef.current?.saveProjectLocallyNow(active.projectId);
+        if (!saved?.ok || !saved.record) throw new Error(saved && !saved.ok ? saved.errorMessage : "建立同步任務前保存本機快照失敗。");
+        const ownerAccountId = saved.record.ownerAccountId || saved.record.project.ownerAccountId;
+        if (!ownerAccountId) throw new Error("雲端專案缺少擁有者帳戶。");
+        await sharedCloudTaskManager.enqueue({
+          kind: "project_sync",
+          ownerAccountId,
+          projectId: saved.record.projectId,
+          projectName: saved.record.project.name,
+          snapshotRevision: saved.record.project.revisionToken,
+          intentId: `project_sync:${ownerAccountId}:${saved.record.projectId}:${saved.record.project.revisionToken}`,
+          descriptor: { projectId: saved.record.projectId, snapshotRevision: saved.record.project.revisionToken, projectSnapshot: saved.record },
+        });
+        showShortcutHint("已建立背景專案同步任務；關閉視窗不會取消，後續本機修改不會偷偷改寫此快照。");
+        return;
+      }
       const res = await coordinator.requestSync({ expectedProjectId });
       await applyManualSyncFlowResult(res);
     } catch (err) {
       showShortcutHint(err instanceof Error ? err.message : "同步失敗，本機資料已保留。");
     }
   };
+
+  useEffect(() => sharedCloudTaskManager.registerExecutor("original_backup", async (task, context) => {
+    const descriptor = task.descriptor;
+    if (!descriptor.projectId) {
+      return { status: "failed", stage: "缺少專案引用", errorCode: "project_missing", errorMessage: "原曲備份任務缺少專案引用。", retryable: false };
+    }
+    const projectRecord = await getProjectRecord(descriptor.projectId);
+    if (!projectRecord) {
+      return { status: "failed", stage: "專案已刪除", errorCode: "project_missing", errorMessage: "專案已刪除，不會重新建立。", retryable: false };
+    }
+    if (projectRecord.storageProvider !== "google_drive" || projectRecord.ownerAccountId !== task.ownerAccountId) {
+      return { status: "failed", stage: "帳戶或儲存位置不一致", errorCode: "account_mismatch", errorMessage: "原曲備份只能提交到原專案的 Google 帳戶。", retryable: false };
+    }
+    const entry = projectRecord.project.songs.find((item) => item.entryId === descriptor.songId);
+    if (!entry || entry.sourceAudioHash !== descriptor.sourceAudioHash) {
+      return { status: "failed", stage: "原曲來源已變更", errorCode: "source_mismatch", errorMessage: "歌曲來源已更換或刪除，禁止舊任務上傳。", retryable: false };
+    }
+    if (entry.originalBackup?.driveFileId && entry.originalBackup.ownerAccountId === task.ownerAccountId && entry.originalBackup.sourceAudioHash === descriptor.sourceAudioHash) {
+      return { status: "completed", stage: "原曲已存在且引用一致" };
+    }
+    const audio = await getPersistedAudioBlobByKey(descriptor.persistedAudioBlobKey);
+    if (!audio?.blob || audio.sourceAudioHash !== descriptor.sourceAudioHash) {
+      return { status: "failed", stage: "本機原曲不存在", errorCode: "source_blob_missing", errorMessage: "本機原曲已刪除，請重新載入音檔後再建立備份任務。", retryable: false };
+    }
+    const backupRef = await backupLocalOriginalAudioToDrive({
+      file: audio.blob,
+      fileName: entry.fileName,
+      mimeType: entry.mimeType || audio.blob.type || "audio/mpeg",
+      sourceAudioHash: descriptor.sourceAudioHash,
+      accountId: task.ownerAccountId,
+      accessToken: context.accessToken,
+      generation: context.accountGeneration,
+      isGenerationValid: () => context.isAccountGenerationValid(),
+      signal: context.signal,
+      onProgress: (completedBytes, totalBytes) => {
+        void context.updateProgress({ stage: "備份原曲至 Google Drive", completedBytes, totalBytes, completedFiles: completedBytes >= totalBytes ? 1 : 0, totalFiles: 1 }).catch(() => undefined);
+      },
+    });
+    if (!context.isAccountGenerationValid()) return { status: "waiting_auth", stage: "等待原帳戶重新授權" };
+
+    const latest = await getProjectRecord(descriptor.projectId);
+    if (!latest || latest.ownerAccountId !== task.ownerAccountId) {
+      return { status: "failed", stage: "專案已切換或刪除", errorCode: "project_changed", errorMessage: "遠端檔案已保留，但本機專案不再接受此任務寫入。", retryable: false };
+    }
+    const latestEntry = latest.project.songs.find((item) => item.entryId === descriptor.songId);
+    if (!latestEntry || latestEntry.sourceAudioHash !== descriptor.sourceAudioHash) {
+      return { status: "failed", stage: "原曲來源已變更", errorCode: "source_mismatch", errorMessage: "遠端檔案已保留，但不會覆寫新版歌曲資料。", retryable: false };
+    }
+    const nextSongs = latest.project.songs.map((item) => item.entryId === descriptor.songId
+      ? { ...item, originalBackup: backupRef, backupStatus: computeEntryBackupStatus({ ...item, originalBackup: backupRef }, task.ownerAccountId) }
+      : item);
+    const nextRevision = latest.project.revision + 1;
+    const nextToken = generateRevisionToken(nextRevision);
+    const saved = await saveLocalProjectEditAtomically({
+      ...latest,
+      project: {
+        ...latest.project,
+        songs: nextSongs,
+        revision: nextRevision,
+        revisionToken: nextToken,
+        parentRevisionId: latest.project.revisionToken,
+        updatedAt: new Date().toISOString(),
+        backupSummary: computeProjectBackupSummary(nextSongs, task.ownerAccountId),
+      },
+      localRevision: nextRevision,
+      dirty: true,
+      syncStatus: "dirty",
+      lastError: null,
+      lastSavedAt: Date.now(),
+    });
+    if (!saved.saved) {
+      return { status: "failed", stage: "遠端原曲已完成，等待保存本機引用", errorCode: saved.reason, errorMessage: saved.errorMessage || "專案同時被修改，未覆寫較新的本機版本。", retryable: saved.reason === "idb_error" };
+    }
+    return { status: "completed", stage: "原曲與本機專案引用已驗證" };
+  }), []);
 
   const handlePromoteToDrive = async (params: { backupLocalOriginals: boolean }) => {
     const active = activeProjectRecordRef.current;
@@ -7387,7 +7560,7 @@ export function BandMixer() {
         projectId: active.projectId,
         currentSongs: sessionRef.current.songs,
         auth,
-        backupLocalOriginals: params.backupLocalOriginals,
+        backupLocalOriginals: false,
         inMemoryFilesBySongId: sourceFilesRef.current,
         signal: controller.signal,
         onProgress: (p) => {
@@ -7406,9 +7579,38 @@ export function BandMixer() {
       });
       applyProjectWorkspaceState(res.record, mergedSongs);
       setPromoteBackupFailures(res.originalBackupFailures);
+      if (params.backupLocalOriginals) {
+        const candidates = res.record.project.songs.filter((entry) =>
+          entry.sourceAudioHash &&
+          !entry.originalBackup?.driveFileId &&
+          entry.source.provider !== "google_drive",
+        );
+        for (const entry of candidates) {
+          await sharedCloudTaskManager.enqueue({
+            kind: "original_backup",
+            ownerAccountId: auth.accountId,
+            projectId: res.record.projectId,
+            projectName: res.record.project.name,
+            songId: entry.entryId,
+            songName: entry.displayName,
+            snapshotRevision: entry.sourceAudioHash,
+            intentId: `original_backup:${auth.accountId}:${res.record.projectId}:${entry.entryId}:${entry.sourceAudioHash}`,
+            descriptor: {
+              projectId: res.record.projectId,
+              songId: entry.entryId,
+              sourceAudioHash: entry.sourceAudioHash,
+              persistedAudioBlobKey: entry.sourceAudioHash,
+            },
+            totalBytes: entry.sizeBytes,
+            totalFiles: 1,
+          });
+        }
+      }
       if (res.originalBackupFailures.length === 0) {
         setProjectDialogMode(null);
-        showShortcutHint(`已將專案「${res.record.project.name}」儲存至 Google Drive。`);
+        showShortcutHint(params.backupLocalOriginals
+          ? `已將專案「${res.record.project.name}」儲存至 Google Drive；原曲備份已加入背景任務。`
+          : `已將專案「${res.record.project.name}」儲存至 Google Drive。`);
       }
       void refreshProjectListEntries();
     } catch (err) {
@@ -7773,6 +7975,7 @@ export function BandMixer() {
         onSyncProject={() => void handleSyncProjectToDrive()}
         onOpenConflict={() => openProjectModal("conflict")}
         onReauthorizeSync={() => void handleReauthorizeAndSync()}
+        onOpenCloudTasks={() => window.dispatchEvent(new Event("loop:open-cloud-task-center"))}
       />
       <section className="card row mixer-upload" aria-label="載入歌曲與工作區工具">
         <button
@@ -8469,7 +8672,7 @@ export function BandMixer() {
             submitting={driveExportSubmitting}
             errorMessage={driveExportError}
             needsReauth={driveExportNeedsReauth}
-            onStartExport={(sel) => void startDriveExport(sel)}
+            onStartExport={(sel) => void enqueueDriveExport(sel)}
             onPauseExport={pauseDriveExport}
             onCancelExport={cancelDriveExport}
             onReauthorizeAndResume={() => void reauthorizeAndResumeDriveExport()}
@@ -8602,26 +8805,30 @@ export function BandMixer() {
           const targets = entryIds.map((entryId) => sessionRef.current.songs.find((song) => (song.projectEntryId ?? song.id) === entryId)).filter((song): song is BandSong => Boolean(song));
           if (targets.length !== entryIds.length) throw new Error("部分歌曲已從目前專案移除或無法取得，已停止批次補齊。");
           let completed = 0;
+          const queued: Array<{ song: BandSong; taskId: string }> = [];
           for (const song of targets) {
             if (signal.aborted) throw new DOMException("已取消批次補齊。", "AbortError");
             if (song.separationStatus !== "completed" || !song.separationMode) throw new Error(`「${song.name}」尚未完成可分享分軌。`);
-            onProgress(completed, targets.length, song.name);
             const selectedStemRoles = song.separationMode === "four_stem"
               ? ["vocals", "drums", "bass", "other"] as const
               : ["vocals", "instrumental"] as const;
-            const abortCurrent = () => driveExportAbortRef.current?.abort();
-            signal.addEventListener("abort", abortCurrent, { once: true });
-            let ok = false;
-            try {
-              ok = await startDriveExport({ format: "wav-float32", includeStems: true, selectedStemRoles: [...selectedStemRoles], includeSessionJson: true, includeCustomMix: false, forceNewRevision: Boolean(song.driveExport) }, song);
-            } finally {
-              signal.removeEventListener("abort", abortCurrent);
-            }
-            if (!ok) throw new Error(`「${song.name}」尚未完成上傳；已完成的 ${completed} 首會保留，下次可接續。`);
-            completed += 1;
+            const task = await createDriveExportTask(song, { format: "wav-float32", includeStems: true, selectedStemRoles: [...selectedStemRoles], includeSessionJson: true, includeCustomMix: false, forceNewRevision: Boolean(song.driveExport) });
+            queued.push({ song, taskId: task.taskId });
           }
-          captureLatestProjectSnapshot(activeProjectIdRef.current ?? undefined);
-          return { completed, total: targets.length };
+          const cancelQueued = () => { for (const item of queued) void sharedCloudTaskManager.cancel(item.taskId); };
+          signal.addEventListener("abort", cancelQueued, { once: true });
+          try {
+            for (const item of queued) {
+              onProgress(completed, targets.length, item.song.name);
+              const task = await sharedCloudTaskManager.waitForTerminal(item.taskId, signal, () => onProgress(completed, targets.length, item.song.name));
+              if (task.status !== "completed") throw new Error(`「${item.song.name}」尚未完成上傳；已完成的 ${completed} 首會保留，下次可接續。${task.errorMessage ? ` ${task.errorMessage}` : ""}`);
+              completed += 1;
+            }
+            captureLatestProjectSnapshot(activeProjectIdRef.current ?? undefined);
+            return { completed, total: targets.length };
+          } finally {
+            signal.removeEventListener("abort", cancelQueued);
+          }
         }}
         onClose={() => setProjectShareOpen(false)}
         onMessage={(message) => showShortcutHint(message)}

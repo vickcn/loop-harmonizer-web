@@ -1,5 +1,5 @@
 const DB_NAME = "loop-harmonizer-audio-cache";
-const DB_VERSION = 7;
+const DB_VERSION = 8;
 
 export const INDEXEDDB_VERSION = DB_VERSION;
 export const SEPARATION_CHECKPOINT_HASH_INDEX = "by_sourceAudioHash";
@@ -12,6 +12,13 @@ export const PROJECT_PROVIDER_INDEX = "by_storageProvider";
 export const PROJECT_SYNC_ACCOUNT_INDEX = "by_ownerAccountId";
 export const PROJECT_SHARE_SOURCE_INDEX = "by_sourceProjectId";
 export const PROJECT_SHARE_ACCOUNT_INDEX = "by_ownerAccountId";
+export const CLOUD_TASK_OWNER_INDEX = "by_ownerAccountId";
+export const CLOUD_TASK_STATUS_INDEX = "by_status";
+export const CLOUD_TASK_KIND_INDEX = "by_kind";
+export const CLOUD_TASK_PROJECT_INDEX = "by_projectId";
+export const CLOUD_TASK_SONG_INDEX = "by_songId";
+export const CLOUD_TASK_UPDATED_INDEX = "by_updatedAt";
+export const CLOUD_TASK_INTENT_INDEX = "by_intentId";
 
 export type AudioCacheStore =
   | "separations"
@@ -28,7 +35,8 @@ export type AudioCacheStore =
   | "projects"
   | "projectPreferences"
   | "projectSyncJobs"
-  | "projectShares";
+  | "projectShares"
+  | "cloudTasks";
 
 const ALL_STORES: readonly AudioCacheStore[] = [
   "separations",
@@ -46,6 +54,7 @@ const ALL_STORES: readonly AudioCacheStore[] = [
   "projectPreferences",
   "projectSyncJobs",
   "projectShares",
+  "cloudTasks",
 ];
 
 export interface InMemoryIdbHooks {
@@ -171,7 +180,7 @@ export interface UpgradeableDatabaseLike {
 
 /**
  * 向後相容的 IndexedDB schema 升級：
- * - v1~v4 -> v5：僅增量建立 missing stores 與 metadata indexes，絕不清空或覆寫既有音訊/歌曲資料。
+ * - v1~v7 -> v8：僅增量建立 missing stores 與 metadata indexes，絕不清空或覆寫既有音訊/歌曲資料。
  */
 export function applyIndexedDbSchemaUpgrade(
   db: UpgradeableDatabaseLike,
@@ -262,6 +271,20 @@ export function applyIndexedDbSchemaUpgrade(
       !store.indexNames.contains(PROJECT_SHARE_ACCOUNT_INDEX)
     ) {
       store.createIndex(PROJECT_SHARE_ACCOUNT_INDEX, "ownerAccountId", { unique: false });
+    }
+    if (storeName === "cloudTasks") {
+      const indexes = [
+        [CLOUD_TASK_OWNER_INDEX, "ownerAccountId", false],
+        [CLOUD_TASK_STATUS_INDEX, "status", false],
+        [CLOUD_TASK_KIND_INDEX, "kind", false],
+        [CLOUD_TASK_PROJECT_INDEX, "projectId", false],
+        [CLOUD_TASK_SONG_INDEX, "songId", false],
+        [CLOUD_TASK_UPDATED_INDEX, "updatedAt", false],
+        [CLOUD_TASK_INTENT_INDEX, "intentId", true],
+      ] as const;
+      for (const [name, keyPath, unique] of indexes) {
+        if (!store.indexNames.contains(name)) store.createIndex(name, keyPath, { unique });
+      }
     }
   }
 }
@@ -442,6 +465,15 @@ async function runInMemoryTransaction<T>(
                 indexName === PROJECT_SHARE_ACCOUNT_INDEX
               ) {
                 return obj.ownerAccountId;
+              }
+              if (storeName === "cloudTasks") {
+                if (indexName === CLOUD_TASK_OWNER_INDEX) return obj.ownerAccountId;
+                if (indexName === CLOUD_TASK_STATUS_INDEX) return obj.status;
+                if (indexName === CLOUD_TASK_KIND_INDEX) return obj.kind;
+                if (indexName === CLOUD_TASK_PROJECT_INDEX) return obj.projectId;
+                if (indexName === CLOUD_TASK_SONG_INDEX) return obj.songId;
+                if (indexName === CLOUD_TASK_UPDATED_INDEX) return obj.updatedAt;
+                if (indexName === CLOUD_TASK_INTENT_INDEX) return obj.intentId;
               }
               throw new Error(`資料表 ${storeName} 尚未建立索引：${indexName}`);
             };

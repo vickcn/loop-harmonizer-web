@@ -1033,10 +1033,10 @@ test("13. Cold-start refresh validates local IDB & restores chunked playback wit
     }),
   };
   applyIndexedDbSchemaUpgrade(fakeUpgradeDb, fakeUpgradeTx);
-  assert.equal(INDEXEDDB_VERSION, 7);
+  assert.equal(INDEXEDDB_VERSION, 8);
   assert.deepEqual(
     createdStores.sort(),
-    ["driveAccounts", "driveTransfers", "importedStems", "projectPreferences", "projectShares", "projectSyncJobs", "projects"],
+    ["cloudTasks", "driveAccounts", "driveTransfers", "importedStems", "projectPreferences", "projectShares", "projectSyncJobs", "projects"],
   );
   assert.ok(
     createdIndexes.some(

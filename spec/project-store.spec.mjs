@@ -19,6 +19,7 @@ import {
   PROJECT_SYNC_ACCOUNT_INDEX,
   PROJECT_SHARE_ACCOUNT_INDEX,
   PROJECT_SHARE_SOURCE_INDEX,
+  CLOUD_TASK_INTENT_INDEX,
   applyIndexedDbSchemaUpgrade,
   configureInMemoryIdbForTests,
   idbGet,
@@ -36,8 +37,8 @@ import {
 import { DEMUCS_MODEL_VERSION, SEPARATION_PROCESSING_VERSION, createSeparationCacheKey } from "../lib/storage/cacheKeys.ts";
 import { loadPersistedBandSession, saveSongWithAudioFile } from "../lib/storage/songSessionStore.ts";
 
-test("IndexedDB schema upgrade v5 -> v7 is non-destructive and adds project/share stores and indexes", async () => {
-  assert.equal(INDEXEDDB_VERSION, 7);
+test("IndexedDB schema upgrade v5 -> v8 is non-destructive and adds project/share/cloud task stores and indexes", async () => {
+  assert.equal(INDEXEDDB_VERSION, 8);
   const v5Stores = new Map([
     ["audioFiles", new Set()],
     ["separations", new Set()],
@@ -81,12 +82,13 @@ test("IndexedDB schema upgrade v5 -> v7 is non-destructive and adds project/shar
   };
 
   applyIndexedDbSchemaUpgrade(db, tx);
-  assert.deepEqual(createdStores.sort(), ["projectPreferences", "projectShares", "projectSyncJobs", "projects"]);
+  assert.deepEqual(createdStores.sort(), ["cloudTasks", "projectPreferences", "projectShares", "projectSyncJobs", "projects"]);
   assert.ok(createdIndexes.some((i) => i.store === "projects" && i.idx === PROJECT_OWNER_ACCOUNT_INDEX));
   assert.ok(createdIndexes.some((i) => i.store === "projects" && i.idx === PROJECT_PROVIDER_INDEX));
   assert.ok(createdIndexes.some((i) => i.store === "projectSyncJobs" && i.idx === PROJECT_SYNC_ACCOUNT_INDEX));
   assert.ok(createdIndexes.some((i) => i.store === "projectShares" && i.idx === PROJECT_SHARE_SOURCE_INDEX));
   assert.ok(createdIndexes.some((i) => i.store === "projectShares" && i.idx === PROJECT_SHARE_ACCOUNT_INDEX));
+  assert.ok(createdIndexes.some((i) => i.store === "cloudTasks" && i.idx === CLOUD_TASK_INTENT_INDEX));
 
   // Verify existing v5 records in IDB stay intact under v7 runtime operations
   configureInMemoryIdbForTests();
